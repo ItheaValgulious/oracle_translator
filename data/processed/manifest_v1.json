@@ -1,0 +1,11 @@
+{
+  "ontology_version": "v1_text_qwen06b",
+  "counts": {
+    "curated_raw": 200,
+    "api_raw": 0,
+    "train": 490,
+    "val": 54
+  },
+  "include_prefixes": true,
+  "val_ratio": 0.1
+}

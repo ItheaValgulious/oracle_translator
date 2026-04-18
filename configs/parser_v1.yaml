@@ -1,0 +1,14 @@
+backbone_name: Qwen/Qwen3-0.6B-Base
+max_length: 128
+batch_size: 2
+epochs: 2
+learning_rate: 0.0002
+weight_decay: 0.01
+train_backbone: false
+unfreeze_last_n_layers: 0
+dataset:
+  curated: data/raw/curated_v1.jsonl
+  api: data/raw/api_v1.jsonl
+  train: data/processed/train_v1.jsonl
+  val: data/processed/val_v1.jsonl
+  manifest: data/processed/manifest_v1.json
