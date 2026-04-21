@@ -2,3 +2,4 @@ api.txt
 **/__pycache__/
 .env/
 best_model.pt
+artifacts/

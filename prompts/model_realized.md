@@ -24,12 +24,17 @@
 - 损失函数: `src/oracle_translator/losses.py`
 - 指标计算: `src/oracle_translator/metrics.py`
 - 训练与评测: `src/oracle_translator/train_eval.py`
+  - 训练支持按 `val.loss` 做 early stopping, 并保存最低 `val.loss` 的 checkpoint
+  - 训练日志会输出 `status`, `categorical`, `binned`, `style`, `reaction_mask` 的 train/val loss
+  - 训练结构支持独立切换 `big_head`, `LoRA`, `train_backbone`, `unfreeze_last_n_layers`
 - 脚本入口:
   - `scripts/build_curated_dataset.py`
   - `scripts/generate_api_dataset.py`
   - `scripts/prepare_dataset.py`
   - `scripts/train_parser.py`
   - `scripts/eval_parser.py`
+  - `scripts/interactive_parser.py`
+  - `scripts/overfit_parser.py`
   - `scripts/smoke_test.py`
 
 ## 2. 当前模型结构
@@ -171,6 +176,18 @@ L = 1.0 * L_status
 - `train_quick.jsonl`: `256`
 - `val_quick.jsonl`: `64`
 
+### 5.1 当前仓库本地数据现状
+
+当前仓库里实际存在并被这次本地训练直接使用的 `manifest_v1.json` 为:
+
+- `curated_raw = 200`
+- `api_raw = 0`
+- `train = 490`
+- `val = 54`
+
+这意味着当前本地可直接复现的训练规模, 明显小于上面那版包含 API augment 的完整数据描述.
+如果直接用当前仓库落盘数据训练, 模型表现应按这组较小数据量来预期, 不能按 `4204/467` 的训练规模估计.
+
 ## 6. 已完成的实跑结果
 
 已完成:
@@ -203,6 +220,25 @@ quick eval 指标:
 - 细粒度槽位预测仍然偏弱.
 - style 预测明显不够好.
 - `success_exact_match = 0.0` 表明整套槽位一起命中的能力还远远不够.
+
+### 6.1 最新本地 full split 实跑
+
+基于当前仓库里的本地数据:
+
+- device: `cuda`
+- train: `490`
+- val: `54`
+- early stopping: monitor `val.loss`, `patience=3`, `min_delta=0.0`, `max_epochs=300`
+
+实跑结果:
+
+- 实际停止 epoch: `27`
+- 最佳 epoch: `24`
+- best `val.loss = 0.9595`
+- `status_accuracy = 0.9630`
+- `success_exact_match = 0.0625`
+
+逐字段上, 当前模型对 `color` 和 `state` 仍然不够可靠.
 
 ## 7. 与 model.md 的差别
 

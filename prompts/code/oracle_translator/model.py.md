@@ -21,6 +21,10 @@
     - 全局池化
     - slot attention 池化
     - 多个 MLP heads
+  - 支持:
+    - `big_head`
+    - `LoRA`
+    - 部分解冻或全量解冻 backbone
 
 - `build_model(**kwargs)`
   - 构造模型的便捷入口.
@@ -41,4 +45,6 @@
 - 构造全局表示和槽位特定表示.
 - 输出状态, 槽位, 风格和 multi-label 反应 mask.
 - 通过 `status_logits` 推导 `status_confidence`, 不单独训练置信度头.
-
+- 支持冻结 backbone, 或只解冻 backbone 的最后若干层.
+- 支持在 backbone 内部目标线性层上挂接 LoRA 适配器.
+- 支持把 heads 切换为更大的 MLP 结构.
