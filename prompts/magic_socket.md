@@ -1,301 +1,301 @@
-# Magic Runtime Schema B
+# Magic Socket
 
-本文只定义游戏运行时可执行的魔法结构 `B`, 不讨论模型如何解析自然语言, 也不讨论训练方式.  
-目标是把任意可识别的咒语, 最终编译为一组可被引擎稳定消费的槽位.
+本文定义游戏运行时真正消费的完整魔法结构.
+
+它不是第一版模型直接输出的内容.
+第一版模型先输出 [model_socket.md](/mnt/d/project/oracle_translator/prompts/model/model_socket.md), 再由模板展开器补成这里的完整结构.
 
 ## 1. 总体结构
-
-一个魔法由 5 个部分组成:
-
-1. `subject`: 被召唤或被操作的主体.
-2. `release`: 主体被释放到世界中的方式.
-3. `motion`: 主体出生后的整体运动规则.
-4. `targeting`: 释放起点, 朝向与目标选择规则.
-5. `expression`: 本次咒语的表达风格特征.
-
-当前第一阶段只支持:
-
-- `subject_kind = summon_material`
-
-## 2. 顶层字段
 
 ```json
 {
   "subject_kind": "summon_material",
   "subject": {},
+  "reaction": {},
   "release": {},
   "motion": {},
-  "targeting": {},
   "expression": {}
 }
 ```
 
+## 2. 第一版与完整结构的关系
+
+第一版模型只直接输出:
+
+- `material_template`
+- `reaction_template`
+- `release_template`
+- `motion_template`
+- `motion_direction`
+- `origin`
+- `target`
+- `powerness`
+
+然后模板展开器把它们补成完整运行时字段.
+
 ## 3. Subject
 
-`subject` 表示被生成出来并参与模拟的物质主体.
+`subject` 表示被召出来并进入模拟的主体物质.
 
-### 3.1 核心字段
+### 3.1 模板字段
 
-- `material_archetype`
-  - 可选.
-  - 表示一个预定义物质原型.
-  - 例如: `holy_fire`, `acid_slime`, `poison_mist`, `ice_shard`.
-  - 运行时语义: 原型本质上是一组默认槽位.
+- `material_template`
+  - 例如:
+    - `granite`
+    - `earth`
+    - `obsidian`
+    - `sand`
+    - `water`
+    - `ice`
+    - `steam`
+    - `fire`
+    - `light`
+    - `wind`
+    - `lightning`
+    - `acid`
+    - `poison_slurry`
+    - `tar`
+    - `explosive_slurry`
+    - `grass`
+    - `wood`
+    - `glass`
+    - `iron`
+    - `quicksilver`
 
-- `state`
-  - 必填.
-  - 取值: `solid`, `liquid`, `gas`.
-  - 决定主体的基础体素行为.
+### 3.2 展开后的完整字段
 
 - `color`
-  - 第一阶段必填.
-  - 使用颜色库分类, 不直接输出任意 RGB 或 HEX.
-  - 运行时再由颜色库映射到实际渲染颜色.
-  - 颜色既影响视觉反馈, 也应作为文本解析的一部分保留.
-
+- `state`
 - `density`
-  - 必填.
-  - 表示质量与重力响应.
-  - 决定沉浮, 冲击感和惯性表现.
-
 - `temperature`
-  - 必填.
-  - 表示热量等级.
-  - 决定与环境或目标接触时可能触发的高温或低温效果.
-
 - `amount`
-  - 必填.
-  - 表示总生成量.
-  - 决定生成体素数量, 持续时间上限或覆盖面积.
-
-### 3.2 反应字段
-
-不要把 `传染` 塞进单一字段, 而是拆为以下 4 个字段:
-
-- `reaction_kind`
-  - 可选.
-  - 取值示例: `none`, `burn`, `corrode`, `freeze`, `poison`, `grow`.
-  - 表示该主体接触其他对象后主要触发的转化类型.
-
-- `reaction_rate`
-  - 条件字段.
-  - 当 `reaction_kind != none` 时生效.
-  - 表示扩散或转化的速度.
-
-- `reaction_mask`
-  - 条件字段.
-  - 当 `reaction_kind != none` 时生效.
-  - 表示该转化允许作用于哪些目标.
-  - 取值示例: `solid`, `liquid`, `gas`, `living`, `terrain`.
-  - 可为单值或多值集合.
-
-- `reaction_direction`
-  - 可选.
-  - 表示该反应是否有额外扩散偏置.
-  - 取值示例: `none`, `up`, `down`, `forward`, `outward`.
-
-### 3.3 条件字段
-
-以下字段只在特定 `state` 下启用:
-
 - `hardness`
-  - 仅 `solid` 生效.
-  - 表示固体抵抗破坏和替换的能力.
-
 - `friction`
-  - 仅 `solid` 生效.
-  - 表示固体表面的摩擦表现.
-
 - `viscosity`
-  - 仅 `liquid` 生效.
-  - 表示液体的流动阻力和附着倾向.
 
-## 4. Release
+这些字段不由第一版模型直接预测, 而由 `material_template` 展开得到.
 
-`release` 表示主体出生时如何被抛出或铺开.
+## 4. Reaction
 
-### 4.1 字段
+`reaction` 表示主体接触到别的对象后, 如何把它们转化.
 
+### 4.1 模板字段
+
+- `reaction_template`
+  - 允许值:
+    - `none`
+    - `burn`
+    - `corrode`
+    - `freeze`
+    - `poison`
+    - `grow`
+
+### 4.2 反应的真实含义
+
+reaction 的本质不是文学标签, 而是:
+
+- 接触后把目标转化成什么
+- 转化速度多快
+- 向哪个方向扩散
+- 感染几代
+
+因此完整字段应包括:
+
+- `convert_mode`
+  - `self`
+  - `empty`
+  - `none`
+- `reaction_speed`
+- `reaction_mask`
+- `reaction_direction`
+- `generation_limit`
+
+推荐映射:
+
+- `burn -> self`
+- `freeze -> self`
+- `grow -> self`
+- `poison -> self`
+- `corrode -> empty`
+- `none -> none`
+
+### 4.3 方向示例
+
+- 草向上长:
+  - `reaction_template = grow`
+  - `reaction_direction = up`
+- 生根向下:
+  - `reaction_template = grow`
+  - `reaction_direction = down`
+- 火往前蔓:
+  - `reaction_template = burn`
+  - `reaction_direction = forward`
+
+## 5. Release
+
+第一版模型直接预测:
+
+- `release_template`
+
+再由模板默认值展开:
+
+完整字段保留:
+
+- `release_template`
 - `release_profile`
-  - 必填.
-  - 取值示例: `burst`, `stream`, `spray`, `pool`, `beam`.
-  - 表示体素生成的空间形状和初始发射方式.
-
 - `release_speed`
-  - 必填.
-  - 表示主体出生瞬间获得的初始速度.
-
 - `release_spread`
-  - 可选.
-  - 表示初始扩散角度或扩散宽度.
 
-- `release_duration`
-  - 可选.
-  - 表示持续喷射或持续生成的时长.
-  - 对 `stream`, `beam` 这类持续型释放尤其重要.
+### 5.1 模板字段
 
-## 5. Motion
+- `release_template`
+  - `spray`
+  - `appear`
 
-`motion` 表示主体在出生之后, 如何受一个统一的运动规则影响.
+含义:
 
-### 5.1 字段
+- `spray`
+  - 快速逐渐释放
+- `appear`
+  - 瞬间全部出现
+
+### 5.2 关于 `duration`
+
+完整 runtime 不再把 `release_duration` 作为独立字段强调.
+至少在第一版设计里:
+
+- `duration` 更像一个由 `amount / speed` 推导出来的次级量
+- 不应成为模型单独预测字段
+
+## 6. Motion
+
+第一版把旧 `targeting` 合并进 `motion`.
+
+### 6.1 模板字段
 
 - `motion_template`
-  - 必填.
-  - 取值示例: `fixed`, `flow`, `vortex`.
-  - 表示整体运动场模板.
+  - `none`
+  - `fixed`
+  - `flow`
+  - `vortex`
+  - `rotation`
+  - `vibration`
 
-- `force_strength`
-  - 必填.
-  - 表示运动场施加给主体的力强度.
-
-- `carrier_velocity`
-  - 必填.
-  - 表示运动场本身的整体平移速度.
-  - 最终粒子受力, 可以理解为 `场内局部力 + 场整体移动`.
+### 6.2 方向字段
 
 - `motion_direction`
-  - 可选.
-  - 表示运动场偏向的主要方向.
-  - 取值示例: `forward`, `backward`, `up`, `down`, `target`, `self`, `none`.
+  - `forward`
+  - `backward`
+  - `up`
+  - `down`
+  - `target`
+  - `self`
+  - `front_up`
+  - `front_down`
 
-## 6. Targeting
-
-`targeting` 定义魔法从哪里出现, 朝哪里去, 以及目标如何被选中.
-
-### 6.1 字段
+### 6.3 起点与目标
 
 - `origin`
-  - 必填.
-  - 取值示例: `self`, `front_enemy_random`, `back`, `front_up`, `front_down`.
-  - 表示释放起点.
+  - `self`
+  - `back`
+  - `front_up`
+  - `front_down`
 
-- `target_mode`
-  - 必填.
-  - 取值示例: `aim_enemy`, `aim_self`, `none`.
-  - 表示是否存在明确瞄准对象.
+- `target`
+  - `self`
+  - `enemy`
+  - `none`
 
-- `direction_mode`
-  - 必填.
-  - 取值示例: `to_target`, `to_self`, `forward`, `none`.
-  - 表示释放与运动参考的方向来源.
+### 6.4 完整运动字段
 
-## 7. Archetype 展开规则
+展开后完整运行时还可包括:
 
-`material_archetype` 不是独立于槽位系统的第二套系统, 它只是槽位默认值模板.
+- `force_strength`
+- `carrier_velocity`
 
-例:
+这些也不要求第一版模型直接输出.
+
+## 7. Expression
+
+第一版只保留一个连续值:
+
+- `powerness`
+
+它是综合威力倾向值, 统一承载:
+
+- 这句说法的威力感
+- 说法的压迫感
+- 同义施法下的强势程度
+
+建议范围:
+
+- `0.0 - 1.0`
+
+## 8. 第一版展开示意
+
+第一版模型输出:
 
 ```json
 {
-  "material_archetype": "holy_fire"
+  "subject_kind": "summon_material",
+  "subject": {
+    "material_template": "fire"
+  },
+  "reaction": {
+    "reaction_template": "burn"
+  },
+  "release": {
+    "release_template": "spray"
+  },
+  "motion": {
+    "motion_template": "flow",
+    "motion_direction": "forward",
+    "origin": "self",
+    "target": "enemy"
+  },
+  "expression": {
+    "powerness": 0.72
+  }
 }
 ```
 
-运行时可展开为:
+展开后可变成:
 
 ```json
 {
-  "state": "gas",
-  "temperature": "high",
-  "density": "low",
-  "amount": "medium",
-  "reaction_kind": "burn",
-  "reaction_rate": "medium",
-  "reaction_mask": ["living", "terrain"]
+  "subject_kind": "summon_material",
+  "subject": {
+    "material_template": "fire",
+    "color": "orange",
+    "state": "gas",
+    "density": "low",
+    "temperature": "high",
+    "amount": "mid_high"
+  },
+  "reaction": {
+    "reaction_template": "burn",
+    "convert_mode": "self",
+    "reaction_speed": "high",
+    "reaction_mask": ["living", "terrain"],
+    "reaction_direction": "forward",
+    "generation_limit": 2
+  },
+  "release": {
+    "release_template": "spray",
+    "release_profile": "stream",
+    "release_speed": "high",
+    "release_spread": "mid_low"
+  },
+  "motion": {
+    "motion_template": "flow",
+    "motion_direction": "forward",
+    "origin": "self",
+    "target": "enemy",
+    "force_strength": "mid_high",
+    "carrier_velocity": "high"
+  },
+  "expression": {
+    "powerness": 0.72
+  }
 }
 ```
-
-如果后续解析结果中还出现明确修饰, 则允许覆盖模板默认值.
-
-例:
-
-- `holy_fire` + `更粘稠` -> 若系统允许, 可强行转向更像燃烧液或凝胶火.
-- `acid_slime` + `极寒` -> 允许覆盖温度字段.
-
-## 8. Expression
-
-`expression` 表示一次咒语在语言风格层面的附加特征.  
-这些字段默认不直接改变物理执行结果, 但可用于驱动以下系统:
-
-- 吟唱音效与 UI 反馈.
-- 施法姿态或特效风格.
-- 语义疲劳的风格偏置.
-- 误判或反噬时的表现差异.
-- 成就, 评分, 流派偏好, NPC 反应.
-
-### 8.1 字段
-
-- `curvature`
-  - 必填.
-  - 表示表达是否直接, 还是更曲折, 迂回, 修辞化.
-  - 建议归一化到 `0.0 - 1.0`.
-  - `0.0` 表示非常直白.
-  - `1.0` 表示高度委婉或高度修辞化.
-
-- `politeness`
-  - 必填.
-  - 表示表达的礼貌程度, 克制程度或祈请感.
-  - 建议归一化到 `0.0 - 1.0`.
-  - `0.0` 表示粗暴, 命令式.
-  - `1.0` 表示恭敬, 请愿式.
-
-- `elegance`
-  - 必填.
-  - 表示表达的高雅程度, 文学性或仪式感.
-  - 建议归一化到 `0.0 - 1.0`.
-  - `0.0` 表示口语化, 粗粝.
-  - `1.0` 表示典雅, 庄重, 仪式化.
-
-### 8.2 设计说明
-
-- `expression` 是解析器输出的一部分, 但不应成为第一阶段物理施法成功的硬前置条件.
-- 当 `subject/release/motion/targeting` 已足够完整时, 即使 `expression` 不稳定, 也不应阻止施法.
-- `expression` 更适合作为风格层和反馈层的控制量, 而不是底层体素物理参数.
-
-## 9. 第一阶段建议的最小必填集合
-
-为了保证第一阶段可执行, 每个成功施法的运行时结果至少应包含:
-
-- `subject.color`
-- `subject.state`
-- `subject.density`
-- `subject.temperature`
-- `subject.amount`
-- `release.release_profile`
-- `release.release_speed`
-- `motion.motion_template`
-- `motion.force_strength`
-- `motion.carrier_velocity`
-- `targeting.origin`
-- `targeting.target_mode`
-- `targeting.direction_mode`
-
-如果依赖反应机制, 则至少还需要:
-
-- `subject.reaction_kind`
-- `subject.reaction_rate`
-- `subject.reaction_mask`
-
-第一阶段如需保留风格信息, 还建议输出:
-
-- `expression.curvature`
-- `expression.politeness`
-- `expression.elegance`
-
-## 10. 不在第一阶段支持的内容
-
-以下内容暂不进入 `B`:
-
-- 对现有玩家或敌人直接施加复杂动作.
-- 对场上任意已有物体做精细语义选择.
-- 多主体并列召唤.
-- 条件语句, 因果链, 多段施法脚本.
-- 需要世界知识才能稳定理解的隐喻解释.
-
-第一阶段的 `B` 本质上是:
-
-- 召唤一种物质.
-- 以一种方式释放.
-- 让它遵循一种运动模板.
-- 根据目标规则向外作用.

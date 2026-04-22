@@ -25,6 +25,19 @@
     - `big_head`
     - `LoRA`
     - 部分解冻或全量解冻 backbone
+  - 当前仍是旧版风格头实现, 只输出:
+    - `expression.curvature`
+    - `expression.politeness`
+    - `expression.elegance`
+  - 尚未实现最新目标中的:
+    - `material_template`
+    - `reaction_template`
+    - `release_template`
+    - `motion_template`
+    - `motion_direction`
+    - `origin`
+    - `target`
+    - `powerness`
 
 - `build_model(**kwargs)`
   - 构造模型的便捷入口.

@@ -25,6 +25,12 @@ def write_jsonl(path: str | Path, rows: Iterable[dict]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def append_jsonl(path: str | Path, row: dict) -> None:
+    ensure_parent(path)
+    with Path(path).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def read_jsonl(path: str | Path) -> list[dict]:
     rows: list[dict] = []
     with Path(path).open("r", encoding="utf-8") as handle:

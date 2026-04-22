@@ -3,3 +3,4 @@ api.txt
 .env/
 best_model.pt
 artifacts/
+/data/

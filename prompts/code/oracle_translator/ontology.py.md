@@ -45,4 +45,14 @@
 - 定义第一阶段真正训练的字段集合.
 - 明确哪些字段是 categorical, 哪些是 7 档数值, 哪些是 5 档风格.
 - 统一数据生成, 数据集编码, 模型 head 数量, 指标统计时使用的标签空间.
-
+- 当前文件里的风格空间仍是旧版:
+  - `STYLE_BINS`
+  - `STYLE_SPECS`
+  - 对应 `curvature/politeness/elegance`
+- 它尚未表达最新目标中的:
+  - `material_template`
+  - `reaction_template`
+  - `release_template`
+  - `motion.origin`
+  - `motion.target`
+  - `expression.powerness`
