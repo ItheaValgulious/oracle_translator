@@ -29,7 +29,7 @@
 - `motion_direction`
 - `origin`
 - `target`
-- `powerness`
+- `politeness`
 
 然后模板展开器把它们补成完整运行时字段.
 
@@ -61,6 +61,7 @@
     - `glass`
     - `iron`
     - `quicksilver`
+    - `unknown`
 
 ### 3.2 展开后的完整字段
 
@@ -227,9 +228,20 @@ reaction 的本质不是文学标签, 而是:
 - 说法的压迫感
 - 同义施法下的强势程度
 
-建议范围:
+训练标注时:
 
-- `0.0 - 1.0`
+- 模型先输出 `politeness ∈ {0, 1}`
+
+运行时:
+
+- 游戏侧把模型输出的 `politeness` 转成 `powerness`
+- 可以直接使用模型输出概率, 得到连续的 `0.0 - 1.0`
+
+当前阶段可简单视为:
+
+```text
+powerness = politeness
+```
 
 ## 8. 第一版展开示意
 
@@ -254,7 +266,7 @@ reaction 的本质不是文学标签, 而是:
     "target": "enemy"
   },
   "expression": {
-    "powerness": 0.72
+    "politeness": 1
   }
 }
 ```

@@ -16,7 +16,7 @@
 - `motion_direction`
 - `origin`
 - `target`
-- `powerness`
+- `politeness`
 
 ## 2. 当前阶段不训练什么
 
@@ -37,7 +37,7 @@
 由 assistant 手写高覆盖 seed 咒语.
 当前仓库已有:
 
-- `data/source/manual_spell_seeds_v2.jsonl`
+- `data/source/manual_spell_seeds.jsonl`
 
 它的作用:
 
@@ -104,12 +104,18 @@
       "target": "..."
     },
     "expression": {
-      "powerness": 0.0
+      "politeness": 0
     }
   },
   "meta": {}
 }
 ```
+
+其中:
+
+- `politeness` 在当前训练数据里只标 `0/1`
+- 推理时模型可以输出介于 `0.0 - 1.0` 的概率值
+- 游戏侧再把这个值映射成运行时 `powerness`
 
 ## 6. 当前最重要的质量标准
 
@@ -125,8 +131,8 @@
 代码侧真正运行的 prompt 不在 `prompts/`.
 而在:
 
-- `src/prompts/spell_generation_prompt_v2.md`
-- `src/prompts/spell_to_json_prompt_v2.md`
-- `src/prompts/json_to_spell_prompt_v2.md`
+- `src/prompts/spell_generation_prompt.md`
+- `src/prompts/spell_to_json_prompt.md`
+- `src/prompts/json_to_spell_prompt.md`
 
 `prompts/` 目录下的文档主要是给 Codex 和项目设计讨论使用的.

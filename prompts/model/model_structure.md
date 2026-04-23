@@ -16,7 +16,7 @@
 - `motion_direction`
 - `origin`
 - `target`
-- `powerness`
+- `politeness`
 
 ## 2. Backbone
 
@@ -62,13 +62,15 @@
 
 风格头只保留:
 
-- `powerness_head`
+- `politeness_head`
 
 推荐:
 
-- 直接回归到 `0.0 - 1.0`
-  或
-- 做 `9` 档 ordinal bins
+- 做二分类:
+  - `0`
+  - `1`
+- 训练时用 BCE 或 2-class CE
+- 推理时取概率作为连续 `politeness`
 
 ## 5. 表征方式
 
@@ -100,13 +102,13 @@ L = λ_material * L_material
   + λ_motion_direction * L_motion_direction
   + λ_origin * L_origin
   + λ_target * L_target
-  + λ_powerness * L_powerness
+  + λ_politeness * L_politeness
 ```
 
 推荐:
 
 - 全部模板头: cross entropy
-- `powerness`: 回归 loss 或 ordinal loss
+- `politeness`: BCE loss 或 2-class cross entropy
 
 ## 7. 执行链路
 
