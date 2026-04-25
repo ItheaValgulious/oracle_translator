@@ -261,6 +261,27 @@ class EngineCoreTests(unittest.TestCase):
         steam_count = sum(1 for cell in grid.cells if cell.variant_id == "steam")
         self.assertEqual(steam_count, 0)
 
+    def test_steam_in_air_does_not_condense_immediately(self) -> None:
+        grid = create_grid(9, 9)
+        inject_cells(grid, [(4, 4)], "water", "steam", {"temperature": 120.0})
+        for _ in range(30):
+            step(grid, self.registry, 1 / 60.0)
+        self.assertEqual(sum(1 for cell in grid.cells if cell.variant_id == "steam"), 1)
+
+    def test_ice_block_persists_in_ambient_air(self) -> None:
+        grid = create_grid(9, 9)
+        inject_cells(grid, [(x, y) for y in range(3, 6) for x in range(3, 6)], "water", "ice", {"temperature": -5.0})
+        for _ in range(120):
+            step(grid, self.registry, 1 / 60.0)
+        self.assertGreaterEqual(sum(1 for cell in grid.cells if cell.variant_id == "ice"), 1)
+
+    def test_blocked_impulse_is_clamped_after_successful_move(self) -> None:
+        grid = create_grid(5, 3)
+        inject_cells(grid, [(2, 1)], "sand", "sand_powder", {"vel_x": 8.0})
+        apply_motion(grid, self.registry, 1 / 60.0)
+        moved_sand = next(cell for cell in grid.cells if cell.variant_id == "sand_powder")
+        self.assertLessEqual(abs(moved_sand.blocked_x), 1.25)
+
     def test_temperature_moves_with_moving_cell(self) -> None:
         grid = create_grid(3, 3)
         inject_cells(grid, [(1, 0)], "sand", "sand_powder", {"temperature": 80.0})
@@ -614,6 +635,38 @@ class EngineCoreTests(unittest.TestCase):
         readback = gpu.readback_grid()
         steam_count = sum(1 for cell in readback.cells if cell.variant_id == "steam")
         self.assertEqual(steam_count, 0)
+
+    def test_gpu_steam_in_air_does_not_condense_immediately(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(9, 9)
+        inject_cells(grid, [(4, 4)], "water", "steam", {"temperature": 120.0})
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        for _ in range(30):
+            gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        self.assertEqual(sum(1 for cell in readback.cells if cell.variant_id == "steam"), 1)
+
+    def test_gpu_ice_block_persists_in_ambient_air(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(9, 9)
+        inject_cells(grid, [(x, y) for y in range(3, 6) for x in range(3, 6)], "water", "ice", {"temperature": -5.0})
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        for _ in range(120):
+            gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        self.assertGreaterEqual(sum(1 for cell in readback.cells if cell.variant_id == "ice"), 1)
+
+    def test_gpu_blocked_impulse_is_clamped_after_successful_move(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(5, 3)
+        inject_cells(grid, [(2, 1)], "sand", "sand_powder", {"vel_x": 8.0})
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        gpu.step(1 / 60.0)
+        moved_sand = next(cell for cell in gpu.readback_grid().cells if cell.variant_id == "sand_powder")
+        self.assertLessEqual(abs(moved_sand.blocked_x), 1.25)
 
     def test_gpu_temperature_moves_with_moving_cell(self) -> None:
         ctx = create_compute_context()

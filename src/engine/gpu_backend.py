@@ -267,6 +267,7 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define REACTION_FLAMMABLE {REACTION_KIND_CODES[ReactionKind.FLAMMABLE]}
 
 #define FIRE_FAMILY_INDEX {tables.family_index_by_id["fire"]}
+#define STEAM_VARIANT_INDEX {tables.variant_index_by_key[("water", "steam")]}
 
 #define SUPPORT_TIMEOUT_SECONDS 10.0
 #define SUPPORT_SOURCE_VALUE SUPPORT_TIMEOUT_SECONDS
@@ -294,8 +295,10 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define VELOCITY_DECAY 0.92
 #define STATIC_VELOCITY_DECAY 0.96
 #define BLOCKED_DECAY 0.72
+#define BLOCKED_IMPULSE_MAX 1.25
 #define LIQUID_RANDOM_GAIN 0.012
 #define LIQUID_RANDOM_VERTICAL_FACTOR 0.18
+#define EMPTY_RANDOM_GAIN 0.52
 #define GAS_RANDOM_GAIN 0.42
 #define GAS_RANDOM_VERTICAL_FACTOR 0.85
 #define DIRECTION_JITTER_GAIN 0.06
@@ -305,9 +308,11 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define GAS_THERMAL_TEMPERATURE_SPAN 120.0
 #define LIQUID_THERMAL_TEMPERATURE_SPAN 400.0
 #define GAS_RANDOM_FLOOR_FACTOR 0.35
+#define GAS_RANDOM_HEAT_FACTOR 1.25
 #define LIQUID_RANDOM_FLOOR_FACTOR 0.15
 #define DENSITY_EPSILON 0.000001
-#define LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER 2.0
+#define LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER 30.0
+#define CONDENSABLE_GAS_CLUSTER_CONDUCTION_MULTIPLIER 80.0
 
 #define VIEW_MODE_MATERIAL 0
 #define VIEW_MODE_TEMPERATURE 1
@@ -523,6 +528,10 @@ float axis_remaining_after_step(float desired_component, float realized_componen
     return sign(desired_component) * max(0.0, abs(desired_component) - abs(realized_component));
 }}
 
+vec2 decayed_blocked_impulse(vec2 blocked) {{
+    return clamp(blocked * BLOCKED_DECAY, vec2(-BLOCKED_IMPULSE_MAX), vec2(BLOCKED_IMPULSE_MAX));
+}}
+
 vec2 blocked_intent(vec2 blocked) {{
     return blocked_impulse_enabled != 0 ? blocked : vec2(0.0);
 }}
@@ -584,9 +593,7 @@ bool is_gas_like_variant(int variant_index) {{
 }}
 
 bool is_condensable_gas_variant(int variant_index) {{
-    return variant_index != EMPTY_VARIANT_INDEX
-        && is_gas_state(matter_state_for_variant(variant_index))
-        && freeze_temperature_for_variant(variant_index) > 0.0;
+    return variant_index == STEAM_VARIANT_INDEX;
 }}
 
 bool is_liquid_variant(int variant_index) {{
@@ -596,9 +603,13 @@ bool is_liquid_variant(int variant_index) {{
 float thermal_conduction_multiplier_between(int current_variant, int neighbor_variant) {{
     bool current_liquid_neighbor_gas = is_liquid_variant(current_variant) && is_condensable_gas_variant(neighbor_variant);
     bool neighbor_liquid_current_gas = is_liquid_variant(neighbor_variant) && is_condensable_gas_variant(current_variant);
-    return (current_liquid_neighbor_gas || neighbor_liquid_current_gas)
-        ? LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER
-        : 1.0;
+    if (current_liquid_neighbor_gas || neighbor_liquid_current_gas) {{
+        return LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER;
+    }}
+    if (is_condensable_gas_variant(current_variant) && is_condensable_gas_variant(neighbor_variant)) {{
+        return CONDENSABLE_GAS_CLUSTER_CONDUCTION_MULTIPLIER;
+    }}
+    return 1.0;
 }}
 
 float ambient_temperature() {{
@@ -622,12 +633,12 @@ float effective_density_for_variant_and_temperature(int variant_index, float tem
 
 float thermal_random_gain_for_cell(int variant_index, float temperature) {{
     if (variant_index == EMPTY_VARIANT_INDEX) {{
-        return GAS_RANDOM_GAIN * temperature_motion_factor(temperature, GAS_THERMAL_TEMPERATURE_SPAN);
+        return EMPTY_RANDOM_GAIN * temperature_motion_factor(temperature, GAS_THERMAL_TEMPERATURE_SPAN);
     }}
     int matter_state = matter_state_for_variant(variant_index);
     if (matter_state == MATTER_STATE_GAS) {{
         float factor = temperature_motion_factor(temperature, GAS_THERMAL_TEMPERATURE_SPAN);
-        return GAS_RANDOM_GAIN * (GAS_RANDOM_FLOOR_FACTOR + (1.0 - GAS_RANDOM_FLOOR_FACTOR) * factor);
+        return GAS_RANDOM_GAIN * (GAS_RANDOM_FLOOR_FACTOR + (1.0 - GAS_RANDOM_FLOOR_FACTOR) * factor * GAS_RANDOM_HEAT_FACTOR);
     }}
     if (matter_state == MATTER_STATE_LIQUID && liquid_brownian_enabled != 0) {{
         float factor = temperature_motion_factor(temperature, LIQUID_THERMAL_TEMPERATURE_SPAN);
@@ -1282,8 +1293,10 @@ void main() {
             out_vec.x = base_velocity.x * 0.92;
             out_vec.y = base_velocity.y * 0.92;
             if (blocked_impulse_enabled != 0) {
-                out_vec.z = axis_remaining_after_step(desired.x, float(plan.y));
-                out_vec.w = axis_remaining_after_step(desired.y, float(plan.z));
+                out_vec.zw = decayed_blocked_impulse(vec2(
+                    axis_remaining_after_step(desired.x, float(plan.y)),
+                    axis_remaining_after_step(desired.y, float(plan.z))
+                ));
             }
             imageStore(state_int_dst, coord, source_int);
             imageStore(state_vec_dst, coord, out_vec);
@@ -1322,8 +1335,7 @@ void main() {
                 displaced_vec.x = displaced_base_velocity.x * STATIC_VELOCITY_DECAY;
                 displaced_vec.y = displaced_base_velocity.y * STATIC_VELOCITY_DECAY;
                 if (blocked_impulse_enabled != 0) {
-                    displaced_vec.z *= BLOCKED_DECAY;
-                    displaced_vec.w *= BLOCKED_DECAY;
+                    displaced_vec.zw = decayed_blocked_impulse(displaced_vec.zw);
                 } else {
                     displaced_vec.z = 0.0;
                     displaced_vec.w = 0.0;
@@ -1343,8 +1355,10 @@ void main() {
                 displaced_vec.x = displaced_base_velocity.x * VELOCITY_DECAY;
                 displaced_vec.y = displaced_base_velocity.y * VELOCITY_DECAY;
                 if (blocked_impulse_enabled != 0) {
-                    displaced_vec.z = axis_remaining_after_step(displaced_desired.x, float(-plan.y));
-                    displaced_vec.w = axis_remaining_after_step(displaced_desired.y, float(-plan.z));
+                    displaced_vec.zw = decayed_blocked_impulse(vec2(
+                        axis_remaining_after_step(displaced_desired.x, float(-plan.y)),
+                        axis_remaining_after_step(displaced_desired.y, float(-plan.z))
+                    ));
                 } else {
                     displaced_vec.z = 0.0;
                     displaced_vec.w = 0.0;
@@ -1397,8 +1411,7 @@ void main() {
         out_vec.x = base_velocity.x * STATIC_VELOCITY_DECAY;
         out_vec.y = base_velocity.y * STATIC_VELOCITY_DECAY;
         if (blocked_impulse_enabled != 0) {
-            out_vec.z = cell_vec.z * BLOCKED_DECAY;
-            out_vec.w = cell_vec.w * BLOCKED_DECAY;
+            out_vec.zw = decayed_blocked_impulse(cell_vec.zw);
         }
         imageStore(state_int_dst, coord, cell_int);
         imageStore(state_vec_dst, coord, out_vec);
@@ -1420,8 +1433,7 @@ void main() {
     out_vec.x = base_velocity.x * 0.92;
     out_vec.y = base_velocity.y * 0.92;
     if (blocked_impulse_enabled != 0) {
-        out_vec.z = desired.x * BLOCKED_DECAY;
-        out_vec.w = desired.y * BLOCKED_DECAY;
+        out_vec.zw = decayed_blocked_impulse(desired);
     }
 
     imageStore(state_int_dst, coord, cell_int);

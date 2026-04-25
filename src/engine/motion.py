@@ -25,8 +25,10 @@ GAS_BUOYANCY_SCALE = 10.0
 VELOCITY_DECAY = 0.92
 STATIC_VELOCITY_DECAY = 0.96
 INTENT_DECAY = 0.72
+BLOCKED_IMPULSE_MAX = 1.25
 LIQUID_RANDOM_GAIN = 0.012
 LIQUID_RANDOM_VERTICAL_FACTOR = 0.18
+EMPTY_RANDOM_GAIN = 0.52
 GAS_RANDOM_GAIN = 0.42
 GAS_RANDOM_VERTICAL_FACTOR = 0.85
 DIRECTION_JITTER_GAIN = 0.06
@@ -36,6 +38,7 @@ EMPTY_MOTION_TEMPERATURE_THRESHOLD = 0.5
 GAS_THERMAL_TEMPERATURE_SPAN = 120.0
 LIQUID_THERMAL_TEMPERATURE_SPAN = 400.0
 GAS_RANDOM_FLOOR_FACTOR = 0.35
+GAS_RANDOM_HEAT_FACTOR = 1.25
 LIQUID_RANDOM_FLOOR_FACTOR = 0.15
 DENSITY_EPSILON = 1e-6
 
@@ -94,7 +97,7 @@ def _effective_density(cell, variant, registry: MaterialRegistry) -> float:
 def _thermal_random_gain(grid: Grid, registry: MaterialRegistry, cell, variant) -> float:
     ambient_temperature = _ambient_air_temperature(registry)
     if cell.is_empty:
-        return GAS_RANDOM_GAIN * _temperature_motion_factor(
+        return EMPTY_RANDOM_GAIN * _temperature_motion_factor(
             cell.temperature,
             ambient_temperature,
             span=GAS_THERMAL_TEMPERATURE_SPAN,
@@ -105,7 +108,7 @@ def _thermal_random_gain(grid: Grid, registry: MaterialRegistry, cell, variant) 
             ambient_temperature,
             span=GAS_THERMAL_TEMPERATURE_SPAN,
         )
-        return GAS_RANDOM_GAIN * (GAS_RANDOM_FLOOR_FACTOR + (1.0 - GAS_RANDOM_FLOOR_FACTOR) * factor)
+        return GAS_RANDOM_GAIN * (GAS_RANDOM_FLOOR_FACTOR + (1.0 - GAS_RANDOM_FLOOR_FACTOR) * factor * GAS_RANDOM_HEAT_FACTOR)
     if variant.matter_state == MatterState.LIQUID and grid.liquid_brownian_enabled:
         factor = _temperature_motion_factor(
             cell.temperature,
@@ -197,6 +200,14 @@ def _axis_remaining_after_step(desired_component: float, realized_component: flo
     if realized_component == 0.0 or desired_component * realized_component <= 0.0:
         return desired_component
     return copysign(max(0.0, abs(desired_component) - abs(realized_component)), desired_component)
+
+
+def _clamp_blocked_impulse(value: float) -> float:
+    return max(-BLOCKED_IMPULSE_MAX, min(BLOCKED_IMPULSE_MAX, value))
+
+
+def _decayed_blocked_impulse(value: float) -> float:
+    return _clamp_blocked_impulse(value * INTENT_DECAY)
 
 
 def _downward_exchange_available(grid: Grid, registry: MaterialRegistry, x: int, y: int, variant) -> bool:
@@ -464,8 +475,8 @@ def _resolved_cell_after_forces(
         updated.vel_x = base_velocity_x * STATIC_VELOCITY_DECAY
         updated.vel_y = base_velocity_y * STATIC_VELOCITY_DECAY
         if blocked_enabled:
-            updated.blocked_x *= INTENT_DECAY
-            updated.blocked_y *= INTENT_DECAY
+            updated.blocked_x = _decayed_blocked_impulse(updated.blocked_x)
+            updated.blocked_y = _decayed_blocked_impulse(updated.blocked_y)
         else:
             updated.blocked_x = 0.0
             updated.blocked_y = 0.0
@@ -480,11 +491,11 @@ def _resolved_cell_after_forces(
         updated.blocked_x = 0.0
         updated.blocked_y = 0.0
     elif realized_step is None:
-        updated.blocked_x = desired_x * INTENT_DECAY
-        updated.blocked_y = desired_y * INTENT_DECAY
+        updated.blocked_x = _decayed_blocked_impulse(desired_x)
+        updated.blocked_y = _decayed_blocked_impulse(desired_y)
     else:
-        updated.blocked_x = _axis_remaining_after_step(desired_x, realized_step[0])
-        updated.blocked_y = _axis_remaining_after_step(desired_y, realized_step[1])
+        updated.blocked_x = _decayed_blocked_impulse(_axis_remaining_after_step(desired_x, realized_step[0]))
+        updated.blocked_y = _decayed_blocked_impulse(_axis_remaining_after_step(desired_y, realized_step[1]))
 
     return updated
 
