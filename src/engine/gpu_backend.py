@@ -13,7 +13,7 @@ from .types import CellFlag, CellState, LifetimeMode, MaterialRegistry, MatterSt
 
 
 WORKGROUP_SIZE = 8
-LIQUID_RELAXATION_PASSES = 0
+LIQUID_RELAXATION_PASSES = 2
 FORCE_WAVE_DECAY = 0.82
 INT_MAX_VALUE = 2_147_483_647
 PHASE_FLAG_ABOVE = 1
@@ -279,9 +279,9 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define FORCE_WAVE_DECAY 0.82
 #define LIQUID_LATERAL_PRESSURE_BOOST 1.35
 #define LIQUID_BLOCKED_LATERAL_BOOST 2.6
-#define LIQUID_SURFACE_SIDEFLOW_BONUS 0.8
-#define LIQUID_PRESSURE_HEAD_BOOST 0.25
-#define LIQUID_PRESSURE_HEAD_BOOST_CAP 2.5
+#define LIQUID_SURFACE_SIDEFLOW_BONUS 3.0
+#define LIQUID_PRESSURE_HEAD_BOOST 0.55
+#define LIQUID_PRESSURE_HEAD_BOOST_CAP 4.0
 #define LIQUID_RELAXATION_HEAD_THRESHOLD 1.5
 #define LIQUID_RELAXATION_NEIGHBOR_THRESHOLD 2
 #define LIQUID_VERTICAL_PRESSURE_SCALE 0.8
@@ -306,6 +306,8 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define LIQUID_THERMAL_TEMPERATURE_SPAN 400.0
 #define GAS_RANDOM_FLOOR_FACTOR 0.35
 #define LIQUID_RANDOM_FLOOR_FACTOR 0.15
+#define DENSITY_EPSILON 0.000001
+#define LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER 2.0
 
 #define VIEW_MODE_MATERIAL 0
 #define VIEW_MODE_TEMPERATURE 1
@@ -436,6 +438,10 @@ float ignite_temperature_for_variant(int variant_index) {{
 
 float melt_temperature_for_variant(int variant_index) {{
     return variant_table[variant_index].floats2.y;
+}}
+
+float freeze_temperature_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats2.z;
 }}
 
 float decompose_temperature_for_variant(int variant_index) {{
@@ -573,6 +579,28 @@ bool is_gas_state(int matter_state) {{
     return matter_state == MATTER_STATE_GAS;
 }}
 
+bool is_gas_like_variant(int variant_index) {{
+    return variant_index == EMPTY_VARIANT_INDEX || is_gas_state(matter_state_for_variant(variant_index));
+}}
+
+bool is_condensable_gas_variant(int variant_index) {{
+    return variant_index != EMPTY_VARIANT_INDEX
+        && is_gas_state(matter_state_for_variant(variant_index))
+        && freeze_temperature_for_variant(variant_index) > 0.0;
+}}
+
+bool is_liquid_variant(int variant_index) {{
+    return matter_state_for_variant(variant_index) == MATTER_STATE_LIQUID;
+}}
+
+float thermal_conduction_multiplier_between(int current_variant, int neighbor_variant) {{
+    bool current_liquid_neighbor_gas = is_liquid_variant(current_variant) && is_condensable_gas_variant(neighbor_variant);
+    bool neighbor_liquid_current_gas = is_liquid_variant(neighbor_variant) && is_condensable_gas_variant(current_variant);
+    return (current_liquid_neighbor_gas || neighbor_liquid_current_gas)
+        ? LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER
+        : 1.0;
+}}
+
 float ambient_temperature() {{
     return base_temperature_for_variant(EMPTY_VARIANT_INDEX);
 }}
@@ -670,7 +698,7 @@ vec2 apply_forces_to_velocity(
         return velocity;
     }}
     int matter_state = matter_state_for_variant(variant_index);
-    float random_gain = thermal_random_gain_for_cell(variant_index, temperature);
+    float random_gain = thermal_random_gain_for_cell(variant_index, temperature) * clamp(dt * 60.0, 0.0, 1.0);
     velocity.x += (hash01(coord, 11) - 0.5) * random_gain;
     float vertical_factor = (variant_index == EMPTY_VARIANT_INDEX || is_gas_state(matter_state))
         ? GAS_RANDOM_VERTICAL_FACTOR
@@ -989,7 +1017,25 @@ bool downward_exchange_available_local(ivec2 coord, int variant_index) {
     return target_is_lighter(variant_index, below_variant);
 }
 
-bool motion_target_is_lighter(int current_variant, float current_temperature, int target_variant, float target_temperature) {
+bool motion_target_can_exchange(int current_variant, float current_temperature, int target_variant, float target_temperature, ivec2 direction) {
+    if (current_variant == EMPTY_VARIANT_INDEX && target_variant != EMPTY_VARIANT_INDEX) {
+        return false;
+    }
+    if (
+        matter_state_for_variant(current_variant) == MATTER_STATE_LIQUID
+        && matter_state_for_variant(target_variant) == MATTER_STATE_GAS
+        && direction.y < 0
+    ) {
+        return false;
+    }
+    if (is_gas_like_variant(current_variant) && is_gas_like_variant(target_variant) && direction.y != 0) {
+        float current_density = effective_density_for_variant_and_temperature(current_variant, current_temperature);
+        float target_density = effective_density_for_variant_and_temperature(target_variant, target_temperature);
+        if (direction.y < 0) {
+            return current_density < target_density - DENSITY_EPSILON;
+        }
+        return current_density > target_density + DENSITY_EPSILON;
+    }
     if (current_variant == EMPTY_VARIANT_INDEX) {
         return target_variant == EMPTY_VARIANT_INDEX;
     }
@@ -1030,6 +1076,9 @@ ivec4 find_exchange_plan(ivec2 coord, int variant_index, float current_temperatu
     ivec2 best_direction = ivec2(0, 0);
     int best_target = -1;
     int best_swap = 0;
+    if (length(desired) <= 0.000001) {
+        return ivec4(-1, 0, 0, 0);
+    }
     int surface_outflow_direction = surface_outflow_direction_local(coord, variant_index);
     float jitter_gain = DIRECTION_JITTER_GAIN;
     if (length(desired) < 0.05) {
@@ -1045,7 +1094,7 @@ ivec4 find_exchange_plan(ivec2 coord, int variant_index, float current_temperatu
         }
         int target_variant = imageLoad(state_int_src, neighbor_coord).x;
         float target_temperature = imageLoad(state_misc_src, neighbor_coord).x;
-        if (!motion_target_is_lighter(variant_index, current_temperature, target_variant, target_temperature)) {
+        if (!motion_target_can_exchange(variant_index, current_temperature, target_variant, target_temperature, direction)) {
             continue;
         }
         float score = direction_score(direction, desired) + direction_jitter(coord, direction, jitter_gain);
@@ -1413,6 +1462,7 @@ void main() {
         ivec4 neighbor_int = imageLoad(state_int_src, neighbor_coord);
         vec4 neighbor_misc = imageLoad(state_misc_src, neighbor_coord);
         float conductivity = (thermal_conductivity_for_variant(variant_index) + thermal_conductivity_for_variant(neighbor_int.x)) * 0.5;
+        conductivity *= thermal_conduction_multiplier_between(variant_index, neighbor_int.x);
         float capacity = max((heat_capacity_for_variant(variant_index) + heat_capacity_for_variant(neighbor_int.x)) * 0.5, 0.001);
         float delta = (neighbor_misc.x - cell_misc.x) * conductivity * THERMAL_CONDUCTION_RATE * dt / capacity;
         next_temperature += clamp(delta, -MAX_HEAT_EXCHANGE, MAX_HEAT_EXCHANGE);

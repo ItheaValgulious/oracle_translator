@@ -244,6 +244,23 @@ class EngineCoreTests(unittest.TestCase):
         hottest_y = max(range(grid.height), key=lambda y: grid.get_cell(0, y).temperature)
         self.assertLess(hottest_y, 3)
 
+    def test_cold_empty_air_advects_downward(self) -> None:
+        grid = create_grid(1, 5)
+        inject_cells(grid, [(0, 1)], "empty", "empty", {"temperature": -80.0}, registry=self.registry)
+        for _ in range(3):
+            step(grid, self.registry, 1 / 60.0)
+        coldest_y = min(range(grid.height), key=lambda y: grid.get_cell(0, y).temperature)
+        self.assertGreater(coldest_y, 1)
+
+    def test_steam_cluster_surrounded_by_water_cools_and_condenses(self) -> None:
+        grid = create_grid(9, 9)
+        inject_cells(grid, [(x, y) for y in range(9) for x in range(9)], "water", "water", {"temperature": 20.0})
+        inject_cells(grid, [(x, y) for y in range(2, 7) for x in range(2, 7)], "water", "steam", {"temperature": 120.0})
+        for _ in range(60):
+            step(grid, self.registry, 1 / 60.0)
+        steam_count = sum(1 for cell in grid.cells if cell.variant_id == "steam")
+        self.assertEqual(steam_count, 0)
+
     def test_temperature_moves_with_moving_cell(self) -> None:
         grid = create_grid(3, 3)
         inject_cells(grid, [(1, 0)], "sand", "sand_powder", {"temperature": 80.0})
@@ -572,6 +589,31 @@ class EngineCoreTests(unittest.TestCase):
         readback = gpu.readback_grid()
         hottest_y = max(range(readback.height), key=lambda y: readback.get_cell(0, y).temperature)
         self.assertLess(hottest_y, 3)
+
+    def test_gpu_cold_empty_air_advects_downward(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(1, 5)
+        inject_cells(grid, [(0, 1)], "empty", "empty", {"temperature": -80.0}, registry=self.registry)
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        for _ in range(3):
+            gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        coldest_y = min(range(readback.height), key=lambda y: readback.get_cell(0, y).temperature)
+        self.assertGreater(coldest_y, 1)
+
+    def test_gpu_steam_cluster_surrounded_by_water_cools_and_condenses(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(9, 9)
+        inject_cells(grid, [(x, y) for y in range(9) for x in range(9)], "water", "water", {"temperature": 20.0})
+        inject_cells(grid, [(x, y) for y in range(2, 7) for x in range(2, 7)], "water", "steam", {"temperature": 120.0})
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        for _ in range(60):
+            gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        steam_count = sum(1 for cell in readback.cells if cell.variant_id == "steam")
+        self.assertEqual(steam_count, 0)
 
     def test_gpu_temperature_moves_with_moving_cell(self) -> None:
         ctx = create_compute_context()

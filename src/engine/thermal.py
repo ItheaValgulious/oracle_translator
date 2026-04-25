@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 from .grid import Grid
-from .types import MaterialRegistry
+from .types import MaterialRegistry, MatterState
 
 
 MAX_HEAT_EXCHANGE = 120.0
 THERMAL_CONDUCTION_RATE = 8.0
+LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER = 2.0
+
+
+def _liquid_gas_interface_multiplier(current, current_variant, neighbor, neighbor_variant) -> float:
+    current_is_condensable_gas = (
+        not current.is_empty and current_variant.matter_state == MatterState.GAS and current_variant.freeze_temperature is not None
+    )
+    neighbor_is_condensable_gas = (
+        not neighbor.is_empty and neighbor_variant.matter_state == MatterState.GAS and neighbor_variant.freeze_temperature is not None
+    )
+    current_is_liquid = current_variant.matter_state == MatterState.LIQUID
+    neighbor_is_liquid = neighbor_variant.matter_state == MatterState.LIQUID
+    if (current_is_liquid and neighbor_is_condensable_gas) or (neighbor_is_liquid and current_is_condensable_gas):
+        return LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER
+    return 1.0
 
 
 def apply_thermal(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
@@ -24,6 +39,7 @@ def apply_thermal(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
                 neighbor = grid.get_cell(nx, ny)
                 neighbor_variant = registry.variant(neighbor.family_id, neighbor.variant_id)
                 conductivity = (current_variant.thermal_conductivity + neighbor_variant.thermal_conductivity) * 0.5
+                conductivity *= _liquid_gas_interface_multiplier(current, current_variant, neighbor, neighbor_variant)
                 capacity = max((current_variant.heat_capacity + neighbor_variant.heat_capacity) * 0.5, 0.001)
                 delta = (neighbor.temperature - current.temperature) * conductivity * THERMAL_CONDUCTION_RATE * dt / capacity
                 delta = max(-MAX_HEAT_EXCHANGE, min(MAX_HEAT_EXCHANGE, delta))
