@@ -11,9 +11,10 @@
 
 - `engine.types.MaterialFamily`
 - `engine.types.MaterialRegistry`
+- `engine.types.MatterState`
+- `engine.types.MotionMode`
 - `engine.types.PhaseRule`
 - `engine.types.ReactionKind`
-- `engine.types.SimKind`
 - `engine.types.VariantDef`
 
 ## 主要功能
@@ -25,4 +26,12 @@
   - 变体静态参数
   - 相变闭环
   - 反应与渲染配置
+- 用 `matter_state + motion_mode + density` 组合描述每个变体的运动与交换语义。
+- 为反应变体提供“是否在成功反应后保留自身”的静态开关。
+- 为反应变体区分“反应效果强度”和“反应热量”两类参数; 其中 `reaction_energy` 用于表达反应时吸热或放热。
+- 给 `empty`、`platform/fixpoint` 等固体以及流体都配置导热率,让热量能经空气和材质一起扩散。
+- `empty` 当前使用较高于早期版本的导热率,避免热空气在热力图上看起来像几乎不和周围空气交换。
+- `empty` 当前也作为空气格参与气体式运动,用于表达热空气上浮和空气布朗运动。
+- `base_temperature` 只表示创建 cell 时的默认初始温度,不表示已有 cell 的温度回归目标。
+- `fire` 当前通过 `reaction_energy` 在每步先加热自身,再由热传导把热量扩散到周围空气和材质。
 - 让 `engine` 其他模块通过查表获得静态材质参数,而不是把这些参数复制到每个 cell。

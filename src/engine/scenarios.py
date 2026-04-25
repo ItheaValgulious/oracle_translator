@@ -21,8 +21,8 @@ def populate_demo_scene(grid: Grid, registry: MaterialRegistry | None = None) ->
     right_anchor = min(width - 3, width - width // 8)
     bridge_y = max(6, height // 2)
 
-    inject_cells(grid, [(left_anchor, bridge_y)], "stone", "stone_platform", {"flags": CellFlag.FIXPOINT, "support_value": 1.0}, registry=registry)
-    inject_cells(grid, [(right_anchor, bridge_y)], "stone", "stone_platform", {"flags": CellFlag.FIXPOINT, "support_value": 1.0}, registry=registry)
+    inject_cells(grid, [(left_anchor, bridge_y)], "stone", "stone_platform", {"flags": CellFlag.FIXPOINT}, registry=registry)
+    inject_cells(grid, [(right_anchor, bridge_y)], "stone", "stone_platform", {"flags": CellFlag.FIXPOINT}, registry=registry)
     for x in range(left_anchor + 1, right_anchor):
         inject_cells(grid, [(x, bridge_y)], "stone", "stone_platform", registry=registry)
 

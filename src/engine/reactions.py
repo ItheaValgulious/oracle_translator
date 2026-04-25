@@ -28,8 +28,7 @@ def _spawn_fire(cell: CellState) -> CellState:
 
 
 def _empty_like(cell: CellState) -> CellState:
-    del cell
-    return CellState()
+    return CellState(temperature=cell.temperature)
 
 
 def apply_reactions(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
@@ -40,18 +39,14 @@ def apply_reactions(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
             current = grid.get_cell(x, y)
             variant = registry.variant(current.family_id, current.variant_id)
             updated = grid.get_cell(x, y, use_scratch=True)
+            consumed_by_reaction = False
 
             if variant.reaction_kind == ReactionKind.HEAT_SOURCE:
                 updated.age = current.age + dt
+                updated.temperature += variant.reaction_energy * dt / max(variant.heat_capacity, 0.001)
                 max_age = registry.family(current.family_id).reaction_profile.get("max_age", 6.0)
-                for dx, dy in NEIGHBORS_8:
-                    nx = x + dx
-                    ny = y + dy
-                    if not grid.in_bounds(nx, ny):
-                        continue
-                    grid.get_cell(nx, ny, use_scratch=True).temperature += variant.reaction_strength * dt
                 if updated.age >= max_age:
-                    grid.set_cell(x, y, _empty_like(current), use_scratch=True)
+                    grid.set_cell(x, y, _empty_like(updated), use_scratch=True)
                     continue
 
             if current.family_id == "tar":
@@ -74,6 +69,7 @@ def apply_reactions(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
                     updated.variant_id = "tar_smoke"
 
             if variant.reaction_kind == ReactionKind.CORROSIVE:
+                corroded_anything = False
                 for dx, dy in NEIGHBORS_8:
                     nx = x + dx
                     ny = y + dy
@@ -85,6 +81,9 @@ def apply_reactions(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
                         target = grid.get_cell(nx, ny, use_scratch=True)
                         corrosion = variant.reaction_strength * dt / max(neighbor_variant.hardness, 0.05)
                         target.integrity = max(0.0, target.integrity - corrosion)
+                        corroded_anything = True
+                if corroded_anything and not variant.reaction_preserves_self:
+                    consumed_by_reaction = True
 
             if current.family_id == "poison" and current.temperature >= (variant.decompose_temperature or 10_000.0):
                 updated.family_id = "poison"
@@ -108,5 +107,8 @@ def apply_reactions(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
                         0.0,
                         target.integrity - (current.temperature - heat_start) * variant.integrity_decay_from_heat * dt,
                     )
+
+            if consumed_by_reaction:
+                grid.set_cell(x, y, _empty_like(updated), use_scratch=True)
 
     grid.swap_buffers()

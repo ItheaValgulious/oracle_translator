@@ -26,4 +26,5 @@
   - `water <-> ice <-> steam`
   - `acid_liquid -> acid_gas`
   - `poison_liquid -> poison_gas`
-- 在熔融体冷却时,按当前支撑状态决定回 `platform` 还是同家族碎屑。
+- 在熔融体冷却时,按 `support_value > 0` 的当前支撑新鲜度决定回 `platform` 还是同家族碎屑。
+- 相变只改变 cell 的家族/变体身份,不会把当前温度重置或夹到目标变体的 `base_temperature`。

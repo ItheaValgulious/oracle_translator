@@ -15,16 +15,16 @@ def _convert_cell(
     updated = cell.copy()
     updated.family_id = target_family_id
     updated.variant_id = target_variant_id
-    updated.temperature = max(updated.temperature, target_variant.base_temperature)
     updated.age = 0.0
     if not target_variant.support_bearing:
         updated.flags &= ~CellFlag.FIXPOINT
         updated.support_value = 0.0
+        updated.generation = 0
     return updated
 
 
 def _cooled_variant(family: MaterialFamily, cell: CellState) -> str:
-    if cell.support_value >= SUPPORT_FAILURE_THRESHOLD:
+    if cell.support_value > SUPPORT_FAILURE_THRESHOLD:
         return family.default_variant
     return family.collapse_target or family.default_variant
 

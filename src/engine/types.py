@@ -5,14 +5,16 @@ from enum import Enum, IntFlag
 from typing import Any
 
 
-class SimKind(str, Enum):
-    EMPTY = "empty"
-    PLATFORM = "platform"
-    POWDER = "powder"
+class MatterState(str, Enum):
+    SOLID = "solid"
     LIQUID = "liquid"
     GAS = "gas"
-    FIRE = "fire"
-    MOLTEN = "molten"
+
+
+class MotionMode(str, Enum):
+    STATIC = "static"
+    POWDER = "powder"
+    FLUID = "fluid"
 
 
 class ReactionKind(str, Enum):
@@ -54,7 +56,8 @@ class PhaseRule:
 @dataclass(frozen=True)
 class VariantDef:
     variant_id: str
-    sim_kind: SimKind
+    matter_state: MatterState
+    motion_mode: MotionMode
     density: float
     hardness: float
     friction: float
@@ -72,6 +75,8 @@ class VariantDef:
     integrity_decay_from_heat: float = 0.0
     reaction_kind: ReactionKind = ReactionKind.NONE
     reaction_strength: float = 0.0
+    reaction_energy: float = 0.0
+    reaction_preserves_self: bool = True
     lifetime_mode: LifetimeMode = LifetimeMode.NONE
     render_color: tuple[int, int, int] = (255, 255, 255)
 

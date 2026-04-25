@@ -18,7 +18,8 @@
 
 - 核心模拟已经可以独立步进
 - demo 可以开窗,实时渲染网格并用笔刷注入材质
-- GPU 后端本身仍未实现,当前只是用 ModernGL 显示 CPU 模拟结果
+- demo 优先使用 compute shader GPU backend 步进和着色
+- CPU 路径保留为 reference 和 fallback
 
 ## 1. 当前目标
 
@@ -29,6 +30,7 @@
 - `platform` 失撑后逐步粉化，而不是整块刚体坍塌
 - 每格速度向量与 `blocked_impulse`
 - 热传导
+- 热空气、气体与液体的温度相关运动
 - 家族内相变
 - `fire/acid/poison/tar` 的基础反应
 
@@ -51,7 +53,7 @@
   - 不是反弹，不是反向冲量。
   - 下一步会和 `vel` 共同决定新的主方向。
 - `temperature`
-  - 当前温度。
+  - 当前温度,是跟随 cell 移动和交换的动态状态。
 - `support_value`
   - 当前收到的支撑强度。
 - `integrity`
@@ -91,15 +93,16 @@
 `VariantDef` 定义一个具体变体的静态模拟参数。
 
 - `variant_id`
-- `sim_kind`
-  - 例如：
-    - `EMPTY`
-    - `PLATFORM`
-    - `POWDER`
-    - `LIQUID`
-    - `GAS`
-    - `FIRE`
-    - `MOLTEN`
+- `matter_state`
+  - 只分:
+    - `solid`
+    - `liquid`
+    - `gas`
+- `motion_mode`
+  - 例如:
+    - `static`
+    - `powder`
+    - `fluid`
 - `density`
 - `hardness`
 - `friction`
@@ -109,6 +112,7 @@
 - `support_bearing`
 - `support_transmission`
 - `base_temperature`
+  - 只表示创建 cell 时的默认初始温度,不会把已有 cell 拉回这个温度。
 - 相变阈值：
   - `ignite_temperature`
   - `melt_temperature`
@@ -118,6 +122,7 @@
 - `integrity_decay_from_heat`
 - `reaction_kind`
 - `reaction_strength`
+- `reaction_energy`
 - `lifetime_mode`
 - `render_color` 或 `palette_id`
 
@@ -133,13 +138,17 @@
 
 ### 4.2 support_value
 
-支撑信号采用连续值场，但只在承重网络内传播：
+支撑信号按离散波次传播,但只在承重网络内传播：
 
-- `fixpoint` 持续注入 `support_value`
+- `fixpoint` 每个模拟步发出一个新的支撑波次
 - 只有 `fixpoint/platform` 网络传播支撑
+- 每个模拟步只向相邻格传播一格,靠多帧传到远处
+- 连通的 `platform` 网络不按距离削弱支撑波次
+- `generation` 记录已收到的最新波次 id,只有更新的波次才能继续刷新平台
+- `support_value` 表示距离失撑还剩多少秒,当前超时时间先设为 10 秒
 - `powder/liquid/gas/fire/molten` 不传播支撑
 
-当 `support_value` 低于阈值时：
+当 `platform` 超过 10 秒没有收到新支撑波次时：
 
 - 结构不会立刻塌
 - 而是开始持续降低 `integrity`
@@ -160,13 +169,76 @@
 - 反向回弹
 - 法向反作用力的直接存储
 
-下一步的主方向由以下量合成：
+当前运动改为:
 
-```text
-drive = vel + blocked_impulse + 重力/浮力偏置
-```
+- 先计算一个统一压力标量场 `pressure`
+- 再由压力差生成速度变化
+- 最后按 `8 邻域` 里与当前速度夹角最小的方向选择交换目标
 
-候选方向使用 `8 邻域`，并按与 `drive` 夹角从小到大搜索。
+当前压力语义是:
+
+- 气体格:
+  - 给本格提供 `air_pressure + gas_density` 的局部压力
+- 非气体格:
+  - 压力逐步回归空气基准压力
+- 液体格:
+  - 自上而下累积
+  - 当前格压力 = 上一格压力 + 当前液体密度
+
+当前受力语义是:
+
+- 先由压强梯度得到本地 `source force`
+- 再维护一个跨帧持久化的 `force wave`
+- 当前帧注入的源项是:
+  - `delta = source - lambda * prev_source`
+- `force wave` 会沿连通液体跨帧向外传播
+- 当前运动最终使用:
+  - `source force + propagated wave`
+- 这样远处液体不需要在同一帧内多次 `motion` 迭代,也能逐步吃到来自高压液柱的横向传力
+
+当前速度语义是:
+
+- `platform/fixpoint`
+  - 当前仍不移动
+  - 但会先更新受压后的 `vec`,为后续扩展留接口
+- `powder`
+  - 受重力
+- `liquid`
+  - 在 `powder` 基础上增加极小的温度相关布朗运动
+  - 液面整平当前主要靠横向压差,而不是靠放大布朗运动
+  - 当下方不可交换时,会显著加强横向压力驱动,加快大尺度铺开
+  - 深水区会额外按压头增强横向推力,避免大水堆长时间保持高弧顶
+  - 对自由表面和外侧壁,当前还会对“纯水平向外”的离散候选方向做额外偏置,减少边缘格总是优先往斜下掉而形成锯齿
+- `gas`
+  - 在 `liquid` 基础上按温度修正后的等效密度决定上浮或下沉
+  - 当前会使用比液体更强的温度相关布朗运动,避免只剩单向浮沉
+- `empty`
+  - 当前作为空气格参与对流
+  - 只有在温度明显偏离环境或已有残余速度时才会主动移动
+
+目标格是否可交换:
+
+- 不是只看空不空
+- 而是看目标是否更轻
+- 比较顺序是:
+- 先比物态: `solid > liquid > gas`
+- 同物态再比密度
+- 空背景仍视作可交换目标
+
+当前交换落地语义还包括:
+
+- source 成功交换到目标格后
+- 被顶开的目标格不会只是“原样塞回 source 位置”
+- 而是会先应用它自身的受力、随机扰动和剩余意图
+- 再作为 displaced cell 落到 source 位置
+- 这样可以避免下落固体长期把液体一路抬高成细柱
+
+`blocked_impulse` 当前更接近“剩余移动意图 / 未释放需求”,用于把连续速度拆成多步离散移动。
+
+当前阶段为了控制 GPU 开销,液体额外多次迭代保持关闭:
+
+- 每个外部 `step` 当前只跑一次完整 `motion`
+- 液体内部更远处的传力当前主要依赖跨帧的 `force wave`,而不再依赖同一帧里重复跑多轮 liquid relaxation
 
 ## 6. 首批材质族闭环
 
@@ -218,7 +290,8 @@ drive = vel + blocked_impulse + 重力/浮力偏置
 
 - `fire`
   - 使用 `age`
-  - 作为加热源
+  - 在反应阶段按 `reaction_energy` 对自身放热
+  - 对周围的升温统一通过后续 `thermal` 的邻格温差传导完成
 - `acid`
   - 主打腐蚀
   - 可让结构掉 `integrity`
@@ -241,8 +314,16 @@ drive = vel + blocked_impulse + 重力/浮力偏置
 
 - 打开桌面窗口
 - 实时步进模拟
+- 优先使用 GPU compute shader,不可用时回退 CPU reference
+- overlay 显示当前 backend、刷新频率和网格/窗口尺寸
+- overlay 显示当前模拟子步进数与调试视图
+- 可运行时开关液体布朗运动,便于观察其对液体铺开和性能的影响
+- 可运行时开关 `blocked_impulse`,便于观察残余意图是否导致液体边缘异常运动
 - 鼠标绘制/擦除
 - 切换 `stone/fixpoint/sand/water/fire/acid/tar/poison/ice`
+- 可切换材质视图 / 温度视图 / 压力视图
+- 初始网格分辨率和窗口大小可由启动参数配置
+- 窗口可直接拖拽调整大小
 - 暂停、单步、重置和清空场景
 
 ## 9. 第一版不做什么
@@ -251,9 +332,23 @@ drive = vel + blocked_impulse + 重力/浮力偏置
 - 不做整块刚体坍塌
 - 不做 Godot 集成
 - 不做实时模型 socket 接入
-- 不做真正的 GPU 模拟后端
 
 当前阶段是：
 
-- CPU 做模拟
-- `pyglet + ModernGL` 只做 demo 壳与显示
+- compute shader GPU backend 负责 `support / motion / thermal / phases / reactions / collapse` 和调试着色输出
+- CPU 路径保留为同规则 reference 实现
+- `pyglet + ModernGL` 继续作为桌面 demo 壳
+- demo 当前允许“一次渲染对应多次模拟子步进”
+- `support` 当前按“fixpoint 持续发信号, platform 跨多帧逐格保持传播”的方式工作
+- 压力场当前已进入 CPU/GPU 两条路径,并参与速度更新
+- `solid` 当前已经会更新受压后的 `vec`,但仍不移动
+- 重液下沉和液体/气体分层当前都通过统一的交换式 `motion` 完成
+- `fire` 和 `steam` 当前按“比空气轻”上浮, `poison_gas` 当前按“高于空气密度”下沉
+- 气体当前的布朗运动和浮力都受当前温度影响; 温度越高,等效密度越低
+- `liquid/gas/fire` 的扩散当前按质量守恒处理,是移动或交换,不是凭空复制
+- `acid` 当前在成功腐蚀承重目标后会自耗
+- `poison` 当前主要是受热挥发成更易扩散的毒气,本轮不主打地形腐蚀
+- 温度当前可以通过空气、`platform/fixpoint` 等固体和流体一起传导
+- 温度是 cell 的动态状态,运动或交换时随 cell 一起移动
+- 物质离开某格时,留下的 `empty` 空气仍保留被加热后的温度,尤其 `fire` 移走或熄灭不会把原位置重置成默认空气温度
+- 热空气当前除了导热,还会通过空气格交换向上漂移

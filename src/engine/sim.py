@@ -7,7 +7,7 @@ from .materials import build_material_registry
 from .motion import apply_motion
 from .phases import apply_phase_transitions
 from .reactions import apply_reactions
-from .support import apply_support
+from .support import SUPPORT_SOURCE_VALUE, apply_support
 from .thermal import apply_thermal
 from .types import CellFlag, CellState, MaterialRegistry
 
@@ -29,6 +29,7 @@ def _collapse_cells(grid: Grid, registry: MaterialRegistry) -> None:
             collapsed.variant_id = collapse_target
             collapsed.flags &= ~CellFlag.FIXPOINT
             collapsed.support_value = 0.0
+            collapsed.generation = 0
             collapsed.integrity = 0.6
             collapsed.age = 0.0
             grid.set_cell(x, y, collapsed, use_scratch=True)
@@ -37,11 +38,12 @@ def _collapse_cells(grid: Grid, registry: MaterialRegistry) -> None:
 
 def step(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
     apply_support(grid, registry, dt)
-    apply_motion(grid, registry, dt)
+    apply_reactions(grid, registry, dt)
     apply_thermal(grid, registry, dt)
     apply_phase_transitions(grid, registry, dt)
-    apply_reactions(grid, registry, dt)
+    apply_motion(grid, registry, dt)
     _collapse_cells(grid, registry)
+    grid.step_id += 1
 
 
 def inject_cells(
@@ -80,5 +82,5 @@ def inject_cells(
             continue
         cell = base.copy()
         if cell.flags & CellFlag.FIXPOINT:
-            cell.support_value = 1.0
+            cell.support_value = SUPPORT_SOURCE_VALUE
         grid.set_cell(x, y, cell)

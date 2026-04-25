@@ -26,9 +26,10 @@
 
 - 统一按顺序执行:
   - `support`
-  - `motion`
+  - `reactions`
   - `thermal`
   - `phases`
-  - `reactions`
+  - `motion`
   - `collapse`
-- 提供手工注入接口给后续 `pyglet + ModernGL` 壳和测试场景使用。
+- 每次完整步进后推进 `grid.step_id`,供后续步的确定性随机运动使用。
+- 提供手工注入接口给后续 `pyglet + ModernGL` 壳和测试场景使用; 注入 `fixpoint` 时会初始化 10 秒支撑新鲜度。

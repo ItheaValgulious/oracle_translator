@@ -5,16 +5,39 @@
 ## 对外接口
 
 - `apply_motion(grid, registry, dt)`
-  - 基于 `vel + blocked_impulse + gravity` 更新移动结果。
+  - 基于速度、剩余意图和“更轻目标交换”规则更新移动结果。
 
 ## 依赖的对外接口
 
 - `engine.grid.Grid`
 - `engine.types.MaterialRegistry`
-- `engine.types.SimKind`
+- `engine.types.MatterState`
+- `engine.types.MotionMode`
 
 ## 主要功能
 
-- 对 `powder/liquid/gas/fire/molten` 这几类可动物质做局部移动。
-- 从主方向开始,按与 `drive` 的夹角从小到大搜索候选空位。
-- 把未实现的那部分主方向需求累积到 `blocked_impulse`,而不是做反向回弹。
+- 先更新统一压力标量场。
+- 由压力梯度生成当前帧的局部 `source force` 向量场。
+- 维护 `prev_source_force` 与 `force_wave`,并用 `delta = source - lambda * prev_source` 的方式把受力跨帧往连通液体内部传播。
+- `platform/fixpoint` 当前仍不移动,但会先更新受压后的 `vec`。
+- `powder` 受重力。
+- `liquid` 在 `powder` 基础上增加极小的温度相关布朗运动,主要靠横向压差而不是靠随机项铺开。
+- 液体随机扰动当前受 `grid.liquid_brownian_enabled` 运行时开关控制,方便对比布朗运动对液体铺开和性能的影响。
+- `blocked_impulse` 当前也受 `grid.blocked_impulse_enabled` 运行时开关控制; 关闭后,速度求解不再读取旧的残余意图,并会把已有 `blocked_x/y` 清零。
+- 当液体下方不可交换时,会额外放大横向压力响应,加快液面整平和大尺度铺开。
+- 深水区在下方受阻时,还会按局部压头额外增强横向推力,缩短大水堆弧顶维持时间。
+- `gas` 在 `liquid` 基础上根据当前温度修正后的等效密度决定上浮或下沉,并使用更强的温度相关布朗运动。
+- `empty` 空气格在温度明显偏离环境时也会像气体包一样运动,用于表达热空气上浮和空气对流。
+- 运动使用的是“局部 pressure source + 持久化 propagated wave”的总受力,而不是只用本地压力梯度。
+- 目标格是否可交换先比较物态 `solid > liquid > gas`,同物态再比较密度。
+- 离散移动仍按与当前速度夹角最小的 `8 邻域` 目标选择。
+- 对液体自由表面或外侧壁,当前还会给“纯水平向外”的候选方向一个额外偏置,尽量减少边缘格总是优先选 `右下/左下` 造成的锯齿滴落。
+- 当多个方向分数接近时,会用轻量哈希扰动打破固定偏向,避免总是朝固定对角漂。
+- 但在液体布朗运动被关闭,或当前 `desired` 很小时,这层方向扰动也会被抑制,避免“关了布朗仍然有隐藏随机走位”。
+- `blocked_impulse` 承担连续速度拆成多步离散移动时剩余意图的职责。
+- occupied-target 交换时,被顶开的目标格也会先应用自身受力和剩余意图,再回填到 source 位置。
+- `temperature` 是 cell 的动态状态,移动或交换时会跟随对应 cell 一起搬到新位置。
+- 当物质移入 `empty` 时,原位置留下的空气会保留源物质和目标空气二者中较高的温度,不会重置成创建温度。
+- 空空气格之间交换时会直接交换各自的空气包状态,不会复制热量。
+- 当前为了控制 GPU 开销,液体额外多次迭代已关闭; 每个外部 `step` 只跑一次完整 `motion`,液体内部的远程传力主要靠持久化 `force_wave` 跨帧传播。
+- 当周围都没有更轻目标可交换时,当前意图和速度都会衰减。
