@@ -9,13 +9,17 @@ import moderngl
 import pyglet
 from pyglet.window import key, mouse
 
-from .gpu_backend import ComputeBackendUnavailable, GpuSimulator
-from .grid import create_grid
+from .gpu_backend import ComputeBackendUnavailable
 from .materials import build_material_registry
-from .render import DebugViewMode, build_rgba_frame
+from .render import DebugViewMode
 from .scenarios import populate_demo_scene
-from .sim import inject_cells, step
 from .types import CellFlag
+from .world import (
+    DEFAULT_HALO_CELLS,
+    DEFAULT_PAGE_SHIFT_CELLS,
+    ActiveWorldWindow,
+    WorldChunkStore,
+)
 
 
 @dataclass(frozen=True)
@@ -55,10 +59,12 @@ void main() {
 FRAGMENT_SHADER = """
 #version 330
 uniform sampler2D frame_tex;
+uniform vec2 view_uv_origin;
+uniform vec2 view_uv_scale;
 in vec2 v_uv;
 out vec4 fragColor;
 void main() {
-    fragColor = texture(frame_tex, v_uv);
+    fragColor = texture(frame_tex, view_uv_origin + v_uv * view_uv_scale);
 }
 """
 
@@ -78,6 +84,10 @@ class VoxelDemoWindow(pyglet.window.Window):
         grid_width: int = 160,
         grid_height: int = 96,
         *,
+        world_width: int | None = None,
+        world_height: int | None = None,
+        halo_cells: int = DEFAULT_HALO_CELLS,
+        page_shift_cells: int = DEFAULT_PAGE_SHIFT_CELLS,
         cell_scale: int = 8,
         window_width: int | None = None,
         window_height: int | None = None,
@@ -96,13 +106,14 @@ class VoxelDemoWindow(pyglet.window.Window):
             resizable=True,
             vsync=vsync,
         )
-        self.grid = create_grid(grid_width, grid_height)
-        self.grid.liquid_brownian_enabled = bool(liquid_brownian_enabled)
-        self.grid.blocked_impulse_enabled = bool(blocked_impulse_enabled)
-        self.grid.directional_fallback_enabled = bool(directional_fallback_enabled)
+
         self.registry = build_material_registry()
-        populate_demo_scene(self.grid, self.registry)
-        self.gpu_simulator: GpuSimulator | None = None
+        self.viewport_grid_width = int(grid_width)
+        self.viewport_grid_height = int(grid_height)
+        self.world_grid_width = int(world_width if world_width is not None else max(grid_width * 2, grid_width + halo_cells * 4))
+        self.world_grid_height = int(world_height if world_height is not None else max(grid_height * 2, grid_height + halo_cells * 4))
+        self.halo_cells = int(halo_cells)
+        self.page_shift_cells = int(page_shift_cells)
         self.cell_scale = cell_scale
         self.target_tick_hz = DEFAULT_TICK_RATE_HZ
         self.last_tick_dt = 1.0 / self.target_tick_hz
@@ -117,9 +128,11 @@ class VoxelDemoWindow(pyglet.window.Window):
         self.liquid_brownian_enabled = bool(liquid_brownian_enabled)
         self.blocked_impulse_enabled = bool(blocked_impulse_enabled)
         self.directional_fallback_enabled = bool(directional_fallback_enabled)
-        self.directional_fallback_angle_limit_degrees = float(self.grid.directional_fallback_angle_limit_degrees)
+        self.directional_fallback_angle_limit_degrees = 45.0
         self.backend_label = "CPU Reference"
         self.backend_detail = ""
+        self.camera_pan_cells = max(8, self.page_shift_cells // 4)
+        self.world: ActiveWorldWindow | None = None
 
         try:
             self.ctx = moderngl.create_context()
@@ -160,19 +173,8 @@ class VoxelDemoWindow(pyglet.window.Window):
             [(quad, "2f 2f", "in_pos", "in_uv")],
         )
 
-        try:
-            self.gpu_simulator = GpuSimulator(self.ctx, self.grid, self.registry)
-            self.texture = self.gpu_simulator.frame_texture
-            self.backend_label = "GPU Compute"
-        except (ComputeBackendUnavailable, Exception) as exc:  # noqa: BLE001
-            self.gpu_simulator = None
-            self.texture = self.ctx.texture((grid_width, grid_height), 4, build_rgba_frame(self.grid, self.registry))
-            self.backend_detail = f"{type(exc).__name__}: {exc}"
-        self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.texture.repeat_x = False
-        self.texture.repeat_y = False
-        self.texture.use(location=0)
-        self.program["frame_tex"].value = 0
+        self.texture: moderngl.Texture | None = None
+        self._rebuild_world(populate_scene=True)
 
         self.overlay = pyglet.text.Label(
             "",
@@ -187,17 +189,84 @@ class VoxelDemoWindow(pyglet.window.Window):
         self._refresh_overlay()
         pyglet.clock.schedule_interval(self.tick, 1.0 / self.target_tick_hz)
 
-    def _screen_to_grid(self, sx: int, sy: int) -> tuple[int, int]:
-        window_width = max(1, int(self.width))
-        window_height = max(1, int(self.height))
-        screen_x = float(sx)
-        screen_y = float(sy)
-        gx = max(0, min(self.grid.width - 1, int(screen_x * self.grid.width / window_width)))
-        gy_from_bottom = int(screen_y * self.grid.height / window_height)
-        gy = max(0, min(self.grid.height - 1, self.grid.height - 1 - gy_from_bottom))
-        return gx, gy
+    def _build_world_store(self, *, populate_scene: bool) -> WorldChunkStore:
+        store = WorldChunkStore(self.world_grid_width, self.world_grid_height)
+        if populate_scene:
+            populate_demo_scene(store, self.registry)
+        store.recompute_anchored_support(self.registry)
+        return store
+
+    def _rebuild_world(self, *, populate_scene: bool) -> None:
+        store = self._build_world_store(populate_scene=populate_scene)
+        try:
+            self.world = ActiveWorldWindow(
+                store,
+                self.registry,
+                viewport_width=self.viewport_grid_width,
+                viewport_height=self.viewport_grid_height,
+                halo_cells=self.halo_cells,
+                page_shift_cells=self.page_shift_cells,
+                ctx=self.ctx,
+                liquid_brownian_enabled=self.liquid_brownian_enabled,
+                blocked_impulse_enabled=self.blocked_impulse_enabled,
+                directional_fallback_enabled=self.directional_fallback_enabled,
+                directional_fallback_angle_limit_degrees=self.directional_fallback_angle_limit_degrees,
+            )
+            self.backend_label = "GPU Compute"
+            self.backend_detail = ""
+        except (ComputeBackendUnavailable, Exception) as exc:  # noqa: BLE001
+            self.world = ActiveWorldWindow(
+                store,
+                self.registry,
+                viewport_width=self.viewport_grid_width,
+                viewport_height=self.viewport_grid_height,
+                halo_cells=self.halo_cells,
+                page_shift_cells=self.page_shift_cells,
+                ctx=None,
+                liquid_brownian_enabled=self.liquid_brownian_enabled,
+                blocked_impulse_enabled=self.blocked_impulse_enabled,
+                directional_fallback_enabled=self.directional_fallback_enabled,
+                directional_fallback_angle_limit_degrees=self.directional_fallback_angle_limit_degrees,
+            )
+            self.backend_label = "CPU Reference"
+            self.backend_detail = f"{type(exc).__name__}: {exc}"
+        self._bind_world_texture()
+
+    def _bind_world_texture(self) -> None:
+        assert self.world is not None
+        if self.world.gpu_simulator is not None:
+            self.texture = self.world.gpu_simulator.frame_texture
+        else:
+            self.texture = self.ctx.texture(
+                (self.world.active_width, self.world.active_height),
+                4,
+                self.world.render(self.view_mode),
+            )
+        assert self.texture is not None
+        self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.texture.repeat_x = False
+        self.texture.repeat_y = False
+        self.texture.use(location=0)
+        self.program["frame_tex"].value = 0
+        self._update_view_uv_uniforms()
+
+    def _update_view_uv_uniforms(self) -> None:
+        assert self.world is not None
+        origin_x, origin_y, scale_x, scale_y = self.world.visible_uv_rect()
+        self.program["view_uv_origin"].value = (origin_x, origin_y)
+        self.program["view_uv_scale"].value = (scale_x, scale_y)
+
+    def _screen_to_world(self, sx: int, sy: int) -> tuple[int, int]:
+        assert self.world is not None
+        return self.world.screen_to_world(
+            sx,
+            sy,
+            screen_width=max(1, int(self.width)),
+            screen_height=max(1, int(self.height)),
+        )
 
     def _refresh_overlay(self) -> None:
+        assert self.world is not None
         tool = TOOLS[self.current_tool_key]
         status = "Paused" if self.paused else "Running"
         refresh_hz = 0.0
@@ -206,65 +275,55 @@ class VoxelDemoWindow(pyglet.window.Window):
         backend_note = f"\nFallback: {self.backend_detail}" if self.backend_detail else ""
         self.overlay.text = (
             f"{status} | Backend: {self.backend_label} | Refresh: {refresh_hz:.1f} Hz | Draw: {self.draw_fps:.1f} FPS\n"
-            f"Grid: {self.grid.width}x{self.grid.height} | Window: {self.width}x{self.height} | View: {self.view_mode.value.title()} | Substeps: {self.steps_per_tick}\n"
+            f"World: {self.world.world_width}x{self.world.world_height} | Active: {self.world.active_width}x{self.world.active_height} | Viewport: {self.world.viewport_width}x{self.world.viewport_height}\n"
+            f"Camera: ({self.world.camera_x}, {self.world.camera_y}) | Window Origin: ({self.world.active_origin_x}, {self.world.active_origin_y}) | Window: {self.width}x{self.height}\n"
+            f"View: {self.view_mode.value.title()} | Substeps: {self.steps_per_tick} | Brush: {self.brush_radius} | Tool: {tool.label}\n"
             f"Liquid Brownian: {'On' if self.liquid_brownian_enabled else 'Off'}\n"
             f"Blocked Impulse: {'On' if self.blocked_impulse_enabled else 'Off'}\n"
             f"Directional Fallback: {'On' if self.directional_fallback_enabled else 'Off'} (<= {self.directional_fallback_angle_limit_degrees:.0f} deg)\n"
-            f"Tool: {tool.label} | Brush: {self.brush_radius}\n"
-            "1-9/0 switch tools, [ ] brush size, -/= substeps, T cycle views, B toggle liquid Brownian, I toggle blocked impulse, F toggle directional fallback, Space pause, N single-step, R reset scene, C clear, drag border to resize"
+            "1-9/0 switch tools, [ ] brush size, -/= substeps, T cycle views, B toggle liquid Brownian, I toggle blocked impulse, F toggle directional fallback, WASD or arrows pan camera, Space pause, N single-step, R reset scene, C clear"
             f"{backend_note}"
         )
 
     def _upload_frame(self) -> None:
-        if self.gpu_simulator is not None:
-            self.texture = self.gpu_simulator.render(self.view_mode)
-            return
-        self.texture.write(build_rgba_frame(self.grid, self.registry, view_mode=self.view_mode))
+        assert self.world is not None
+        if self.world.gpu_simulator is not None:
+            self.texture = self.world.render(self.view_mode)
+        else:
+            assert self.texture is not None
+            self.texture.write(self.world.render(self.view_mode))
+        self._update_view_uv_uniforms()
 
-    def _paint(self, gx: int, gy: int, erase: bool = False) -> None:
+    def _paint(self, world_x: int, world_y: int, erase: bool = False) -> None:
+        assert self.world is not None
         tool = TOOLS[self.current_tool_key]
-        if self.gpu_simulator is not None:
-            self.gpu_simulator.paint_circle(
-                gx,
-                gy,
-                self.brush_radius,
-                None if erase or tool.family_id is None else tool.family_id,
-                None if erase or tool.family_id is None else tool.variant_id,
-                overrides=dict(tool.overrides),
-            )
-            return
-        if erase or TOOLS[self.current_tool_key].family_id is None:
-            inject_cells(
-                self.grid,
-                {"x": gx, "y": gy, "radius": self.brush_radius},
-                "empty",
-                "empty",
-                registry=self.registry,
-            )
-            return
-        tool = TOOLS[self.current_tool_key]
-        inject_cells(
-            self.grid,
-            {"x": gx, "y": gy, "radius": self.brush_radius},
-            tool.family_id,
-            tool.variant_id,
-            dict(tool.overrides),
-            registry=self.registry,
+        self.world.paint_world(
+            world_x,
+            world_y,
+            self.brush_radius,
+            None if erase or tool.family_id is None else tool.family_id,
+            None if erase or tool.family_id is None else tool.variant_id,
+            overrides=dict(tool.overrides),
         )
 
+    def _pan_camera(self, dx: int, dy: int) -> None:
+        assert self.world is not None
+        self.world.pan_camera(dx, dy)
+        self._upload_frame()
+
     def tick(self, dt: float) -> None:
+        assert self.world is not None
         self.last_tick_dt = dt
         if not self.paused:
             substep_dt = dt / self.steps_per_tick
             for _ in range(self.steps_per_tick):
-                if self.gpu_simulator is not None:
-                    self.gpu_simulator.step(substep_dt)
-                else:
-                    step(self.grid, self.registry, substep_dt)
+                self.world.step(substep_dt)
+        self.world.service_background_io()
         self._upload_frame()
         self._refresh_overlay()
 
     def on_draw(self) -> None:
+        assert self.texture is not None
         self._draw_counter += 1
         now = perf_counter()
         elapsed = now - self._draw_sample_started_at
@@ -289,17 +348,17 @@ class VoxelDemoWindow(pyglet.window.Window):
 
     def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
         del modifiers
-        gx, gy = self._screen_to_grid(x, y)
-        self._paint(gx, gy, erase=button == mouse.RIGHT)
+        world_x, world_y = self._screen_to_world(x, y)
+        self._paint(world_x, world_y, erase=button == mouse.RIGHT)
         self._upload_frame()
 
     def on_mouse_drag(self, x: int, y: int, dx: int, dy: int, buttons: int, modifiers: int) -> None:
         del dx, dy, modifiers
-        gx, gy = self._screen_to_grid(x, y)
+        world_x, world_y = self._screen_to_world(x, y)
         erase = bool(buttons & mouse.RIGHT)
         draw = bool(buttons & mouse.LEFT)
         if draw or erase:
-            self._paint(gx, gy, erase=erase)
+            self._paint(world_x, world_y, erase=erase)
             self._upload_frame()
 
     def on_key_press(self, symbol: int, modifiers: int) -> None:
@@ -309,51 +368,33 @@ class VoxelDemoWindow(pyglet.window.Window):
         elif symbol == key.SPACE:
             self.paused = not self.paused
         elif symbol == key.N:
+            assert self.world is not None
             single_step_dt = (1 / 60.0) / self.steps_per_tick
             for _ in range(self.steps_per_tick):
-                if self.gpu_simulator is not None:
-                    self.gpu_simulator.step(single_step_dt)
-                else:
-                    step(self.grid, self.registry, single_step_dt)
+                self.world.step(single_step_dt)
             self._upload_frame()
         elif symbol == key.R:
-            self.grid = create_grid(self.grid.width, self.grid.height)
-            self.grid.liquid_brownian_enabled = self.liquid_brownian_enabled
-            self.grid.blocked_impulse_enabled = self.blocked_impulse_enabled
-            self.grid.directional_fallback_enabled = self.directional_fallback_enabled
-            self.grid.directional_fallback_angle_limit_degrees = self.directional_fallback_angle_limit_degrees
-            populate_demo_scene(self.grid, self.registry)
-            if self.gpu_simulator is not None:
-                self.gpu_simulator.load_grid(self.grid)
+            self._rebuild_world(populate_scene=True)
             self._upload_frame()
         elif symbol == key.C:
-            self.grid = create_grid(self.grid.width, self.grid.height)
-            self.grid.liquid_brownian_enabled = self.liquid_brownian_enabled
-            self.grid.blocked_impulse_enabled = self.blocked_impulse_enabled
-            self.grid.directional_fallback_enabled = self.directional_fallback_enabled
-            self.grid.directional_fallback_angle_limit_degrees = self.directional_fallback_angle_limit_degrees
-            if self.gpu_simulator is not None:
-                self.gpu_simulator.load_grid(self.grid)
+            self._rebuild_world(populate_scene=False)
             self._upload_frame()
         elif symbol == key.T:
             current_index = VIEW_MODE_ORDER.index(self.view_mode)
             self.view_mode = VIEW_MODE_ORDER[(current_index + 1) % len(VIEW_MODE_ORDER)]
             self._upload_frame()
         elif symbol == key.B:
+            assert self.world is not None
             self.liquid_brownian_enabled = not self.liquid_brownian_enabled
-            self.grid.liquid_brownian_enabled = self.liquid_brownian_enabled
-            if self.gpu_simulator is not None:
-                self.gpu_simulator.set_liquid_brownian_enabled(self.liquid_brownian_enabled)
+            self.world.set_liquid_brownian_enabled(self.liquid_brownian_enabled)
         elif symbol == key.I:
+            assert self.world is not None
             self.blocked_impulse_enabled = not self.blocked_impulse_enabled
-            self.grid.blocked_impulse_enabled = self.blocked_impulse_enabled
-            if self.gpu_simulator is not None:
-                self.gpu_simulator.set_blocked_impulse_enabled(self.blocked_impulse_enabled)
+            self.world.set_blocked_impulse_enabled(self.blocked_impulse_enabled)
         elif symbol == key.F:
+            assert self.world is not None
             self.directional_fallback_enabled = not self.directional_fallback_enabled
-            self.grid.directional_fallback_enabled = self.directional_fallback_enabled
-            if self.gpu_simulator is not None:
-                self.gpu_simulator.set_directional_fallback_enabled(self.directional_fallback_enabled)
+            self.world.set_directional_fallback_enabled(self.directional_fallback_enabled)
         elif symbol == key.MINUS:
             self.steps_per_tick = max(1, self.steps_per_tick - 1)
         elif symbol == key.EQUAL:
@@ -362,6 +403,14 @@ class VoxelDemoWindow(pyglet.window.Window):
             self.brush_radius = max(0, self.brush_radius - 1)
         elif symbol == key.BRACKETRIGHT:
             self.brush_radius = min(8, self.brush_radius + 1)
+        elif symbol in {key.A, key.LEFT}:
+            self._pan_camera(-self.camera_pan_cells, 0)
+        elif symbol in {key.D, key.RIGHT}:
+            self._pan_camera(self.camera_pan_cells, 0)
+        elif symbol in {key.W, key.UP}:
+            self._pan_camera(0, -self.camera_pan_cells)
+        elif symbol in {key.S, key.DOWN}:
+            self._pan_camera(0, self.camera_pan_cells)
         elif symbol == key.ESCAPE:
             self.close()
             return
@@ -372,6 +421,10 @@ def run_demo(
     *,
     grid_width: int = 160,
     grid_height: int = 96,
+    world_width: int | None = None,
+    world_height: int | None = None,
+    halo_cells: int = DEFAULT_HALO_CELLS,
+    page_shift_cells: int = DEFAULT_PAGE_SHIFT_CELLS,
     cell_scale: int = 8,
     window_width: int | None = None,
     window_height: int | None = None,
@@ -384,6 +437,10 @@ def run_demo(
     window = VoxelDemoWindow(
         grid_width=grid_width,
         grid_height=grid_height,
+        world_width=world_width,
+        world_height=world_height,
+        halo_cells=halo_cells,
+        page_shift_cells=page_shift_cells,
         cell_scale=cell_scale,
         window_width=window_width,
         window_height=window_height,

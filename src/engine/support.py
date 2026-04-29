@@ -29,9 +29,10 @@ def apply_support(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
             current = grid.get_cell(x, y)
             updated = grid.get_cell(x, y, use_scratch=True)
             variant = registry.variant(current.family_id, current.variant_id)
+            index = grid.index(x, y)
 
             incoming_generation = current.generation
-            if current.flags & CellFlag.FIXPOINT:
+            if current.flags & CellFlag.FIXPOINT or grid.external_support_anchors[index]:
                 incoming_generation = emitted_generation
             elif variant.support_transmission:
                 for dx, dy in NEIGHBORS_8:

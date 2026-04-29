@@ -17,6 +17,7 @@ class Grid:
     directional_fallback_angle_limit_degrees: float = 45.0
     cells: list[CellState] = field(default_factory=list)
     scratch: list[CellState] = field(default_factory=list)
+    external_support_anchors: list[bool] = field(default_factory=list)
     pressure: list[float] = field(default_factory=list)
     source_force_x: list[float] = field(default_factory=list)
     source_force_y: list[float] = field(default_factory=list)
@@ -41,6 +42,8 @@ class Grid:
             ]
         if not self.pressure:
             self.pressure = [1.0 for _ in range(expected)]
+        if not self.external_support_anchors:
+            self.external_support_anchors = [False for _ in range(expected)]
         if not self.source_force_x:
             self.source_force_x = [0.0 for _ in range(expected)]
         if not self.source_force_y:
@@ -77,6 +80,9 @@ class Grid:
             for y in range(self.height)
             for _ in range(self.width)
         ]
+
+    def clear_external_support_anchors(self) -> None:
+        self.external_support_anchors = [False for _ in range(self.width * self.height)]
 
     def swap_buffers(self) -> None:
         self.cells, self.scratch = self.scratch, self.cells

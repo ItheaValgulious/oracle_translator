@@ -27,6 +27,7 @@ from engine.sim import inject_cells, step
 from engine.support import SUPPORT_SOURCE_VALUE
 from engine.thermal import apply_thermal
 from engine.types import CellFlag, CellState
+from engine.world import ActiveWorldWindow, WorldChunkStore
 from scripts.run_engine_demo import parse_args
 
 
@@ -615,6 +616,68 @@ class EngineCoreTests(unittest.TestCase):
         for _ in range(width - 1):
             step(grid, self.registry, 1 / 60.0)
         self.assertEqual(grid.get_cell(width - 1, 0).support_value, SUPPORT_SOURCE_VALUE)
+
+    def test_world_chunk_store_rect_roundtrip_preserves_cell_state(self) -> None:
+        store = WorldChunkStore(12, 6, chunk_size=4)
+        store.set_cell(5, 2, CellState(family_id="water", variant_id="water", temperature=85.0, vel_x=0.5))
+        region = store.read_rect(4, 1, 3, 3)
+        water = region.get_cell(1, 1)
+        self.assertEqual(water.variant_id, "water")
+        self.assertAlmostEqual(water.temperature, 85.0)
+        self.assertAlmostEqual(water.vel_x, 0.5)
+
+        region.set_cell(2, 2, CellState(family_id="sand", variant_id="sand_powder", blocked_y=0.25))
+        store.write_rect(4, 1, region)
+        self.assertEqual(store.get_cell(6, 3).variant_id, "sand_powder")
+        self.assertAlmostEqual(store.get_cell(6, 3).blocked_y, 0.25)
+
+    def test_active_world_window_preserves_modified_overlap_when_camera_pages(self) -> None:
+        store = WorldChunkStore(12, 1, chunk_size=4)
+        for x in range(12):
+            inject_cells(store, [(x, 0)], "stone", "stone_platform", {"temperature": 20.0 + x}, registry=self.registry)
+        store.recompute_anchored_support(self.registry)
+
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=1,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        overlap_world_x = 7
+        local_x = overlap_world_x - world.active_origin_x
+        world.active_grid.get_cell(local_x, 0).temperature = 999.0
+
+        world.pan_camera(2, 0)
+        shifted = world.readback_active_grid()
+        shifted_local_x = overlap_world_x - world.active_origin_x
+        self.assertAlmostEqual(shifted.get_cell(shifted_local_x, 0).temperature, 999.0)
+
+    def test_active_world_window_uses_offscreen_anchor_to_refresh_support(self) -> None:
+        store = WorldChunkStore(8, 1, chunk_size=4)
+        inject_cells(store, [(0, 0)], "stone", "stone_platform", {"flags": CellFlag.FIXPOINT}, registry=self.registry)
+        inject_cells(store, [(x, 0) for x in range(1, 8)], "stone", "stone_platform", registry=self.registry)
+        store.recompute_anchored_support(self.registry)
+
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=1,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        for _ in range(5):
+            world.step(1 / 60.0)
+        active = world.readback_active_grid()
+        target_world_x = 4
+        local_x = target_world_x - world.active_origin_x
+        self.assertGreater(active.get_cell(local_x, 0).support_value, 0.0)
 
     def test_platform_integrity_decays_only_after_support_timeout(self) -> None:
         grid = create_grid(2, 1)
@@ -1297,6 +1360,32 @@ class EngineCoreTests(unittest.TestCase):
         self.assertEqual(readback.get_cell(1, 0).support_value, SUPPORT_SOURCE_VALUE)
         self.assertEqual(readback.get_cell(2, 0).support_value, 0.0)
 
+    def test_gpu_region_read_write_and_copy_preserve_cell_positions(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(4, 4)
+        inject_cells(grid, [(2, 1)], "stone", "stone_platform", {"temperature": 123.0})
+        gpu = GpuSimulator(ctx, grid, self.registry)
+
+        region = gpu.read_region(2, 1, 1, 1)
+        self.assertEqual(region.get_cell(0, 0).variant_id, "stone_platform")
+        self.assertAlmostEqual(region.get_cell(0, 0).temperature, 123.0)
+
+        target_buffer = 1 - gpu.front_index
+        gpu.copy_region(2, 1, 1, 1, 0, 3, dst_buffer_index=target_buffer)
+        gpu.front_index = target_buffer
+        copied = gpu.readback_grid()
+        self.assertEqual(copied.get_cell(0, 3).variant_id, "stone_platform")
+        self.assertAlmostEqual(copied.get_cell(0, 3).temperature, 123.0)
+
+        rewritten = region.get_cell(0, 0).copy()
+        rewritten.temperature = 321.0
+        region.set_cell(0, 0, rewritten)
+        gpu.write_region(1, 2, region)
+        writeback = gpu.readback_grid()
+        self.assertEqual(writeback.get_cell(1, 2).variant_id, "stone_platform")
+        self.assertAlmostEqual(writeback.get_cell(1, 2).temperature, 321.0)
+
     def test_gpu_platform_integrity_decays_only_after_support_timeout(self) -> None:
         ctx = create_compute_context()
 
@@ -1511,6 +1600,14 @@ class EngineCoreTests(unittest.TestCase):
                 "200",
                 "--grid-height",
                 "120",
+                "--world-width",
+                "640",
+                "--world-height",
+                "360",
+                "--halo-cells",
+                "48",
+                "--page-shift-cells",
+                "32",
                 "--window-width",
                 "1440",
                 "--window-height",
@@ -1527,6 +1624,10 @@ class EngineCoreTests(unittest.TestCase):
         )
         self.assertEqual(args.grid_width, 200)
         self.assertEqual(args.grid_height, 120)
+        self.assertEqual(args.world_width, 640)
+        self.assertEqual(args.world_height, 360)
+        self.assertEqual(args.halo_cells, 48)
+        self.assertEqual(args.page_shift_cells, 32)
         self.assertEqual(args.window_width, 1440)
         self.assertEqual(args.window_height, 900)
         self.assertEqual(args.cell_scale, 4)

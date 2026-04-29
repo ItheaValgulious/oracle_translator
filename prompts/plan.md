@@ -61,3 +61,17 @@
   - 模拟按自己的固定时间步持续推进
   - 渲染只采样最近一次完成的稳定状态
   - demo 可临时允许每帧执行多次模拟子步进来验证手感
+- 大世界方向当前补充为:
+  - 世界存储与活动模拟窗解耦
+  - `WorldChunkStore` 负责有限大地图的 chunk 化持久层
+  - `ActiveWorldWindow` 负责一个连续的滑动模拟域和 viewport / camera 映射
+  - 相机移动不再走整窗 `load_grid()`,而是:
+    - 保留重叠区域 cell state
+    - 新暴露区域按矩形增量装入
+    - 被逐出活动窗的区域按矩形写回 world store
+    - GPU 路径可先把被逐出的区域暂存在显存 staging,后续空闲时再回写 CPU world store
+  - `pressure / source_force / force_wave` 当前只属于活动模拟窗,不写入 chunk store
+  - support 在大世界里增加“冻结区外部锚定”语义:
+    - chunk store 记录冻结承重网络是否仍连到真实 `fixpoint`
+    - 活动窗边界可以把这些冻结外部连接视为虚拟支撑源
+    - 不把整条承重链永久改写成真正的 `FIXPOINT`

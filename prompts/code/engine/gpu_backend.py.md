@@ -19,6 +19,16 @@
     - `set_blocked_impulse_enabled(enabled)`
     - `set_directional_fallback_enabled(enabled)`
     - `set_directional_fallback_angle_limit_degrees(angle_limit_degrees)`
+    - `set_external_support_anchors(anchors)`
+    - `read_region(x, y, width, height)`
+    - `write_region(x, y, region, buffer_index=None)`
+    - `copy_region(src_x, src_y, width, height, dst_x, dst_y, src_buffer_index=None, dst_buffer_index=None)`
+    - `copy_transient_region(src_x, src_y, width, height, dst_x, dst_y)`
+    - `stage_region(x, y, width, height)`
+    - `copy_from_staged_region(staged, src_x, src_y, width, height, dst_x, dst_y, dst_buffer_index=None)`
+    - `read_staged_region(staged)`
+    - `release_staged_region(staged)`
+    - `clear_region_transients(x, y, width, height)`
     - `step(dt)`
     - `render(view_mode=DebugViewMode.MATERIAL)`
     - `paint_circle(center_x, center_y, radius, family_id, variant_id, overrides=None)`
@@ -55,7 +65,14 @@
   - `velocity_decay`
   - `downward_blocked_diagonal_fallback`
 - 把 cell 动态状态拆成整数纹理和浮点纹理,并做双缓冲。
+- 额外维护一张 `external_support_anchor` 纹理,供大世界活动窗把冻结区外部支撑源映射到当前边界。
 - 维护 GPU 侧持久化 `pressure` 标量场、`source_force` 和 `force_wave` 纹理。
+- 提供面向大世界活动窗的区域接口:
+  - 局部读回 `cell state`
+  - 局部写入 `cell state`
+  - 在 GPU 内把重叠区域从旧位置复制到新位置
+  - 在活动窗平移时复制 overlap 的 transient 力场,并只清空新暴露条带
+  - 把被逐出的区域临时 stage 在 GPU 纹理里,供后续慢速回写或快速装回
 - 用 compute shader 执行:
   - `support`
   - `reactions`
@@ -66,15 +83,10 @@
   - `force_wave`
   - 交换式 `motion`
   - `collapse`
+- GPU `support` 当前除了真实 `FIXPOINT`,还会把 `external_support_anchor` 当作虚拟外部支撑源。
 - GPU `motion` 和 CPU 一样,求解器只按 `matter_state` 分支; 同一物态内部的差异全部由打包后的通用运动参数控制。
-- GPU `motion` 也会先用这些通用参数判断某个变体当前是否具备平移能力; 对不可平移的变体,shader 会提前跳过 motion 候选与 claim 热路径,只保留轻量的速度/blocked impulse 结算。
-- 所有运动都按“和可交换目标换位”实现,包括与空背景以及更轻流体的交换。
-- 同为气体/空气的垂直交换使用方向感知的温度修正密度: 更轻者只能向上换入更重目标,更重者只能向下换入更轻目标。
-- 开启 `downward_blocked_diagonal_fallback` 的变体,在主方向仍向下且正下方受阻时,shader 会把 fallback 收窄成左下和右下两个 `<= 45°` 候选。
 - GPU 里的液体布朗运动、`blocked_impulse` 和方向 fallback 都带运行时开关,语义与 CPU 保持一致。
-- GPU 里的环境 `empty` 空气也会参与 pressure、热运动和对流,但不会主动去替换显式气体包,避免背景空气反向吞掉蒸汽或毒气团。
 - GPU 当前每个外部 `step` 会先跑一次“非气态物质”交换,再跑一次“空气/气体”交换。
-- occupied-target 交换时,被顶开的目标格不会只做简单复制回填,而是会先应用自身受力和剩余意图后再落回 source。
 - `thermal` 阶段使用数据驱动的导热加速倍率,不再把 `steam` 写成 shader 里的固定分支。
 - `reaction` 阶段当前只通过 `reaction_energy` 改变当前格自身温度,不会直接给邻格写热量。
 - `phases` 阶段只切换变体身份,不会用目标变体 `base_temperature` 重置当前温度。

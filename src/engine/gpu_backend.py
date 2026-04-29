@@ -178,11 +178,20 @@ class GpuMaterialTables:
         )
 
 
-def pack_grid_state(grid: Grid, tables: GpuMaterialTables) -> tuple[bytes, bytes, bytes]:
+@dataclass
+class GpuStagedRegion:
+    width: int
+    height: int
+    state_int: moderngl.Texture
+    state_vec: moderngl.Texture
+    state_misc: moderngl.Texture
+
+
+def _pack_cells_state(cells: list[CellState], tables: GpuMaterialTables) -> tuple[bytes, bytes, bytes]:
     state_int = array("i")
     state_vec = array("f")
     state_misc = array("f")
-    for cell in grid.cells:
+    for cell in cells:
         state_int.extend(
             (
                 tables.variant_index_by_key[(cell.family_id, cell.variant_id)],
@@ -196,6 +205,48 @@ def pack_grid_state(grid: Grid, tables: GpuMaterialTables) -> tuple[bytes, bytes
     return (state_int.tobytes(), state_vec.tobytes(), state_misc.tobytes())
 
 
+def pack_grid_state(grid: Grid, tables: GpuMaterialTables) -> tuple[bytes, bytes, bytes]:
+    return _pack_cells_state(grid.cells, tables)
+
+
+def _unpack_cells_state(
+    tables: GpuMaterialTables,
+    state_int_data: bytes,
+    state_vec_data: bytes,
+    state_misc_data: bytes,
+) -> list[CellState]:
+    state_int = array("i")
+    state_vec = array("f")
+    state_misc = array("f")
+    state_int.frombytes(state_int_data)
+    state_vec.frombytes(state_vec_data)
+    state_misc.frombytes(state_misc_data)
+
+    cell_count = len(state_int) // 4
+    cells: list[CellState] = []
+    for index in range(cell_count):
+        int_offset = index * 4
+        vec_offset = index * 4
+        family_id, variant_id = tables.variant_keys[state_int[int_offset]]
+        cells.append(
+            CellState(
+                family_id=family_id,
+                variant_id=variant_id,
+                generation=state_int[int_offset + 1],
+                flags=CellFlag(state_int[int_offset + 2]),
+                vel_x=state_vec[vec_offset],
+                vel_y=state_vec[vec_offset + 1],
+                blocked_x=state_vec[vec_offset + 2],
+                blocked_y=state_vec[vec_offset + 3],
+                temperature=state_misc[vec_offset],
+                support_value=state_misc[vec_offset + 1],
+                integrity=state_misc[vec_offset + 2],
+                age=state_misc[vec_offset + 3],
+            )
+        )
+    return cells
+
+
 def unpack_grid_state(
     width: int,
     height: int,
@@ -204,32 +255,8 @@ def unpack_grid_state(
     state_vec_data: bytes,
     state_misc_data: bytes,
 ) -> Grid:
-    state_int = array("i")
-    state_vec = array("f")
-    state_misc = array("f")
-    state_int.frombytes(state_int_data)
-    state_vec.frombytes(state_vec_data)
-    state_misc.frombytes(state_misc_data)
-
     grid = Grid(width=width, height=height)
-    for index in range(width * height):
-        int_offset = index * 4
-        vec_offset = index * 4
-        family_id, variant_id = tables.variant_keys[state_int[int_offset]]
-        grid.cells[index] = CellState(
-            family_id=family_id,
-            variant_id=variant_id,
-            generation=state_int[int_offset + 1],
-            flags=CellFlag(state_int[int_offset + 2]),
-            vel_x=state_vec[vec_offset],
-            vel_y=state_vec[vec_offset + 1],
-            blocked_x=state_vec[vec_offset + 2],
-            blocked_y=state_vec[vec_offset + 3],
-            temperature=state_misc[vec_offset],
-            support_value=state_misc[vec_offset + 1],
-            integrity=state_misc[vec_offset + 2],
-            age=state_misc[vec_offset + 3],
-        )
+    grid.cells = _unpack_cells_state(tables, state_int_data, state_vec_data, state_misc_data)
     return grid
 
 
@@ -1035,6 +1062,7 @@ layout(rgba32f, binding = 5) uniform readonly image2D state_misc_src;
 layout(rgba32i, binding = 6) uniform writeonly iimage2D state_int_dst;
 layout(rgba32f, binding = 7) uniform writeonly image2D state_vec_dst;
 layout(rgba32f, binding = 8) uniform writeonly image2D state_misc_dst;
+layout(r32i, binding = 17) uniform readonly iimage2D external_support_anchor_tex;
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -1047,9 +1075,10 @@ void main() {
     vec4 cell_misc = imageLoad(state_misc_src, coord);
     vec4 out_misc = cell_misc;
     int variant_index = cell_int.x;
+    int external_anchor = imageLoad(external_support_anchor_tex, coord).x;
 
     int incoming_generation = cell_int.y;
-    if ((cell_int.z & CELL_FLAG_FIXPOINT) != 0) {
+    if ((cell_int.z & CELL_FLAG_FIXPOINT) != 0 || external_anchor != 0) {
         incoming_generation = step_index + 1;
     } else if (support_transmission_for_variant(variant_index)) {
         for (int index = 0; index < 8; index += 1) {
@@ -1465,6 +1494,98 @@ void main() {
         return;
     }
     imageStore(target_tex, coord, ivec4(clear_value, 0, 0, 0));
+}
+"""
+
+
+def _copy_rgba32i_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32i, binding = 18) uniform readonly iimage2D src_tex;
+layout(rgba32i, binding = 19) uniform writeonly iimage2D dst_tex;
+
+uniform ivec2 copy_src_origin;
+uniform ivec2 copy_dst_origin;
+uniform ivec2 copy_size;
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= copy_size.x || local_coord.y >= copy_size.y) {
+        return;
+    }
+    ivec2 src_coord = copy_src_origin + local_coord;
+    ivec2 dst_coord = copy_dst_origin + local_coord;
+    imageStore(dst_tex, dst_coord, imageLoad(src_tex, src_coord));
+}
+"""
+
+
+def _copy_rgba32f_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32f, binding = 18) uniform readonly image2D src_tex;
+layout(rgba32f, binding = 19) uniform writeonly image2D dst_tex;
+
+uniform ivec2 copy_src_origin;
+uniform ivec2 copy_dst_origin;
+uniform ivec2 copy_size;
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= copy_size.x || local_coord.y >= copy_size.y) {
+        return;
+    }
+    ivec2 src_coord = copy_src_origin + local_coord;
+    ivec2 dst_coord = copy_dst_origin + local_coord;
+    imageStore(dst_tex, dst_coord, imageLoad(src_tex, src_coord));
+}
+"""
+
+
+def _copy_r32f_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f, binding = 18) uniform readonly image2D src_tex;
+layout(r32f, binding = 19) uniform writeonly image2D dst_tex;
+
+uniform ivec2 copy_src_origin;
+uniform ivec2 copy_dst_origin;
+uniform ivec2 copy_size;
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= copy_size.x || local_coord.y >= copy_size.y) {
+        return;
+    }
+    ivec2 src_coord = copy_src_origin + local_coord;
+    ivec2 dst_coord = copy_dst_origin + local_coord;
+    imageStore(dst_tex, dst_coord, imageLoad(src_tex, src_coord));
+}
+"""
+
+
+def _copy_rg32f_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rg32f, binding = 18) uniform readonly image2D src_tex;
+layout(rg32f, binding = 19) uniform writeonly image2D dst_tex;
+
+uniform ivec2 copy_src_origin;
+uniform ivec2 copy_dst_origin;
+uniform ivec2 copy_size;
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= copy_size.x || local_coord.y >= copy_size.y) {
+        return;
+    }
+    ivec2 src_coord = copy_src_origin + local_coord;
+    ivec2 dst_coord = copy_dst_origin + local_coord;
+    imageStore(dst_tex, dst_coord, imageLoad(src_tex, src_coord));
 }
 """
 
@@ -2251,6 +2372,7 @@ class GpuSimulator:
         self.pressure_tex = [self._make_texture(1, "f4"), self._make_texture(1, "f4")]
         self.source_force_tex = [self._make_texture(2, "f4"), self._make_texture(2, "f4")]
         self.wave_force_tex = [self._make_texture(2, "f4"), self._make_texture(2, "f4")]
+        self.external_support_anchor_tex = self._make_texture(1, "i4")
         self.source_force_front_index = 0
         self.wave_force_front_index = 0
         self.motion_plan = self._make_texture(4, "i4")
@@ -2267,6 +2389,10 @@ class GpuSimulator:
         self.support_shader = self.ctx.compute_shader(_support_shader_source(self.tables))
         self.motion_plan_shader = self.ctx.compute_shader(_motion_plan_shader_source(self.tables))
         self.clear_r32i_shader = self.ctx.compute_shader(_clear_r32i_shader_source(self.tables))
+        self.copy_rgba32i_shader = self.ctx.compute_shader(_copy_rgba32i_shader_source(self.tables))
+        self.copy_rgba32f_shader = self.ctx.compute_shader(_copy_rgba32f_shader_source(self.tables))
+        self.copy_r32f_shader = self.ctx.compute_shader(_copy_r32f_shader_source(self.tables))
+        self.copy_rg32f_shader = self.ctx.compute_shader(_copy_rg32f_shader_source(self.tables))
         self.motion_claim_shader = self.ctx.compute_shader(_motion_claim_shader_source(self.tables))
         self.motion_resolve_shader = self.ctx.compute_shader(_motion_resolve_shader_source(self.tables))
         self.thermal_shader = self.ctx.compute_shader(_thermal_shader_source(self.tables))
@@ -2299,7 +2425,10 @@ class GpuSimulator:
         self.render()
 
     def _make_texture(self, components: int, dtype: str) -> moderngl.Texture:
-        texture = self.ctx.texture((self.width, self.height), components, data=None, dtype=dtype)
+        return self._make_texture_for_size(self.width, self.height, components, dtype)
+
+    def _make_texture_for_size(self, width: int, height: int, components: int, dtype: str) -> moderngl.Texture:
+        texture = self.ctx.texture((width, height), components, data=None, dtype=dtype)
         texture.repeat_x = False
         texture.repeat_y = False
         return texture
@@ -2365,6 +2494,10 @@ class GpuSimulator:
             self.support_shader,
             self.motion_plan_shader,
             self.clear_r32i_shader,
+            self.copy_rgba32i_shader,
+            self.copy_rgba32f_shader,
+            self.copy_r32f_shader,
+            self.copy_rg32f_shader,
             self.motion_claim_shader,
             self.motion_resolve_shader,
             self.thermal_shader,
@@ -2396,11 +2529,60 @@ class GpuSimulator:
             self.paint_shader,
         )
 
-    def _pressure_bytes(self, value: float = 1.0) -> bytes:
-        return array("f", [value for _ in range(self.width * self.height)]).tobytes()
+    def _pressure_bytes(self, value: float = 1.0, *, width: int | None = None, height: int | None = None) -> bytes:
+        cell_count = (self.width if width is None else width) * (self.height if height is None else height)
+        return array("f", [value for _ in range(cell_count)]).tobytes()
 
-    def _force_bytes(self) -> bytes:
-        return array("f", [0.0 for _ in range(self.width * self.height * 2)]).tobytes()
+    def _force_bytes(self, *, width: int | None = None, height: int | None = None) -> bytes:
+        cell_count = (self.width if width is None else width) * (self.height if height is None else height)
+        return array("f", [0.0 for _ in range(cell_count * 2)]).tobytes()
+
+    def _external_anchor_bytes(self, anchors: list[bool]) -> bytes:
+        return array("i", [1 if anchor else 0 for anchor in anchors]).tobytes()
+
+    def _read_texture_region(
+        self,
+        texture: moderngl.Texture,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        components: int,
+        dtype: str,
+    ) -> bytes:
+        framebuffer = self.ctx.framebuffer(color_attachments=[texture])
+        try:
+            return framebuffer.read(
+                viewport=(x, y, width, height),
+                components=components,
+                dtype=dtype,
+                alignment=1,
+            )
+        finally:
+            framebuffer.release()
+
+    def _run_copy_shader(
+        self,
+        shader: moderngl.ComputeShader,
+        src_texture: moderngl.Texture,
+        dst_texture: moderngl.Texture,
+        *,
+        src_x: int,
+        src_y: int,
+        width: int,
+        height: int,
+        dst_x: int,
+        dst_y: int,
+    ) -> None:
+        src_texture.bind_to_image(18, read=True, write=False)
+        dst_texture.bind_to_image(19, read=False, write=True)
+        shader["copy_src_origin"].value = (src_x, src_y)
+        shader["copy_dst_origin"].value = (dst_x, dst_y)
+        shader["copy_size"].value = (width, height)
+        group_x, group_y = _dispatch_groups(width, height)
+        shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
 
     def _bind_state(self, src_index: int, dst_index: int) -> None:
         self.state_int[src_index].bind_to_image(3, read=True, write=False)
@@ -2422,6 +2604,7 @@ class GpuSimulator:
             self.front_index = dst_index
 
     def _run_support(self, dt: float) -> None:
+        self.external_support_anchor_tex.bind_to_image(17, read=True, write=False)
         self._run_stage(self.support_shader, dt)
 
     def _clear_r32i_texture(self, texture: moderngl.Texture, clear_value: int) -> None:
@@ -2557,11 +2740,291 @@ class GpuSimulator:
             texture.write(force_bytes)
         for texture in self.wave_force_tex:
             texture.write(force_bytes)
+        self.set_external_support_anchors(grid.external_support_anchors)
         self.front_index = 0
         self.pressure_front_index = 0
         self.source_force_front_index = 0
         self.wave_force_front_index = 0
         self.step_index = grid.step_id
+
+    def set_external_support_anchors(self, anchors: list[bool]) -> None:
+        if len(anchors) != self.width * self.height:
+            raise ValueError("External support anchor mask size does not match the GPU simulator.")
+        self.external_support_anchor_tex.write(self._external_anchor_bytes(anchors))
+
+    def clear_region_transients(self, x: int, y: int, width: int, height: int) -> None:
+        viewport = (x, y, width, height)
+        pressure_bytes = self._pressure_bytes(width=width, height=height)
+        for texture in self.pressure_tex:
+            texture.write(pressure_bytes, viewport=viewport)
+        force_bytes = self._force_bytes(width=width, height=height)
+        for texture in self.source_force_tex:
+            texture.write(force_bytes, viewport=viewport)
+        for texture in self.wave_force_tex:
+            texture.write(force_bytes, viewport=viewport)
+
+    def read_region(self, x: int, y: int, width: int, height: int):
+        from .world import GridSlice
+
+        state_int_data = self._read_texture_region(
+            self.state_int[self.front_index],
+            x,
+            y,
+            width,
+            height,
+            components=4,
+            dtype="i4",
+        )
+        state_vec_data = self._read_texture_region(
+            self.state_vec[self.front_index],
+            x,
+            y,
+            width,
+            height,
+            components=4,
+            dtype="f4",
+        )
+        state_misc_data = self._read_texture_region(
+            self.state_misc[self.front_index],
+            x,
+            y,
+            width,
+            height,
+            components=4,
+            dtype="f4",
+        )
+        cells = _unpack_cells_state(self.tables, state_int_data, state_vec_data, state_misc_data)
+        return GridSlice(width=width, height=height, cells=cells)
+
+    def write_region(self, x: int, y: int, region, *, buffer_index: int | None = None) -> None:
+        target_index = self.front_index if buffer_index is None else buffer_index
+        state_int_data, state_vec_data, state_misc_data = _pack_cells_state(region.cells, self.tables)
+        viewport = (x, y, region.width, region.height)
+        self.state_int[target_index].write(state_int_data, viewport=viewport)
+        self.state_vec[target_index].write(state_vec_data, viewport=viewport)
+        self.state_misc[target_index].write(state_misc_data, viewport=viewport)
+
+    def copy_region(
+        self,
+        src_x: int,
+        src_y: int,
+        width: int,
+        height: int,
+        dst_x: int,
+        dst_y: int,
+        *,
+        src_buffer_index: int | None = None,
+        dst_buffer_index: int | None = None,
+    ) -> None:
+        source_index = self.front_index if src_buffer_index is None else src_buffer_index
+        target_index = self.front_index if dst_buffer_index is None else dst_buffer_index
+        self._run_copy_shader(
+            self.copy_rgba32i_shader,
+            self.state_int[source_index],
+            self.state_int[target_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+        self._run_copy_shader(
+            self.copy_rgba32f_shader,
+            self.state_vec[source_index],
+            self.state_vec[target_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+        self._run_copy_shader(
+            self.copy_rgba32f_shader,
+            self.state_misc[source_index],
+            self.state_misc[target_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+
+    def copy_transient_region(
+        self,
+        src_x: int,
+        src_y: int,
+        width: int,
+        height: int,
+        dst_x: int,
+        dst_y: int,
+    ) -> None:
+        self._run_copy_shader(
+            self.copy_r32f_shader,
+            self.pressure_tex[self.pressure_front_index],
+            self.pressure_tex[1 - self.pressure_front_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+        self._run_copy_shader(
+            self.copy_rg32f_shader,
+            self.source_force_tex[self.source_force_front_index],
+            self.source_force_tex[1 - self.source_force_front_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+        self._run_copy_shader(
+            self.copy_rg32f_shader,
+            self.wave_force_tex[self.wave_force_front_index],
+            self.wave_force_tex[1 - self.wave_force_front_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+        self.pressure_front_index = 1 - self.pressure_front_index
+        self.source_force_front_index = 1 - self.source_force_front_index
+        self.wave_force_front_index = 1 - self.wave_force_front_index
+
+    def stage_region(self, x: int, y: int, width: int, height: int) -> GpuStagedRegion:
+        staged = GpuStagedRegion(
+            width=width,
+            height=height,
+            state_int=self._make_texture_for_size(width, height, 4, "i4"),
+            state_vec=self._make_texture_for_size(width, height, 4, "f4"),
+            state_misc=self._make_texture_for_size(width, height, 4, "f4"),
+        )
+        self._run_copy_shader(
+            self.copy_rgba32i_shader,
+            self.state_int[self.front_index],
+            staged.state_int,
+            src_x=x,
+            src_y=y,
+            width=width,
+            height=height,
+            dst_x=0,
+            dst_y=0,
+        )
+        self._run_copy_shader(
+            self.copy_rgba32f_shader,
+            self.state_vec[self.front_index],
+            staged.state_vec,
+            src_x=x,
+            src_y=y,
+            width=width,
+            height=height,
+            dst_x=0,
+            dst_y=0,
+        )
+        self._run_copy_shader(
+            self.copy_rgba32f_shader,
+            self.state_misc[self.front_index],
+            staged.state_misc,
+            src_x=x,
+            src_y=y,
+            width=width,
+            height=height,
+            dst_x=0,
+            dst_y=0,
+        )
+        return staged
+
+    def copy_from_staged_region(
+        self,
+        staged: GpuStagedRegion,
+        *,
+        src_x: int,
+        src_y: int,
+        width: int,
+        height: int,
+        dst_x: int,
+        dst_y: int,
+        dst_buffer_index: int | None = None,
+    ) -> None:
+        target_index = self.front_index if dst_buffer_index is None else dst_buffer_index
+        self._run_copy_shader(
+            self.copy_rgba32i_shader,
+            staged.state_int,
+            self.state_int[target_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+        self._run_copy_shader(
+            self.copy_rgba32f_shader,
+            staged.state_vec,
+            self.state_vec[target_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+        self._run_copy_shader(
+            self.copy_rgba32f_shader,
+            staged.state_misc,
+            self.state_misc[target_index],
+            src_x=src_x,
+            src_y=src_y,
+            width=width,
+            height=height,
+            dst_x=dst_x,
+            dst_y=dst_y,
+        )
+
+    def read_staged_region(self, staged: GpuStagedRegion):
+        from .world import GridSlice
+
+        state_int_data = self._read_texture_region(
+            staged.state_int,
+            0,
+            0,
+            staged.width,
+            staged.height,
+            components=4,
+            dtype="i4",
+        )
+        state_vec_data = self._read_texture_region(
+            staged.state_vec,
+            0,
+            0,
+            staged.width,
+            staged.height,
+            components=4,
+            dtype="f4",
+        )
+        state_misc_data = self._read_texture_region(
+            staged.state_misc,
+            0,
+            0,
+            staged.width,
+            staged.height,
+            components=4,
+            dtype="f4",
+        )
+        cells = _unpack_cells_state(self.tables, state_int_data, state_vec_data, state_misc_data)
+        return GridSlice(width=staged.width, height=staged.height, cells=cells)
+
+    def release_staged_region(self, staged: GpuStagedRegion) -> None:
+        staged.state_int.release()
+        staged.state_vec.release()
+        staged.state_misc.release()
 
     def step(self, dt: float) -> None:
         self._run_support(dt)

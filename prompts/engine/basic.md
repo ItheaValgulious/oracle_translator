@@ -365,6 +365,28 @@
 - 初始网格分辨率和窗口大小可由启动参数配置
 - 窗口可直接拖拽调整大小
 - 暂停、单步、重置和清空场景
+- 大世界第一版当前拆成两层:
+  - `WorldChunkStore`
+    - 负责有限大地图的 chunk 化持久层
+    - 默认 chunk 尺寸为 `320x320`
+    - 视野外区域默认冻结,不持续推进模拟
+  - `ActiveWorldWindow`
+    - 负责一个随相机滑动的连续活动模拟窗
+    - 当前仍然只保留一个连续 `Grid` / `GpuSimulator`,而不是每个 chunk 各跑一个 backend
+    - viewport 四周默认额外保留 `64` 格 halo
+    - 相机接近活动窗内部安全边界时,按 `64` 格分页平移活动窗
+- 活动窗平移时:
+  - 只持久化 `cell state`
+  - 新暴露区域按矩形从 chunk store 流式载入
+  - 被逐出活动窗的区域按矩形写回 chunk store
+  - `pressure / source_force / force_wave` 只属于当前活动模拟窗,不写入 chunk store
+  - GPU 路径当前优先把被逐出的条带先留在 GPU staging 里
+  - 用户操作时先保证“进显存”和活动窗内复制够快
+  - staging 条带会在后续空闲 tick 再慢速回写 CPU world store
+- `fixpoint` / support 在大世界里当前增加冻结区外部锚定语义:
+  - chunk store 会记录冻结承重网络是否仍连到真实 `fixpoint`
+  - 活动窗边界可把这些冻结外部连接视为虚拟支撑来源
+  - 不把整条承重链永久改写成真正的 `FIXPOINT`
 
 ## 9. 第一版不做什么
 
