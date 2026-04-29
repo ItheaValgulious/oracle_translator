@@ -84,6 +84,7 @@ class VoxelDemoWindow(pyglet.window.Window):
         simulation_substeps: int = DEFAULT_SIMULATION_SUBSTEPS,
         liquid_brownian_enabled: bool = True,
         blocked_impulse_enabled: bool = True,
+        directional_fallback_enabled: bool = True,
         vsync: bool = True,
     ) -> None:
         initial_width = int(window_width if window_width is not None else grid_width * cell_scale)
@@ -98,6 +99,7 @@ class VoxelDemoWindow(pyglet.window.Window):
         self.grid = create_grid(grid_width, grid_height)
         self.grid.liquid_brownian_enabled = bool(liquid_brownian_enabled)
         self.grid.blocked_impulse_enabled = bool(blocked_impulse_enabled)
+        self.grid.directional_fallback_enabled = bool(directional_fallback_enabled)
         self.registry = build_material_registry()
         populate_demo_scene(self.grid, self.registry)
         self.gpu_simulator: GpuSimulator | None = None
@@ -114,6 +116,8 @@ class VoxelDemoWindow(pyglet.window.Window):
         self.steps_per_tick = max(1, int(simulation_substeps))
         self.liquid_brownian_enabled = bool(liquid_brownian_enabled)
         self.blocked_impulse_enabled = bool(blocked_impulse_enabled)
+        self.directional_fallback_enabled = bool(directional_fallback_enabled)
+        self.directional_fallback_angle_limit_degrees = float(self.grid.directional_fallback_angle_limit_degrees)
         self.backend_label = "CPU Reference"
         self.backend_detail = ""
 
@@ -205,8 +209,9 @@ class VoxelDemoWindow(pyglet.window.Window):
             f"Grid: {self.grid.width}x{self.grid.height} | Window: {self.width}x{self.height} | View: {self.view_mode.value.title()} | Substeps: {self.steps_per_tick}\n"
             f"Liquid Brownian: {'On' if self.liquid_brownian_enabled else 'Off'}\n"
             f"Blocked Impulse: {'On' if self.blocked_impulse_enabled else 'Off'}\n"
+            f"Directional Fallback: {'On' if self.directional_fallback_enabled else 'Off'} (<= {self.directional_fallback_angle_limit_degrees:.0f} deg)\n"
             f"Tool: {tool.label} | Brush: {self.brush_radius}\n"
-            "1-9/0 switch tools, [ ] brush size, -/= substeps, T cycle views, B toggle liquid Brownian, I toggle blocked impulse, Space pause, N single-step, R reset scene, C clear, drag border to resize"
+            "1-9/0 switch tools, [ ] brush size, -/= substeps, T cycle views, B toggle liquid Brownian, I toggle blocked impulse, F toggle directional fallback, Space pause, N single-step, R reset scene, C clear, drag border to resize"
             f"{backend_note}"
         )
 
@@ -315,6 +320,8 @@ class VoxelDemoWindow(pyglet.window.Window):
             self.grid = create_grid(self.grid.width, self.grid.height)
             self.grid.liquid_brownian_enabled = self.liquid_brownian_enabled
             self.grid.blocked_impulse_enabled = self.blocked_impulse_enabled
+            self.grid.directional_fallback_enabled = self.directional_fallback_enabled
+            self.grid.directional_fallback_angle_limit_degrees = self.directional_fallback_angle_limit_degrees
             populate_demo_scene(self.grid, self.registry)
             if self.gpu_simulator is not None:
                 self.gpu_simulator.load_grid(self.grid)
@@ -323,6 +330,8 @@ class VoxelDemoWindow(pyglet.window.Window):
             self.grid = create_grid(self.grid.width, self.grid.height)
             self.grid.liquid_brownian_enabled = self.liquid_brownian_enabled
             self.grid.blocked_impulse_enabled = self.blocked_impulse_enabled
+            self.grid.directional_fallback_enabled = self.directional_fallback_enabled
+            self.grid.directional_fallback_angle_limit_degrees = self.directional_fallback_angle_limit_degrees
             if self.gpu_simulator is not None:
                 self.gpu_simulator.load_grid(self.grid)
             self._upload_frame()
@@ -340,6 +349,11 @@ class VoxelDemoWindow(pyglet.window.Window):
             self.grid.blocked_impulse_enabled = self.blocked_impulse_enabled
             if self.gpu_simulator is not None:
                 self.gpu_simulator.set_blocked_impulse_enabled(self.blocked_impulse_enabled)
+        elif symbol == key.F:
+            self.directional_fallback_enabled = not self.directional_fallback_enabled
+            self.grid.directional_fallback_enabled = self.directional_fallback_enabled
+            if self.gpu_simulator is not None:
+                self.gpu_simulator.set_directional_fallback_enabled(self.directional_fallback_enabled)
         elif symbol == key.MINUS:
             self.steps_per_tick = max(1, self.steps_per_tick - 1)
         elif symbol == key.EQUAL:
@@ -364,6 +378,7 @@ def run_demo(
     simulation_substeps: int = DEFAULT_SIMULATION_SUBSTEPS,
     liquid_brownian_enabled: bool = True,
     blocked_impulse_enabled: bool = True,
+    directional_fallback_enabled: bool = True,
     vsync: bool = True,
 ) -> None:
     window = VoxelDemoWindow(
@@ -375,6 +390,7 @@ def run_demo(
         simulation_substeps=simulation_substeps,
         liquid_brownian_enabled=liquid_brownian_enabled,
         blocked_impulse_enabled=blocked_impulse_enabled,
+        directional_fallback_enabled=directional_fallback_enabled,
         vsync=vsync,
     )
     window.set_minimum_size(200, 150)

@@ -29,6 +29,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--substeps", type=_positive_int, default=1, help="Simulation substeps executed for each scheduled frame.")
     parser.add_argument("--no-liquid-brownian", action="store_true", help="Disable liquid Brownian motion jitter at startup.")
     parser.add_argument("--no-blocked-impulse", action="store_true", help="Disable blocked impulse residual intent at startup.")
+    parser.add_argument(
+        "--no-directional-fallback",
+        action="store_true",
+        help="Disable the nearest-angle fallback when the preferred motion direction is blocked at startup.",
+    )
     parser.add_argument("--no-vsync", action="store_true", help="Disable vsync for the demo window.")
     return parser.parse_args(argv)
 
@@ -44,5 +49,6 @@ if __name__ == "__main__":
         simulation_substeps=args.substeps,
         liquid_brownian_enabled=not args.no_liquid_brownian,
         blocked_impulse_enabled=not args.no_blocked_impulse,
+        directional_fallback_enabled=not args.no_directional_fallback,
         vsync=not args.no_vsync,
     )

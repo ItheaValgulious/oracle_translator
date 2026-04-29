@@ -11,12 +11,6 @@ class MatterState(str, Enum):
     GAS = "gas"
 
 
-class MotionMode(str, Enum):
-    STATIC = "static"
-    POWDER = "powder"
-    FLUID = "fluid"
-
-
 class ReactionKind(str, Enum):
     NONE = "none"
     HEAT_SOURCE = "heat_source"
@@ -57,7 +51,6 @@ class PhaseRule:
 class VariantDef:
     variant_id: str
     matter_state: MatterState
-    motion_mode: MotionMode
     density: float
     hardness: float
     friction: float
@@ -78,6 +71,17 @@ class VariantDef:
     reaction_energy: float = 0.0
     reaction_preserves_self: bool = True
     lifetime_mode: LifetimeMode = LifetimeMode.NONE
+    mobility: float = 1.0
+    pressure_response: float = 1.0
+    gravity_scale: float = 0.0
+    buoyancy_scale: float = 0.0
+    thermal_motion_scale: float = 0.0
+    wind_coupling: float = 0.0
+    wind_vertical_factor: float = 0.0
+    downward_blocked_diagonal_fallback: bool = False
+    velocity_decay: float = 0.92
+    liquid_contact_heat_exchange_multiplier: float = 1.0
+    same_variant_heat_exchange_multiplier: float = 1.0
     render_color: tuple[int, int, int] = (255, 255, 255)
 
 

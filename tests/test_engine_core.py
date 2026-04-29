@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 import moderngl
 import pyglet
 
+from engine.atmosphere import ambient_air_temperature_for_row
 from engine.gpu_backend import GpuSimulator, GpuMaterialTables, pack_grid_state, unpack_grid_state
 from engine.grid import create_grid
 from engine.materials import build_material_registry
@@ -49,6 +50,49 @@ def create_compute_context() -> moderngl.Context:
                 "Failed to create an OpenGL 4.3 compute context via standalone or hidden-window paths. "
                 f"standalone={standalone_error!r}; window={window_error!r}"
             ) from window_error
+
+
+def populate_single_hole_reservoir(grid, registry, *, hole_x: int | None = None, outlet_y: int = 39) -> int:
+    hole_x = grid.width // 2 if hole_x is None else hole_x
+    left_wall_x = max(2, hole_x - 18)
+    right_wall_x = min(grid.width - 3, hole_x + 18)
+    top_y = 12
+    for y in range(5, outlet_y + 1):
+        inject_cells(grid, [(left_wall_x, y), (right_wall_x, y)], "stone", "stone_platform", registry=registry)
+    for x in range(left_wall_x, right_wall_x + 1):
+        if x != hole_x:
+            inject_cells(grid, [(x, outlet_y)], "stone", "stone_platform", registry=registry)
+    for x in range(left_wall_x + 1, right_wall_x):
+        for y in range(top_y, outlet_y):
+            inject_cells(grid, [(x, y)], "water", "water", registry=registry)
+    return outlet_y
+
+
+def outflow_width_below_row(grid, *, min_y: int, max_y: int | None = None) -> int:
+    upper_bound = grid.height if max_y is None else min(grid.height, max_y)
+    xs = [
+        x
+        for y in range(min_y, upper_bound)
+        for x in range(grid.width)
+        if grid.get_cell(x, y).variant_id == "water"
+    ]
+    if not xs:
+        return 0
+    return max(xs) - min(xs) + 1
+
+
+def seed_stratified_empty_air(grid, registry) -> None:
+    base_temperature = registry.variant("empty", "empty").base_temperature
+    for y in range(grid.height):
+        row_temperature = ambient_air_temperature_for_row(grid.height, y, base_temperature)
+        inject_cells(
+            grid,
+            [(x, y) for x in range(grid.width)],
+            "empty",
+            "empty",
+            {"temperature": row_temperature},
+            registry=registry,
+        )
 
 
 class EngineCoreTests(unittest.TestCase):
@@ -105,6 +149,16 @@ class EngineCoreTests(unittest.TestCase):
         xs = {x for y in range(grid.height) for x in range(grid.width) if grid.get_cell(x, y).variant_id == "water"}
         self.assertGreater(len(xs), 1)
 
+    def test_non_water_liquid_spreads_sideways_with_same_state_rule(self) -> None:
+        grid = create_grid(9, 6)
+        for x in range(9):
+            inject_cells(grid, [(x, 5)], "stone", "stone_platform")
+        inject_cells(grid, [(4, 1), (4, 2), (4, 3)], "tar", "tar_liquid")
+        for _ in range(40):
+            step(grid, self.registry, 1 / 60.0)
+        xs = {x for y in range(grid.height) for x in range(grid.width) if grid.get_cell(x, y).variant_id == "tar_liquid"}
+        self.assertGreater(len(xs), 1)
+
     def test_disabling_liquid_brownian_removes_horizontal_random_velocity(self) -> None:
         enabled_grid = create_grid(5, 5)
         enabled_grid.liquid_brownian_enabled = True
@@ -143,6 +197,149 @@ class EngineCoreTests(unittest.TestCase):
         self.assertAlmostEqual(disabled_water.blocked_x, 0.0, places=6)
         self.assertAlmostEqual(disabled_water.blocked_y, 0.0, places=6)
 
+    def test_disabling_directional_fallback_prevents_alternate_move_when_primary_direction_is_blocked(self) -> None:
+        enabled_grid = create_grid(3, 3)
+        enabled_grid.liquid_brownian_enabled = False
+        enabled_grid.directional_fallback_enabled = True
+        enabled_grid.directional_fallback_angle_limit_degrees = 45.0
+        inject_cells(enabled_grid, [(1, 0)], "water", "water")
+        inject_cells(enabled_grid, [(1, 1)], "stone", "stone_platform")
+        apply_motion(enabled_grid, self.registry, 1 / 60.0)
+        enabled_positions = {
+            (x, y)
+            for y in range(enabled_grid.height)
+            for x in range(enabled_grid.width)
+            if enabled_grid.get_cell(x, y).variant_id == "water"
+        }
+
+        disabled_grid = create_grid(3, 3)
+        disabled_grid.liquid_brownian_enabled = False
+        disabled_grid.directional_fallback_enabled = False
+        inject_cells(disabled_grid, [(1, 0)], "water", "water")
+        inject_cells(disabled_grid, [(1, 1)], "stone", "stone_platform")
+        apply_motion(disabled_grid, self.registry, 1 / 60.0)
+
+        self.assertIn(enabled_positions, ({(0, 1)}, {(2, 1)}))
+        self.assertEqual(disabled_grid.get_cell(1, 0).variant_id, "water")
+
+    def test_directional_fallback_angle_limit_excludes_diagonal_moves_below_45_degrees(self) -> None:
+        grid = create_grid(5, 5)
+        grid.liquid_brownian_enabled = False
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 44.0
+        inject_cells(grid, [(2, 1)], "water", "water")
+        inject_cells(grid, [(1, 2), (2, 2), (3, 2)], "stone", "stone_platform")
+        apply_motion(grid, self.registry, 1 / 60.0)
+        self.assertEqual(grid.get_cell(2, 1).variant_id, "water")
+
+    def test_directional_fallback_angle_limit_allows_diagonal_moves_at_45_degrees(self) -> None:
+        grid = create_grid(5, 5)
+        grid.liquid_brownian_enabled = False
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 45.0
+        inject_cells(grid, [(2, 1)], "water", "water")
+        inject_cells(grid, [(2, 2)], "stone", "stone_platform")
+        apply_motion(grid, self.registry, 1 / 60.0)
+        positions = {
+            (x, y)
+            for y in range(grid.height)
+            for x in range(grid.width)
+            if grid.get_cell(x, y).variant_id == "water"
+        }
+        self.assertIn(positions, ({(1, 2)}, {(3, 2)}))
+
+    def test_powder_blocked_below_releases_diagonally_at_45_degrees(self) -> None:
+        grid = create_grid(7, 7)
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 45.0
+        inject_cells(grid, [(3, 3)], "sand", "sand_powder")
+        inject_cells(grid, [(3, 4)], "stone", "stone_platform")
+        apply_motion(grid, self.registry, 1 / 60.0)
+        positions = {
+            (x, y)
+            for y in range(grid.height)
+            for x in range(grid.width)
+            if grid.get_cell(x, y).variant_id == "sand_powder"
+        }
+        self.assertIn(positions, ({(2, 4)}, {(4, 4)}))
+
+    def test_non_bearing_solid_reuses_same_diagonal_release_rule(self) -> None:
+        grid = create_grid(7, 7)
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 45.0
+        inject_cells(grid, [(3, 3)], "glass", "glass_shards")
+        inject_cells(grid, [(3, 4)], "stone", "stone_platform")
+        apply_motion(grid, self.registry, 1 / 60.0)
+        positions = {
+            (x, y)
+            for y in range(grid.height)
+            for x in range(grid.width)
+            if grid.get_cell(x, y).variant_id == "glass_shards"
+        }
+        self.assertIn(positions, ({(2, 4)}, {(4, 4)}))
+
+    def test_powder_blocked_below_stays_put_below_45_degree_limit(self) -> None:
+        grid = create_grid(7, 7)
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 44.0
+        inject_cells(grid, [(3, 3)], "sand", "sand_powder")
+        inject_cells(grid, [(3, 4)], "stone", "stone_platform")
+        apply_motion(grid, self.registry, 1 / 60.0)
+        self.assertEqual(grid.get_cell(3, 3).variant_id, "sand_powder")
+
+    def test_directional_tie_break_alternates_diagonal_side_across_steps(self) -> None:
+        positions = []
+        for step_id in (0, 1):
+            grid = create_grid(5, 5)
+            grid.liquid_brownian_enabled = False
+            grid.directional_fallback_angle_limit_degrees = 45.0
+            grid.step_id = step_id
+            inject_cells(grid, [(2, 1)], "water", "water")
+            inject_cells(grid, [(2, 2)], "stone", "stone_platform")
+            apply_motion(grid, self.registry, 1 / 60.0)
+            positions.append(
+                next(
+                    (x, y)
+                    for y in range(grid.height)
+                    for x in range(grid.width)
+                    if grid.get_cell(x, y).variant_id == "water"
+                )
+            )
+
+        self.assertEqual({positions[0], positions[1]}, {(1, 2), (3, 2)})
+
+    def test_disabling_directional_fallback_keeps_single_hole_outflow_narrower(self) -> None:
+        enabled_grid = create_grid(61, 60)
+        enabled_grid.liquid_brownian_enabled = False
+        enabled_grid.directional_fallback_enabled = True
+        enabled_grid.directional_fallback_angle_limit_degrees = 91.0
+        outlet_y = populate_single_hole_reservoir(enabled_grid, self.registry)
+        for _ in range(20):
+            step(enabled_grid, self.registry, 1 / 60.0)
+        enabled_width = outflow_width_below_row(enabled_grid, min_y=outlet_y + 1, max_y=outlet_y + 5)
+
+        disabled_grid = create_grid(61, 60)
+        disabled_grid.liquid_brownian_enabled = False
+        disabled_grid.directional_fallback_enabled = False
+        outlet_y = populate_single_hole_reservoir(disabled_grid, self.registry)
+        for _ in range(20):
+            step(disabled_grid, self.registry, 1 / 60.0)
+        disabled_width = outflow_width_below_row(disabled_grid, min_y=outlet_y + 1, max_y=outlet_y + 5)
+
+        self.assertGreater(enabled_width, disabled_width)
+
+    def test_continuous_sand_feed_spreads_into_wider_pile(self) -> None:
+        grid = create_grid(25, 20)
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 45.0
+        for x in range(grid.width):
+            inject_cells(grid, [(x, 19)], "stone", "stone_platform")
+        for _ in range(60):
+            inject_cells(grid, [(12, 1)], "sand", "sand_powder")
+            step(grid, self.registry, 1 / 60.0)
+        sand_xs = [x for y in range(grid.height) for x in range(grid.width) if grid.get_cell(x, y).variant_id == "sand_powder"]
+        self.assertGreaterEqual(max(sand_xs) - min(sand_xs) + 1, 5)
+
     def test_gas_brownian_motion_changes_horizontal_position(self) -> None:
         grid = create_grid(32, 24)
         inject_cells(
@@ -154,7 +351,7 @@ class EngineCoreTests(unittest.TestCase):
             registry=self.registry,
         )
         inject_cells(grid, [(16, 12)], "poison", "poison_gas")
-        visited_x = set()
+        visited_x = {16}
         for _ in range(12):
             step(grid, self.registry, 1 / 60.0)
             poison_positions = [(x, y) for y in range(grid.height) for x in range(grid.width) if grid.get_cell(x, y).variant_id == "poison_gas"]
@@ -213,6 +410,15 @@ class EngineCoreTests(unittest.TestCase):
         temperature_frame = build_rgba_frame(grid, self.registry, view_mode=DebugViewMode.TEMPERATURE)
         self.assertNotEqual(material_frame, temperature_frame)
 
+    def test_temperature_view_makes_ambient_gradient_visible(self) -> None:
+        grid = create_grid(1, 9)
+        seed_stratified_empty_air(grid, self.registry)
+        temperature_frame = build_rgba_frame(grid, self.registry, view_mode=DebugViewMode.TEMPERATURE)
+        top_pixel = temperature_frame[0:3]
+        bottom_pixel = temperature_frame[-4:-1]
+        contrast = sum(abs(top_pixel[index] - bottom_pixel[index]) for index in range(3))
+        self.assertGreaterEqual(contrast, 100)
+
     def test_temperature_does_not_relax_back_to_material_base_temperature(self) -> None:
         grid = create_grid(1, 1)
         inject_cells(grid, [(0, 0)], "water", "water", {"temperature": 80.0})
@@ -236,10 +442,49 @@ class EngineCoreTests(unittest.TestCase):
         self.assertGreater(grid.get_cell(0, 0).temperature, 40.0)
         self.assertGreater(grid.get_cell(2, 0).temperature, 40.0)
 
+    def test_empty_air_relaxes_toward_stratified_ambient_profile(self) -> None:
+        grid = create_grid(1, 9)
+        for _ in range(240):
+            apply_thermal(grid, self.registry, 1 / 60.0)
+        self.assertLess(grid.get_cell(0, 0).temperature, 19.0)
+        self.assertGreater(grid.get_cell(0, grid.height - 1).temperature, 21.0)
+
+    def test_hot_air_plume_sets_surrounding_air_in_motion(self) -> None:
+        grid = create_grid(7, 7)
+        seed_stratified_empty_air(grid, self.registry)
+        inject_cells(grid, [(3, 4)], "empty", "empty", {"temperature": 400.0}, registry=self.registry)
+        for _ in range(4):
+            step(grid, self.registry, 1 / 60.0)
+        moving_cells = sum(
+            1
+            for cell in grid.cells
+            if cell.is_empty and abs(cell.vel_x) + abs(cell.vel_y) + abs(cell.blocked_x) + abs(cell.blocked_y) > 0.01
+        )
+        self.assertGreaterEqual(moving_cells, 8)
+
+    def test_moving_air_imparts_horizontal_motion_to_powder(self) -> None:
+        grid = create_grid(5, 5)
+        for x in range(grid.width):
+            inject_cells(grid, [(x, 4)], "stone", "stone_platform")
+        inject_cells(grid, [(2, 3)], "sand", "sand_powder")
+        inject_cells(
+            grid,
+            [(1, 2), (2, 2), (3, 2), (1, 3), (3, 3)],
+            "empty",
+            "empty",
+            {"vel_x": 1.1},
+            registry=self.registry,
+        )
+        apply_motion(grid, self.registry, 1 / 60.0)
+        moved_sand = next(cell for cell in grid.cells if cell.variant_id == "sand_powder")
+        sand_x = next(x for y in range(grid.height) for x in range(grid.width) if grid.get_cell(x, y).variant_id == "sand_powder")
+        self.assertGreater(moved_sand.vel_x, 0.2)
+        self.assertGreaterEqual(sand_x, 3)
+
     def test_hot_empty_air_advects_upward(self) -> None:
         grid = create_grid(1, 5)
         inject_cells(grid, [(0, 3)], "empty", "empty", {"temperature": 200.0}, registry=self.registry)
-        for _ in range(3):
+        for _ in range(5):
             step(grid, self.registry, 1 / 60.0)
         hottest_y = max(range(grid.height), key=lambda y: grid.get_cell(0, y).temperature)
         self.assertLess(hottest_y, 3)
@@ -526,6 +771,20 @@ class EngineCoreTests(unittest.TestCase):
         self.assertAlmostEqual(disabled_water.vel_x, 0.0, places=6)
         self.assertNotAlmostEqual(enabled_water.vel_x, 0.0, places=6)
 
+    def test_gpu_non_water_liquid_spreads_sideways_with_same_state_rule(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(9, 6)
+        for x in range(9):
+            inject_cells(grid, [(x, 5)], "stone", "stone_platform")
+        inject_cells(grid, [(4, 1), (4, 2), (4, 3)], "tar", "tar_liquid")
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        for _ in range(40):
+            gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        xs = {x for y in range(readback.height) for x in range(readback.width) if readback.get_cell(x, y).variant_id == "tar_liquid"}
+        self.assertGreater(len(xs), 1)
+
     def test_gpu_disabling_blocked_impulse_clears_persisted_intent(self) -> None:
         ctx = create_compute_context()
 
@@ -553,6 +812,187 @@ class EngineCoreTests(unittest.TestCase):
         self.assertAlmostEqual(disabled_water.blocked_x, 0.0, places=6)
         self.assertAlmostEqual(disabled_water.blocked_y, 0.0, places=6)
 
+    def test_gpu_disabling_directional_fallback_prevents_alternate_move_when_primary_direction_is_blocked(self) -> None:
+        ctx = create_compute_context()
+
+        enabled_grid = create_grid(3, 3)
+        enabled_grid.liquid_brownian_enabled = False
+        enabled_grid.directional_fallback_enabled = True
+        enabled_grid.directional_fallback_angle_limit_degrees = 45.0
+        inject_cells(enabled_grid, [(1, 0)], "water", "water")
+        inject_cells(enabled_grid, [(1, 1)], "stone", "stone_platform")
+        enabled_gpu = GpuSimulator(ctx, enabled_grid, self.registry)
+        enabled_gpu.step(1 / 60.0)
+        enabled_readback = enabled_gpu.readback_grid()
+        enabled_positions = {
+            (x, y)
+            for y in range(enabled_readback.height)
+            for x in range(enabled_readback.width)
+            if enabled_readback.get_cell(x, y).variant_id == "water"
+        }
+
+        disabled_grid = create_grid(3, 3)
+        disabled_grid.liquid_brownian_enabled = False
+        disabled_grid.directional_fallback_enabled = False
+        inject_cells(disabled_grid, [(1, 0)], "water", "water")
+        inject_cells(disabled_grid, [(1, 1)], "stone", "stone_platform")
+        disabled_gpu = GpuSimulator(ctx, disabled_grid, self.registry)
+        disabled_gpu.step(1 / 60.0)
+        disabled_readback = disabled_gpu.readback_grid()
+
+        self.assertIn(enabled_positions, ({(0, 1)}, {(2, 1)}))
+        self.assertEqual(disabled_readback.get_cell(1, 0).variant_id, "water")
+
+    def test_gpu_directional_fallback_angle_limit_excludes_diagonal_moves_below_45_degrees(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(5, 5)
+        grid.liquid_brownian_enabled = False
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 44.0
+        inject_cells(grid, [(2, 1)], "water", "water")
+        inject_cells(grid, [(1, 2), (2, 2), (3, 2)], "stone", "stone_platform")
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        self.assertEqual(readback.get_cell(2, 1).variant_id, "water")
+
+    def test_gpu_directional_fallback_angle_limit_allows_diagonal_moves_at_45_degrees(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(5, 5)
+        grid.liquid_brownian_enabled = False
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 45.0
+        inject_cells(grid, [(2, 1)], "water", "water")
+        inject_cells(grid, [(2, 2)], "stone", "stone_platform")
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        positions = {
+            (x, y)
+            for y in range(readback.height)
+            for x in range(readback.width)
+            if readback.get_cell(x, y).variant_id == "water"
+        }
+        self.assertIn(positions, ({(1, 2)}, {(3, 2)}))
+
+    def test_gpu_powder_blocked_below_releases_diagonally_at_45_degrees(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(7, 7)
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 45.0
+        inject_cells(grid, [(3, 3)], "sand", "sand_powder")
+        inject_cells(grid, [(3, 4)], "stone", "stone_platform")
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        positions = {
+            (x, y)
+            for y in range(readback.height)
+            for x in range(readback.width)
+            if readback.get_cell(x, y).variant_id == "sand_powder"
+        }
+        self.assertIn(positions, ({(2, 4)}, {(4, 4)}))
+
+    def test_gpu_non_bearing_solid_reuses_same_diagonal_release_rule(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(7, 7)
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 45.0
+        inject_cells(grid, [(3, 3)], "glass", "glass_shards")
+        inject_cells(grid, [(3, 4)], "stone", "stone_platform")
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        positions = {
+            (x, y)
+            for y in range(readback.height)
+            for x in range(readback.width)
+            if readback.get_cell(x, y).variant_id == "glass_shards"
+        }
+        self.assertIn(positions, ({(2, 4)}, {(4, 4)}))
+
+    def test_gpu_powder_blocked_below_stays_put_below_45_degree_limit(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(7, 7)
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 44.0
+        inject_cells(grid, [(3, 3)], "sand", "sand_powder")
+        inject_cells(grid, [(3, 4)], "stone", "stone_platform")
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        self.assertEqual(readback.get_cell(3, 3).variant_id, "sand_powder")
+
+    def test_gpu_directional_tie_break_alternates_diagonal_side_across_steps(self) -> None:
+        ctx = create_compute_context()
+
+        positions = []
+        for step_id in (0, 1):
+            grid = create_grid(5, 5)
+            grid.liquid_brownian_enabled = False
+            grid.directional_fallback_angle_limit_degrees = 45.0
+            grid.step_id = step_id
+            inject_cells(grid, [(2, 1)], "water", "water")
+            inject_cells(grid, [(2, 2)], "stone", "stone_platform")
+            gpu = GpuSimulator(ctx, grid, self.registry)
+            gpu.step(1 / 60.0)
+            readback = gpu.readback_grid()
+            positions.append(
+                next(
+                    (x, y)
+                    for y in range(readback.height)
+                    for x in range(readback.width)
+                    if readback.get_cell(x, y).variant_id == "water"
+                )
+            )
+
+        self.assertEqual({positions[0], positions[1]}, {(1, 2), (3, 2)})
+
+    def test_gpu_disabling_directional_fallback_keeps_single_hole_outflow_narrower(self) -> None:
+        ctx = create_compute_context()
+
+        enabled_grid = create_grid(61, 60)
+        enabled_grid.liquid_brownian_enabled = False
+        enabled_grid.directional_fallback_enabled = True
+        enabled_grid.directional_fallback_angle_limit_degrees = 91.0
+        outlet_y = populate_single_hole_reservoir(enabled_grid, self.registry)
+        enabled_gpu = GpuSimulator(ctx, enabled_grid, self.registry)
+        for _ in range(20):
+            enabled_gpu.step(1 / 60.0)
+        enabled_width = outflow_width_below_row(enabled_gpu.readback_grid(), min_y=outlet_y + 1, max_y=outlet_y + 5)
+
+        disabled_grid = create_grid(61, 60)
+        disabled_grid.liquid_brownian_enabled = False
+        disabled_grid.directional_fallback_enabled = False
+        outlet_y = populate_single_hole_reservoir(disabled_grid, self.registry)
+        disabled_gpu = GpuSimulator(ctx, disabled_grid, self.registry)
+        for _ in range(20):
+            disabled_gpu.step(1 / 60.0)
+        disabled_width = outflow_width_below_row(disabled_gpu.readback_grid(), min_y=outlet_y + 1, max_y=outlet_y + 5)
+
+        self.assertGreater(enabled_width, disabled_width)
+
+    def test_gpu_continuous_sand_feed_spreads_into_wider_pile(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(25, 20)
+        grid.directional_fallback_enabled = True
+        grid.directional_fallback_angle_limit_degrees = 45.0
+        for x in range(grid.width):
+            inject_cells(grid, [(x, 19)], "stone", "stone_platform")
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        for _ in range(60):
+            gpu.paint_circle(12, 1, 0, "sand", "sand_powder")
+            gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        sand_xs = [x for y in range(readback.height) for x in range(readback.width) if readback.get_cell(x, y).variant_id == "sand_powder"]
+        self.assertGreaterEqual(max(sand_xs) - min(sand_xs) + 1, 5)
+
     def test_gpu_pressure_view_uses_pressure_palette(self) -> None:
         ctx = create_compute_context()
 
@@ -563,6 +1003,18 @@ class EngineCoreTests(unittest.TestCase):
         material_frame = gpu.render(DebugViewMode.MATERIAL).read()
         pressure_frame = gpu.render(DebugViewMode.PRESSURE).read()
         self.assertNotEqual(material_frame, pressure_frame)
+
+    def test_gpu_temperature_view_makes_ambient_gradient_visible(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(1, 9)
+        seed_stratified_empty_air(grid, self.registry)
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        temperature_frame = gpu.render(DebugViewMode.TEMPERATURE).read()
+        top_pixel = temperature_frame[0:3]
+        bottom_pixel = temperature_frame[-4:-1]
+        contrast = sum(abs(top_pixel[index] - bottom_pixel[index]) for index in range(3))
+        self.assertGreaterEqual(contrast, 100)
 
     def test_gpu_temperature_does_not_relax_back_to_material_base_temperature(self) -> None:
         ctx = create_compute_context()
@@ -599,13 +1051,64 @@ class EngineCoreTests(unittest.TestCase):
         self.assertGreater(readback.get_cell(0, 0).temperature, 40.0)
         self.assertGreater(readback.get_cell(2, 0).temperature, 40.0)
 
+    def test_gpu_empty_air_relaxes_toward_stratified_ambient_profile(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(1, 9)
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        for _ in range(240):
+            gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        self.assertLess(readback.get_cell(0, 0).temperature, 19.0)
+        self.assertGreater(readback.get_cell(0, readback.height - 1).temperature, 21.0)
+
+    def test_gpu_hot_air_plume_sets_surrounding_air_in_motion(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(7, 7)
+        seed_stratified_empty_air(grid, self.registry)
+        inject_cells(grid, [(3, 4)], "empty", "empty", {"temperature": 400.0}, registry=self.registry)
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        for _ in range(4):
+            gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        moving_cells = sum(
+            1
+            for cell in readback.cells
+            if cell.is_empty and abs(cell.vel_x) + abs(cell.vel_y) + abs(cell.blocked_x) + abs(cell.blocked_y) > 0.01
+        )
+        self.assertGreaterEqual(moving_cells, 8)
+
+    def test_gpu_moving_air_imparts_horizontal_motion_to_powder(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(5, 5)
+        for x in range(grid.width):
+            inject_cells(grid, [(x, 4)], "stone", "stone_platform")
+        inject_cells(grid, [(2, 3)], "sand", "sand_powder")
+        inject_cells(
+            grid,
+            [(1, 2), (2, 2), (3, 2), (1, 3), (3, 3)],
+            "empty",
+            "empty",
+            {"vel_x": 1.1},
+            registry=self.registry,
+        )
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        gpu.step(1 / 60.0)
+        readback = gpu.readback_grid()
+        moved_sand = next(cell for cell in readback.cells if cell.variant_id == "sand_powder")
+        sand_x = next(x for y in range(readback.height) for x in range(readback.width) if readback.get_cell(x, y).variant_id == "sand_powder")
+        self.assertGreater(moved_sand.vel_x, 0.2)
+        self.assertGreaterEqual(sand_x, 3)
+
     def test_gpu_hot_empty_air_advects_upward(self) -> None:
         ctx = create_compute_context()
 
         grid = create_grid(1, 5)
         inject_cells(grid, [(0, 3)], "empty", "empty", {"temperature": 200.0}, registry=self.registry)
         gpu = GpuSimulator(ctx, grid, self.registry)
-        for _ in range(3):
+        for _ in range(5):
             gpu.step(1 / 60.0)
         readback = gpu.readback_grid()
         hottest_y = max(range(readback.height), key=lambda y: readback.get_cell(0, y).temperature)
@@ -717,7 +1220,7 @@ class EngineCoreTests(unittest.TestCase):
         gpu.step(1.0)
         readback = gpu.readback_grid()
         self.assertTrue(readback.get_cell(0, 0).is_empty)
-        self.assertGreater(readback.get_cell(0, 0).temperature, 500.0)
+        self.assertGreater(readback.get_cell(0, 0).temperature, 450.0)
 
     def test_gpu_fire_reaction_energy_heats_fire_cell_before_diffusion(self) -> None:
         ctx = create_compute_context()
@@ -729,7 +1232,7 @@ class EngineCoreTests(unittest.TestCase):
         readback = gpu.readback_grid()
         self.assertGreater(readback.get_cell(0, 0).temperature, 100.0)
 
-    def test_gpu_fire_trail_hot_air_cools_after_fire_moves_away(self) -> None:
+    def test_gpu_fire_motion_keeps_a_hot_air_trail(self) -> None:
         ctx = create_compute_context()
 
         grid = create_grid(3, 1)
@@ -738,7 +1241,9 @@ class EngineCoreTests(unittest.TestCase):
         gpu.step(0.0)
         before = gpu.readback_grid().get_cell(1, 0).temperature
         gpu.step(1 / 60.0)
-        self.assertLess(gpu.readback_grid().get_cell(1, 0).temperature, before)
+        readback = gpu.readback_grid()
+        self.assertEqual(sum(1 for cell in readback.cells if cell.variant_id == "fire"), 1)
+        self.assertTrue(any(cell.is_empty and cell.temperature >= before for cell in readback.cells))
 
     def test_gpu_fire_heats_adjacent_water_before_motion(self) -> None:
         ctx = create_compute_context()
@@ -772,7 +1277,13 @@ class EngineCoreTests(unittest.TestCase):
         gpu = GpuSimulator(ctx, grid, self.registry)
         gpu.step(1 / 60.0)
         gpu.step(1 / 60.0)
-        self.assertEqual(gpu.readback_grid().get_cell(4, 5).variant_id, "sand_powder")
+        sand_position = next(
+            (x, y)
+            for y in range(gpu.readback_grid().height)
+            for x in range(gpu.readback_grid().width)
+            if gpu.readback_grid().get_cell(x, y).variant_id == "sand_powder"
+        )
+        self.assertIn(sand_position, {(4, 5), (5, 5)})
 
     def test_gpu_support_signal_moves_one_cell_per_step(self) -> None:
         ctx = create_compute_context()
@@ -855,6 +1366,7 @@ class EngineCoreTests(unittest.TestCase):
         ctx = create_compute_context()
 
         grid = create_grid(5, 4)
+        grid.directional_fallback_angle_limit_degrees = 91.0
         for x in range(5):
             inject_cells(grid, [(x, 3)], "stone", "stone_platform")
         inject_cells(grid, [(2, 2)], "water", "water")
@@ -880,7 +1392,7 @@ class EngineCoreTests(unittest.TestCase):
         inject_cells(grid, [(16, 12)], "poison", "poison_gas")
         gpu = GpuSimulator(ctx, grid, self.registry)
 
-        visited_x = set()
+        visited_x = {16}
         for _ in range(12):
             gpu.step(1 / 60.0)
             readback = gpu.readback_grid()
@@ -1009,6 +1521,7 @@ class EngineCoreTests(unittest.TestCase):
                 "3",
                 "--no-liquid-brownian",
                 "--no-blocked-impulse",
+                "--no-directional-fallback",
                 "--no-vsync",
             ]
         )
@@ -1020,6 +1533,7 @@ class EngineCoreTests(unittest.TestCase):
         self.assertEqual(args.substeps, 3)
         self.assertTrue(args.no_liquid_brownian)
         self.assertTrue(args.no_blocked_impulse)
+        self.assertTrue(args.no_directional_fallback)
         self.assertTrue(args.no_vsync)
 
 

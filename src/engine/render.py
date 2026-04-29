@@ -22,26 +22,33 @@ def _lerp_channel(start: float, end: float, factor: float) -> int:
     return _clamp_channel(start + (end - start) * factor)
 
 
+TEMPERATURE_COLOR_STOPS = (
+    (-40.0, (18, 28, 80)),
+    (0.0, (50, 120, 220)),
+    (10.0, (70, 200, 255)),
+    (17.0, (92, 238, 255)),
+    (20.0, (128, 245, 180)),
+    (23.0, (215, 240, 112)),
+    (30.0, (255, 220, 92)),
+    (60.0, (255, 168, 72)),
+    (120.0, (255, 110, 52)),
+    (300.0, (255, 160, 70)),
+    (800.0, (255, 220, 165)),
+    (1400.0, (255, 245, 235)),
+)
+
+
 def _temperature_rgba(temperature: float) -> tuple[int, int, int, int]:
-    stops = (
-        (-40.0, (20, 28, 70)),
-        (0.0, (50, 120, 220)),
-        (20.0, (70, 180, 255)),
-        (100.0, (90, 220, 140)),
-        (300.0, (240, 220, 80)),
-        (800.0, (255, 120, 40)),
-        (1400.0, (255, 245, 235)),
-    )
-    if temperature <= stops[0][0]:
-        red, green, blue = stops[0][1]
+    if temperature <= TEMPERATURE_COLOR_STOPS[0][0]:
+        red, green, blue = TEMPERATURE_COLOR_STOPS[0][1]
         return (red, green, blue, 255)
-    if temperature >= stops[-1][0]:
-        red, green, blue = stops[-1][1]
+    if temperature >= TEMPERATURE_COLOR_STOPS[-1][0]:
+        red, green, blue = TEMPERATURE_COLOR_STOPS[-1][1]
         return (red, green, blue, 255)
 
-    for index in range(len(stops) - 1):
-        left_temp, left_color = stops[index]
-        right_temp, right_color = stops[index + 1]
+    for index in range(len(TEMPERATURE_COLOR_STOPS) - 1):
+        left_temp, left_color = TEMPERATURE_COLOR_STOPS[index]
+        right_temp, right_color = TEMPERATURE_COLOR_STOPS[index + 1]
         if left_temp <= temperature <= right_temp:
             factor = (temperature - left_temp) / max(0.001, right_temp - left_temp)
             return (

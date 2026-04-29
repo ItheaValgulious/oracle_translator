@@ -9,7 +9,7 @@ import moderngl
 from .grid import Grid
 from .render import DebugViewMode
 from .support import SUPPORT_FAILURE_THRESHOLD, SUPPORT_SOURCE_VALUE
-from .types import CellFlag, CellState, LifetimeMode, MaterialRegistry, MatterState, MotionMode, ReactionKind
+from .types import CellFlag, CellState, LifetimeMode, MaterialRegistry, MatterState, ReactionKind
 
 
 WORKGROUP_SIZE = 8
@@ -19,17 +19,12 @@ INT_MAX_VALUE = 2_147_483_647
 PHASE_FLAG_ABOVE = 1
 PHASE_FLAG_BELOW = 1 << 1
 PHASE_FLAG_COOL_TO_SOLID = 1 << 2
+GAS_NEIGHBOR_WIND_DIAGONAL_WEIGHT = 0.7
 
 MATTER_STATE_CODES = {
     MatterState.SOLID: 0,
     MatterState.LIQUID: 1,
     MatterState.GAS: 2,
-}
-
-MOTION_MODE_CODES = {
-    MotionMode.STATIC: 0,
-    MotionMode.POWDER: 1,
-    MotionMode.FLUID: 2,
 }
 
 REACTION_KIND_CODES = {
@@ -45,7 +40,7 @@ LIFETIME_MODE_CODES = {
     LifetimeMode.DECAY_WITH_AGE: 1,
 }
 
-VARIANT_PACK_FORMAT = "<8i20f"
+VARIANT_PACK_FORMAT = "<8i28f"
 FAMILY_PACK_FORMAT = "<4i4f"
 PHASE_PACK_FORMAT = "<4i4f"
 
@@ -135,7 +130,7 @@ class GpuMaterialTables:
                     family_index_by_id[family_id],
                     REACTION_KIND_CODES[variant.reaction_kind],
                     LIFETIME_MODE_CODES[variant.lifetime_mode],
-                    MOTION_MODE_CODES[variant.motion_mode],
+                    int(variant.downward_blocked_diagonal_fallback),
                     int(variant.support_bearing),
                     int(variant.support_transmission),
                     int(variant.reaction_preserves_self),
@@ -158,8 +153,16 @@ class GpuMaterialTables:
                     float(green),
                     float(blue),
                     float(variant.reaction_energy),
-                    0.0,
-                    0.0,
+                    float(variant.liquid_contact_heat_exchange_multiplier),
+                    float(variant.same_variant_heat_exchange_multiplier),
+                    float(variant.mobility),
+                    float(variant.pressure_response),
+                    float(variant.gravity_scale),
+                    float(variant.buoyancy_scale),
+                    float(variant.thermal_motion_scale),
+                    float(variant.wind_coupling),
+                    float(variant.wind_vertical_factor),
+                    float(variant.velocity_decay),
                 )
             )
 
@@ -256,10 +259,6 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define MATTER_STATE_LIQUID {MATTER_STATE_CODES[MatterState.LIQUID]}
 #define MATTER_STATE_GAS {MATTER_STATE_CODES[MatterState.GAS]}
 
-#define MOTION_MODE_STATIC {MOTION_MODE_CODES[MotionMode.STATIC]}
-#define MOTION_MODE_POWDER {MOTION_MODE_CODES[MotionMode.POWDER]}
-#define MOTION_MODE_FLUID {MOTION_MODE_CODES[MotionMode.FLUID]}
-
 #define REACTION_NONE {REACTION_KIND_CODES[ReactionKind.NONE]}
 #define REACTION_HEAT_SOURCE {REACTION_KIND_CODES[ReactionKind.HEAT_SOURCE]}
 #define REACTION_CORROSIVE {REACTION_KIND_CODES[ReactionKind.CORROSIVE]}
@@ -267,7 +266,6 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define REACTION_FLAMMABLE {REACTION_KIND_CODES[ReactionKind.FLAMMABLE]}
 
 #define FIRE_FAMILY_INDEX {tables.family_index_by_id["fire"]}
-#define STEAM_VARIANT_INDEX {tables.variant_index_by_key[("water", "steam")]}
 
 #define SUPPORT_TIMEOUT_SECONDS 10.0
 #define SUPPORT_SOURCE_VALUE SUPPORT_TIMEOUT_SECONDS
@@ -292,16 +290,17 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 
 #define GRAVITY_ACCELERATION 1.2
 #define GAS_BUOYANCY_SCALE 10.0
-#define VELOCITY_DECAY 0.92
-#define STATIC_VELOCITY_DECAY 0.96
 #define BLOCKED_DECAY 0.72
 #define BLOCKED_IMPULSE_MAX 1.25
 #define LIQUID_RANDOM_GAIN 0.012
 #define LIQUID_RANDOM_VERTICAL_FACTOR 0.18
-#define EMPTY_RANDOM_GAIN 0.52
 #define GAS_RANDOM_GAIN 0.42
 #define GAS_RANDOM_VERTICAL_FACTOR 0.85
 #define DIRECTION_JITTER_GAIN 0.06
+#define DIRECTION_TIE_BREAK_GAIN 0.0001
+#define DIRECTION_FALLBACK_ALIGNMENT_EPSILON 0.000001
+#define AMBIENT_AIR_STRATIFICATION_DELTA 6.0
+#define AMBIENT_AIR_RESTORE_RATE 0.35
 #define KELVIN_OFFSET 273.15
 #define MIN_THERMAL_KELVIN 80.0
 #define EMPTY_MOTION_TEMPERATURE_THRESHOLD 0.5
@@ -311,9 +310,7 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define GAS_RANDOM_HEAT_FACTOR 1.25
 #define LIQUID_RANDOM_FLOOR_FACTOR 0.15
 #define DENSITY_EPSILON 0.000001
-#define LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER 30.0
-#define CONDENSABLE_GAS_CLUSTER_CONDUCTION_MULTIPLIER 80.0
-
+#define GAS_NEIGHBOR_WIND_DIAGONAL_WEIGHT {GAS_NEIGHBOR_WIND_DIAGONAL_WEIGHT}
 #define VIEW_MODE_MATERIAL 0
 #define VIEW_MODE_TEMPERATURE 1
 #define VIEW_MODE_PRESSURE 2
@@ -330,6 +327,8 @@ struct VariantData {{
     vec4 floats2;
     vec4 floats3;
     vec4 floats4;
+    vec4 floats5;
+    vec4 floats6;
 }};
 
 struct FamilyData {{
@@ -360,8 +359,12 @@ uniform ivec2 grid_size;
 uniform float dt;
 uniform int step_index;
 uniform int liquids_only;
+uniform int dense_only;
+uniform int gas_like_only;
 uniform int liquid_brownian_enabled;
 uniform int blocked_impulse_enabled;
+uniform int directional_fallback_enabled;
+uniform float directional_fallback_angle_limit_degrees;
 
 const ivec2 NEIGHBORS_8[8] = ivec2[](
     ivec2(-1, -1),
@@ -389,6 +392,32 @@ int linear_index(ivec2 coord) {{
     return coord.y * grid_size.x + coord.x;
 }}
 
+ivec2 claim_priority_coord(ivec2 coord) {{
+    ivec2 transformed = coord;
+    if ((step_index & 1) != 0) {{
+        transformed.x = grid_size.x - 1 - transformed.x;
+    }}
+    if ((step_index & 2) != 0) {{
+        transformed.y = grid_size.y - 1 - transformed.y;
+    }}
+    return transformed;
+}}
+
+int claim_priority_for_coord(ivec2 coord) {{
+    return linear_index(claim_priority_coord(coord));
+}}
+
+ivec2 coord_from_claim_priority(int priority) {{
+    ivec2 coord = ivec2(priority % grid_size.x, priority / grid_size.x);
+    if ((step_index & 1) != 0) {{
+        coord.x = grid_size.x - 1 - coord.x;
+    }}
+    if ((step_index & 2) != 0) {{
+        coord.y = grid_size.y - 1 - coord.y;
+    }}
+    return coord;
+}}
+
 int family_index_for_variant(int variant_index) {{
     return variant_table[variant_index].ints0.x;
 }}
@@ -401,8 +430,8 @@ int lifetime_mode_for_variant(int variant_index) {{
     return variant_table[variant_index].ints0.z;
 }}
 
-int motion_mode_for_variant(int variant_index) {{
-    return variant_table[variant_index].ints0.w;
+bool downward_blocked_diagonal_fallback_for_variant(int variant_index) {{
+    return variant_table[variant_index].ints0.w != 0;
 }}
 
 bool support_bearing_for_variant(int variant_index) {{
@@ -465,6 +494,46 @@ float reaction_energy_for_variant(int variant_index) {{
     return variant_table[variant_index].floats4.y;
 }}
 
+float liquid_contact_heat_exchange_multiplier_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats4.z;
+}}
+
+float same_variant_heat_exchange_multiplier_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats4.w;
+}}
+
+float mobility_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats5.x;
+}}
+
+float pressure_response_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats5.y;
+}}
+
+float gravity_scale_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats5.z;
+}}
+
+float buoyancy_scale_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats5.w;
+}}
+
+float thermal_motion_scale_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats6.x;
+}}
+
+float wind_coupling_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats6.y;
+}}
+
+float wind_vertical_factor_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats6.z;
+}}
+
+float velocity_decay_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats6.w;
+}}
+
 vec3 render_color_for_variant(int variant_index) {{
     return vec3(
         variant_table[variant_index].floats3.z,
@@ -489,15 +558,13 @@ float clamp_channel(float value) {{
     return clamp(round(value), 0.0, 255.0);
 }}
 
-bool can_move_variant(int variant_index) {{
-    return motion_mode_for_variant(variant_index) != MOTION_MODE_STATIC;
-}}
-
 bool can_move_in_current_pass(int variant_index) {{
-    if (!can_move_variant(variant_index)) {{
-        return false;
-    }}
-    return true;
+    return mobility_for_variant(variant_index) > 0.000001
+        || pressure_response_for_variant(variant_index) > 0.000001
+        || gravity_scale_for_variant(variant_index) > 0.000001
+        || buoyancy_scale_for_variant(variant_index) > 0.000001
+        || thermal_motion_scale_for_variant(variant_index) > 0.000001
+        || wind_coupling_for_variant(variant_index) > 0.000001;
 }}
 
 vec2 normalized_or_default(vec2 value, vec2 fallback_value) {{
@@ -532,8 +599,8 @@ vec2 decayed_blocked_impulse(vec2 blocked) {{
     return clamp(blocked * BLOCKED_DECAY, vec2(-BLOCKED_IMPULSE_MAX), vec2(BLOCKED_IMPULSE_MAX));
 }}
 
-vec2 blocked_intent(vec2 blocked) {{
-    return blocked_impulse_enabled != 0 ? blocked : vec2(0.0);
+vec2 blocked_intent_for_variant(vec2 blocked, int variant_index) {{
+    return blocked_impulse_enabled != 0 ? blocked * mobility_for_variant(variant_index) : vec2(0.0);
 }}
 
 float hash01(ivec2 coord, int salt) {{
@@ -560,6 +627,14 @@ int preferred_side(float desired_x, ivec2 coord, int salt) {{
     }}
     salt = salt;
     return ((coord.x + coord.y + step_index) & 1) == 0 ? -1 : 1;
+}}
+
+float direction_tie_break(ivec2 coord, ivec2 direction, float desired_x) {{
+    return float(direction.x * preferred_side(desired_x, coord, 0)) * DIRECTION_TIE_BREAK_GAIN;
+}}
+
+float directional_fallback_alignment_threshold() {{
+    return cos(radians(clamp(directional_fallback_angle_limit_degrees, 0.0, 180.0)));
 }}
 
 int state_rank(int matter_state) {{
@@ -589,11 +664,7 @@ bool is_gas_state(int matter_state) {{
 }}
 
 bool is_gas_like_variant(int variant_index) {{
-    return variant_index == EMPTY_VARIANT_INDEX || is_gas_state(matter_state_for_variant(variant_index));
-}}
-
-bool is_condensable_gas_variant(int variant_index) {{
-    return variant_index == STEAM_VARIANT_INDEX;
+    return is_gas_state(matter_state_for_variant(variant_index));
 }}
 
 bool is_liquid_variant(int variant_index) {{
@@ -601,56 +672,106 @@ bool is_liquid_variant(int variant_index) {{
 }}
 
 float thermal_conduction_multiplier_between(int current_variant, int neighbor_variant) {{
-    bool current_liquid_neighbor_gas = is_liquid_variant(current_variant) && is_condensable_gas_variant(neighbor_variant);
-    bool neighbor_liquid_current_gas = is_liquid_variant(neighbor_variant) && is_condensable_gas_variant(current_variant);
-    if (current_liquid_neighbor_gas || neighbor_liquid_current_gas) {{
-        return LIQUID_GAS_INTERFACE_CONDUCTION_MULTIPLIER;
+    float multiplier = 1.0;
+    if (matter_state_for_variant(current_variant) == MATTER_STATE_GAS && matter_state_for_variant(neighbor_variant) == MATTER_STATE_LIQUID) {{
+        multiplier = max(multiplier, liquid_contact_heat_exchange_multiplier_for_variant(current_variant));
     }}
-    if (is_condensable_gas_variant(current_variant) && is_condensable_gas_variant(neighbor_variant)) {{
-        return CONDENSABLE_GAS_CLUSTER_CONDUCTION_MULTIPLIER;
+    if (matter_state_for_variant(neighbor_variant) == MATTER_STATE_GAS && matter_state_for_variant(current_variant) == MATTER_STATE_LIQUID) {{
+        multiplier = max(multiplier, liquid_contact_heat_exchange_multiplier_for_variant(neighbor_variant));
     }}
-    return 1.0;
+    if (matter_state_for_variant(current_variant) == MATTER_STATE_GAS && current_variant == neighbor_variant) {{
+        multiplier = max(
+            multiplier,
+            max(
+                same_variant_heat_exchange_multiplier_for_variant(current_variant),
+                same_variant_heat_exchange_multiplier_for_variant(neighbor_variant)
+            )
+        );
+    }}
+    return multiplier;
+}}
+
+vec2 pressure_force_at(ivec2 coord);
+vec2 local_pressure_force_for_variant(int variant_index, ivec2 coord, bool downward_exchange_available);
+
+float ambient_temperature_for_y(int y) {{
+    if (grid_size.y <= 1) {{
+        return base_temperature_for_variant(EMPTY_VARIANT_INDEX);
+    }}
+    float normalized_height = clamp(float(y) / float(grid_size.y - 1), 0.0, 1.0);
+    return base_temperature_for_variant(EMPTY_VARIANT_INDEX)
+        + (normalized_height - 0.5) * AMBIENT_AIR_STRATIFICATION_DELTA;
+}}
+
+float ambient_temperature_at_coord(ivec2 coord) {{
+    return ambient_temperature_for_y(coord.y);
+}}
+
+vec4 empty_cell_misc_for_coord(ivec2 coord) {{
+    return vec4(ambient_temperature_at_coord(coord), 0.0, 1.0, 0.0);
 }}
 
 float ambient_temperature() {{
-    return base_temperature_for_variant(EMPTY_VARIANT_INDEX);
+    return ambient_temperature_for_y(grid_size.y / 2);
 }}
 
 float temperature_kelvin(float temperature) {{
     return max(MIN_THERMAL_KELVIN, temperature + KELVIN_OFFSET);
 }}
 
-float temperature_motion_factor(float temperature, float span) {{
-    return clamp((temperature - ambient_temperature()) / max(span, 0.001), 0.0, 1.0);
+float temperature_motion_factor(float temperature, float ambient_temperature_value, float span) {{
+    return clamp((temperature - ambient_temperature_value) / max(span, 0.001), 0.0, 1.0);
 }}
 
-float effective_density_for_variant_and_temperature(int variant_index, float temperature) {{
-    if (variant_index == EMPTY_VARIANT_INDEX || is_gas_state(matter_state_for_variant(variant_index))) {{
-        return density_for_variant(variant_index) * temperature_kelvin(ambient_temperature()) / temperature_kelvin(temperature);
+float effective_density_for_variant_and_temperature(int variant_index, float temperature, float ambient_temperature_value) {{
+    if (is_gas_state(matter_state_for_variant(variant_index))) {{
+        return density_for_variant(variant_index) * temperature_kelvin(ambient_temperature_value) / temperature_kelvin(temperature);
     }}
     return density_for_variant(variant_index);
 }}
 
-float thermal_random_gain_for_cell(int variant_index, float temperature) {{
-    if (variant_index == EMPTY_VARIANT_INDEX) {{
-        return EMPTY_RANDOM_GAIN * temperature_motion_factor(temperature, GAS_THERMAL_TEMPERATURE_SPAN);
+float density_scaled_wind_coupling_for_variant(int variant_index, float temperature, ivec2 coord) {{
+    float base_coupling = wind_coupling_for_variant(variant_index);
+    if (base_coupling <= 0.0) {{
+        return 0.0;
     }}
+    float ambient_temperature_value = ambient_temperature_at_coord(coord);
+    float current_density = effective_density_for_variant_and_temperature(variant_index, temperature, ambient_temperature_value);
+    float density_ratio = density_for_variant(EMPTY_VARIANT_INDEX) / max(current_density, DENSITY_EPSILON);
+    return base_coupling * min(1.0, density_ratio);
+}}
+
+float thermal_random_gain_for_cell(int variant_index, float temperature, float ambient_temperature_value) {{
     int matter_state = matter_state_for_variant(variant_index);
+    float thermal_motion_scale = thermal_motion_scale_for_variant(variant_index);
+    if (thermal_motion_scale <= 0.0) {{
+        return 0.0;
+    }}
     if (matter_state == MATTER_STATE_GAS) {{
-        float factor = temperature_motion_factor(temperature, GAS_THERMAL_TEMPERATURE_SPAN);
-        return GAS_RANDOM_GAIN * (GAS_RANDOM_FLOOR_FACTOR + (1.0 - GAS_RANDOM_FLOOR_FACTOR) * factor * GAS_RANDOM_HEAT_FACTOR);
+        float factor = temperature_motion_factor(temperature, ambient_temperature_value, GAS_THERMAL_TEMPERATURE_SPAN);
+        float density_ratio = density_for_variant(EMPTY_VARIANT_INDEX) / max(density_for_variant(variant_index), DENSITY_EPSILON);
+        float gain_scale = clamp(density_ratio, 0.85, 1.35);
+        return thermal_motion_scale * GAS_RANDOM_GAIN * gain_scale * (
+            GAS_RANDOM_FLOOR_FACTOR + (1.0 - GAS_RANDOM_FLOOR_FACTOR) * factor * GAS_RANDOM_HEAT_FACTOR
+        );
     }}
     if (matter_state == MATTER_STATE_LIQUID && liquid_brownian_enabled != 0) {{
-        float factor = temperature_motion_factor(temperature, LIQUID_THERMAL_TEMPERATURE_SPAN);
-        return LIQUID_RANDOM_GAIN * (LIQUID_RANDOM_FLOOR_FACTOR + (1.0 - LIQUID_RANDOM_FLOOR_FACTOR) * factor);
+        float factor = temperature_motion_factor(temperature, ambient_temperature_value, LIQUID_THERMAL_TEMPERATURE_SPAN);
+        return thermal_motion_scale * LIQUID_RANDOM_GAIN * (
+            LIQUID_RANDOM_FLOOR_FACTOR + (1.0 - LIQUID_RANDOM_FLOOR_FACTOR) * factor
+        );
     }}
     return 0.0;
 }}
 
-bool empty_can_move(vec4 cell_vec, vec4 cell_misc) {{
-    return abs(cell_misc.x - ambient_temperature()) > EMPTY_MOTION_TEMPERATURE_THRESHOLD
+bool gas_state_can_move(int variant_index, ivec2 coord, vec4 cell_vec, vec4 cell_misc) {{
+    vec2 local_pressure_force = pressure_force_at(coord) * GAS_PRESSURE_FORCE_SCALE;
+    float ambient_density = density_for_variant(EMPTY_VARIANT_INDEX);
+    return abs(cell_misc.x - ambient_temperature_at_coord(coord)) > EMPTY_MOTION_TEMPERATURE_THRESHOLD
+        || abs(density_for_variant(variant_index) - ambient_density) > DENSITY_EPSILON
         || length(cell_vec.xy) > 0.01
-        || length(cell_vec.zw) > 0.01;
+        || length(cell_vec.zw) > 0.01
+        || length(local_pressure_force) > 0.01;
 }}
 
 vec2 pressure_force_at(ivec2 coord) {{
@@ -690,42 +811,6 @@ vec2 local_pressure_force_for_variant(int variant_index, ivec2 coord, bool downw
     return vec2(pressure_force.x * pressure_scale_x, pressure_force.y * pressure_scale_y);
 }}
 
-vec2 apply_forces_to_velocity(
-    int variant_index,
-    ivec2 coord,
-    vec2 velocity,
-    bool downward_exchange_available,
-    vec2 propagated_force,
-    float temperature
-) {{
-    int motion_mode = motion_mode_for_variant(variant_index);
-    vec2 local_pressure_force = local_pressure_force_for_variant(variant_index, coord, downward_exchange_available);
-    velocity += (local_pressure_force + propagated_force) * dt;
-    if (motion_mode == MOTION_MODE_STATIC) {{
-        return velocity;
-    }}
-    if (motion_mode == MOTION_MODE_POWDER) {{
-        velocity.y += GRAVITY_ACCELERATION * dt;
-        return velocity;
-    }}
-    int matter_state = matter_state_for_variant(variant_index);
-    float random_gain = thermal_random_gain_for_cell(variant_index, temperature) * clamp(dt * 60.0, 0.0, 1.0);
-    velocity.x += (hash01(coord, 11) - 0.5) * random_gain;
-    float vertical_factor = (variant_index == EMPTY_VARIANT_INDEX || is_gas_state(matter_state))
-        ? GAS_RANDOM_VERTICAL_FACTOR
-        : LIQUID_RANDOM_VERTICAL_FACTOR;
-    velocity.y += (hash01(coord, 13) - 0.5) * random_gain * vertical_factor;
-    if (variant_index == EMPTY_VARIANT_INDEX || is_gas_state(matter_state)) {{
-        velocity.y += (
-            effective_density_for_variant_and_temperature(variant_index, temperature)
-            - density_for_variant(EMPTY_VARIANT_INDEX)
-        ) * GAS_BUOYANCY_SCALE * dt;
-    }} else {{
-        velocity.y += GRAVITY_ACCELERATION * dt;
-    }}
-    return velocity;
-}}
-
 bool can_swap_with_target(int current_state, float current_density, int target_state, float target_density, float diffusion_roll, int surrounding_count) {{
     diffusion_roll = diffusion_roll;
     surrounding_count = surrounding_count;
@@ -743,31 +828,51 @@ bool can_swap_with_target(int current_state, float current_density, int target_s
 
 vec3 temperature_color(float temperature) {{
     if (temperature <= -40.0) {{
-        return vec3(20.0, 28.0, 70.0);
+        return vec3(18.0, 28.0, 80.0);
     }}
     if (temperature <= 0.0) {{
         float factor = (temperature + 40.0) / 40.0;
-        return mix(vec3(20.0, 28.0, 70.0), vec3(50.0, 120.0, 220.0), factor);
+        return mix(vec3(18.0, 28.0, 80.0), vec3(50.0, 120.0, 220.0), factor);
+    }}
+    if (temperature <= 10.0) {{
+        float factor = temperature / 10.0;
+        return mix(vec3(50.0, 120.0, 220.0), vec3(70.0, 200.0, 255.0), factor);
+    }}
+    if (temperature <= 17.0) {{
+        float factor = (temperature - 10.0) / 7.0;
+        return mix(vec3(70.0, 200.0, 255.0), vec3(92.0, 238.0, 255.0), factor);
     }}
     if (temperature <= 20.0) {{
-        float factor = temperature / 20.0;
-        return mix(vec3(50.0, 120.0, 220.0), vec3(70.0, 180.0, 255.0), factor);
+        float factor = (temperature - 17.0) / 3.0;
+        return mix(vec3(92.0, 238.0, 255.0), vec3(128.0, 245.0, 180.0), factor);
     }}
-    if (temperature <= 100.0) {{
-        float factor = (temperature - 20.0) / 80.0;
-        return mix(vec3(70.0, 180.0, 255.0), vec3(90.0, 220.0, 140.0), factor);
+    if (temperature <= 23.0) {{
+        float factor = (temperature - 20.0) / 3.0;
+        return mix(vec3(128.0, 245.0, 180.0), vec3(215.0, 240.0, 112.0), factor);
+    }}
+    if (temperature <= 30.0) {{
+        float factor = (temperature - 23.0) / 7.0;
+        return mix(vec3(215.0, 240.0, 112.0), vec3(255.0, 220.0, 92.0), factor);
+    }}
+    if (temperature <= 60.0) {{
+        float factor = (temperature - 30.0) / 30.0;
+        return mix(vec3(255.0, 220.0, 92.0), vec3(255.0, 168.0, 72.0), factor);
+    }}
+    if (temperature <= 120.0) {{
+        float factor = (temperature - 60.0) / 60.0;
+        return mix(vec3(255.0, 168.0, 72.0), vec3(255.0, 110.0, 52.0), factor);
     }}
     if (temperature <= 300.0) {{
-        float factor = (temperature - 100.0) / 200.0;
-        return mix(vec3(90.0, 220.0, 140.0), vec3(240.0, 220.0, 80.0), factor);
+        float factor = (temperature - 120.0) / 180.0;
+        return mix(vec3(255.0, 110.0, 52.0), vec3(255.0, 160.0, 70.0), factor);
     }}
     if (temperature <= 800.0) {{
         float factor = (temperature - 300.0) / 500.0;
-        return mix(vec3(240.0, 220.0, 80.0), vec3(255.0, 120.0, 40.0), factor);
+        return mix(vec3(255.0, 160.0, 70.0), vec3(255.0, 220.0, 165.0), factor);
     }}
     if (temperature <= 1400.0) {{
         float factor = (temperature - 800.0) / 600.0;
-        return mix(vec3(255.0, 120.0, 40.0), vec3(255.0, 245.0, 235.0), factor);
+        return mix(vec3(255.0, 220.0, 165.0), vec3(255.0, 245.0, 235.0), factor);
     }}
     return vec3(255.0, 245.0, 235.0);
 }}
@@ -819,10 +924,9 @@ void main() {
         float previous_pressure = imageLoad(pressure_prev_tex, coord).x;
         float cell_temperature = imageLoad(state_misc_src, coord).x;
         float pressure = previous_pressure + (AIR_PRESSURE - previous_pressure) * PRESSURE_RELAXATION;
-        if (variant_index == EMPTY_VARIANT_INDEX) {
-            pressure = previous_pressure + (AIR_PRESSURE - previous_pressure) * PRESSURE_RELAXATION;
-        } else if (matter_state_for_variant(variant_index) == MATTER_STATE_GAS) {
-            pressure = AIR_PRESSURE + effective_density_for_variant_and_temperature(variant_index, cell_temperature);
+        float ambient_temperature_value = ambient_temperature_for_y(y);
+        if (matter_state_for_variant(variant_index) == MATTER_STATE_GAS) {
+            pressure = AIR_PRESSURE + effective_density_for_variant_and_temperature(variant_index, cell_temperature, ambient_temperature_value);
         } else if (matter_state_for_variant(variant_index) == MATTER_STATE_LIQUID) {
             pressure = above_pressure + density_for_variant(variant_index);
         }
@@ -848,11 +952,6 @@ void main() {
     }
 
     int variant_index = imageLoad(state_int_src, coord).x;
-    if (variant_index == EMPTY_VARIANT_INDEX) {
-        imageStore(force_tex, coord, vec4(0.0, 0.0, 0.0, 0.0));
-        return;
-    }
-
     bool downward_exchange_available = false;
     ivec2 below_coord = coord + ivec2(0, 1);
     if (in_bounds(below_coord)) {
@@ -883,7 +982,7 @@ void main() {
     }
 
     int variant_index = imageLoad(state_int_src, coord).x;
-    if (variant_index == EMPTY_VARIANT_INDEX || matter_state_for_variant(variant_index) != MATTER_STATE_LIQUID) {
+    if (matter_state_for_variant(variant_index) != MATTER_STATE_LIQUID) {
         imageStore(next_wave_force_tex, coord, vec4(0.0, 0.0, 0.0, 0.0));
         return;
     }
@@ -1009,14 +1108,65 @@ int liquid_neighbor_count_local(ivec2 coord) {
             continue;
         }
         int neighbor_variant = imageLoad(state_int_src, neighbor_coord).x;
-        if (neighbor_variant == EMPTY_VARIANT_INDEX) {
-            continue;
-        }
         if (matter_state_for_variant(neighbor_variant) == MATTER_STATE_LIQUID) {
             count += 1;
         }
     }
     return count;
+}
+
+bool motion_target_can_exchange(
+    int current_variant,
+    float current_temperature,
+    ivec2 current_coord,
+    int target_variant,
+    float target_temperature,
+    ivec2 target_coord,
+    ivec2 direction
+) {
+    if (
+        matter_state_for_variant(current_variant) == MATTER_STATE_LIQUID
+        && matter_state_for_variant(target_variant) == MATTER_STATE_GAS
+        && direction.y < 0
+    ) {
+        return false;
+    }
+    if (is_gas_like_variant(current_variant) && is_gas_like_variant(target_variant)) {
+        if (current_variant == EMPTY_VARIANT_INDEX && target_variant != EMPTY_VARIANT_INDEX) {
+            return false;
+        }
+        if (direction.y == 0) {
+            return true;
+        }
+        float current_density = effective_density_for_variant_and_temperature(
+            current_variant,
+            current_temperature,
+            ambient_temperature_at_coord(current_coord)
+        );
+        float target_density = effective_density_for_variant_and_temperature(
+            target_variant,
+            target_temperature,
+            ambient_temperature_at_coord(target_coord)
+        );
+        if (direction.y < 0) {
+            return current_density < target_density - DENSITY_EPSILON;
+        }
+        return current_density > target_density + DENSITY_EPSILON;
+    }
+    int current_rank = state_rank(matter_state_for_variant(current_variant));
+    int target_rank = state_rank(matter_state_for_variant(target_variant));
+    if (current_rank != target_rank) {
+        return target_rank < current_rank;
+    }
+    return effective_density_for_variant_and_temperature(
+        target_variant,
+        target_temperature,
+        ambient_temperature_at_coord(target_coord)
+    ) < effective_density_for_variant_and_temperature(
+        current_variant,
+        current_temperature,
+        ambient_temperature_at_coord(current_coord)
+    );
 }
 
 bool downward_exchange_available_local(ivec2 coord, int variant_index) {
@@ -1028,38 +1178,73 @@ bool downward_exchange_available_local(ivec2 coord, int variant_index) {
     return target_is_lighter(variant_index, below_variant);
 }
 
-bool motion_target_can_exchange(int current_variant, float current_temperature, int target_variant, float target_temperature, ivec2 direction) {
-    if (current_variant == EMPTY_VARIANT_INDEX && target_variant != EMPTY_VARIANT_INDEX) {
-        return false;
+vec2 gas_like_motion_vector(ivec2 coord, int variant_index) {
+    if (!is_gas_like_variant(variant_index)) {
+        return vec2(0.0);
     }
-    if (
-        matter_state_for_variant(current_variant) == MATTER_STATE_LIQUID
-        && matter_state_for_variant(target_variant) == MATTER_STATE_GAS
-        && direction.y < 0
-    ) {
-        return false;
-    }
-    if (is_gas_like_variant(current_variant) && is_gas_like_variant(target_variant) && direction.y != 0) {
-        float current_density = effective_density_for_variant_and_temperature(current_variant, current_temperature);
-        float target_density = effective_density_for_variant_and_temperature(target_variant, target_temperature);
-        if (direction.y < 0) {
-            return current_density < target_density - DENSITY_EPSILON;
+    vec4 cell_vec = imageLoad(state_vec_src, coord);
+    return vec2(cell_vec.x, cell_vec.y) + blocked_intent_for_variant(vec2(cell_vec.z, cell_vec.w), variant_index);
+}
+
+vec2 local_wind_velocity(ivec2 coord) {
+    vec2 wind = vec2(0.0);
+    float total_weight = 0.0;
+    for (int index = 0; index < 8; index += 1) {
+        ivec2 direction = NEIGHBORS_8[index];
+        ivec2 neighbor_coord = coord + direction;
+        if (!in_bounds(neighbor_coord)) {
+            continue;
         }
-        return current_density > target_density + DENSITY_EPSILON;
+        int neighbor_variant = imageLoad(state_int_src, neighbor_coord).x;
+        if (!is_gas_like_variant(neighbor_variant)) {
+            continue;
+        }
+        float weight = (direction.x != 0 && direction.y != 0) ? GAS_NEIGHBOR_WIND_DIAGONAL_WEIGHT : 1.0;
+        wind += gas_like_motion_vector(neighbor_coord, neighbor_variant) * weight;
+        total_weight += weight;
     }
-    if (current_variant == EMPTY_VARIANT_INDEX) {
-        return target_variant == EMPTY_VARIANT_INDEX;
+    if (total_weight <= 0.0) {
+        return vec2(0.0);
     }
-    if (target_variant == EMPTY_VARIANT_INDEX) {
-        return true;
+    return wind / total_weight;
+}
+
+vec2 apply_forces_to_velocity(
+    int variant_index,
+    ivec2 coord,
+    vec2 velocity,
+    bool downward_exchange_available,
+    vec2 propagated_force,
+    float temperature
+) {
+    int matter_state = matter_state_for_variant(variant_index);
+    velocity *= mobility_for_variant(variant_index);
+    vec2 local_pressure_force = local_pressure_force_for_variant(variant_index, coord, downward_exchange_available);
+    velocity += (local_pressure_force + propagated_force) * dt * pressure_response_for_variant(variant_index);
+    if (matter_state == MATTER_STATE_SOLID) {
+        vec2 wind_velocity = local_wind_velocity(coord);
+        float wind_coupling = density_scaled_wind_coupling_for_variant(variant_index, temperature, coord);
+        velocity.x += wind_velocity.x * wind_coupling;
+        velocity.y += wind_velocity.y * wind_coupling * wind_vertical_factor_for_variant(variant_index);
+        velocity.y += GRAVITY_ACCELERATION * dt * gravity_scale_for_variant(variant_index);
+        return velocity;
     }
-    int current_rank = state_rank(matter_state_for_variant(current_variant));
-    int target_rank = state_rank(matter_state_for_variant(target_variant));
-    if (current_rank != target_rank) {
-        return target_rank < current_rank;
+    float ambient_temperature_value = ambient_temperature_at_coord(coord);
+    float random_gain = thermal_random_gain_for_cell(variant_index, temperature, ambient_temperature_value) * clamp(dt * 60.0, 0.0, 1.0);
+    velocity.x += (hash01(coord, 11) - 0.5) * random_gain;
+    float vertical_factor = is_gas_state(matter_state)
+        ? GAS_RANDOM_VERTICAL_FACTOR
+        : LIQUID_RANDOM_VERTICAL_FACTOR;
+    velocity.y += (hash01(coord, 13) - 0.5) * random_gain * vertical_factor;
+    if (is_gas_state(matter_state)) {
+        velocity.y += (
+            effective_density_for_variant_and_temperature(variant_index, temperature, ambient_temperature_value)
+            - density_for_variant(EMPTY_VARIANT_INDEX)
+        ) * GAS_BUOYANCY_SCALE * dt * buoyancy_scale_for_variant(variant_index);
+    } else {
+        velocity.y += GRAVITY_ACCELERATION * dt * gravity_scale_for_variant(variant_index);
     }
-    return effective_density_for_variant_and_temperature(target_variant, target_temperature)
-        < effective_density_for_variant_and_temperature(current_variant, current_temperature);
+    return velocity;
 }
 
 int surface_outflow_direction_local(ivec2 coord, int variant_index) {
@@ -1083,13 +1268,10 @@ int surface_outflow_direction_local(ivec2 coord, int variant_index) {
 }
 
 ivec4 find_exchange_plan(ivec2 coord, int variant_index, float current_temperature, vec2 desired) {
-    float best_score = -1000000.0;
-    ivec2 best_direction = ivec2(0, 0);
-    int best_target = -1;
-    int best_swap = 0;
     if (length(desired) <= 0.000001) {
         return ivec4(-1, 0, 0, 0);
     }
+    bool downward_exchange_available = downward_exchange_available_local(coord, variant_index);
     int surface_outflow_direction = surface_outflow_direction_local(coord, variant_index);
     float jitter_gain = DIRECTION_JITTER_GAIN;
     if (length(desired) < 0.05) {
@@ -1097,18 +1279,110 @@ ivec4 find_exchange_plan(ivec2 coord, int variant_index, float current_temperatu
     } else if (matter_state_for_variant(variant_index) == MATTER_STATE_LIQUID && liquid_brownian_enabled == 0) {
         jitter_gain = 0.0;
     }
+
+    if (
+        directional_fallback_enabled != 0
+        && downward_blocked_diagonal_fallback_for_variant(variant_index)
+        && !downward_exchange_available
+        && desired.y > 0.000001
+        && desired.y + DIRECTION_FALLBACK_ALIGNMENT_EPSILON >= abs(desired.x)
+        && directional_fallback_angle_limit_degrees + DIRECTION_FALLBACK_ALIGNMENT_EPSILON >= 45.0
+    ) {
+        float best_score = -1000000.0;
+        ivec2 best_direction = ivec2(0, 0);
+        int best_target = -1;
+        int best_swap = 0;
+        int preferred = preferred_side(desired.x, coord, 0);
+        for (int order_index = 0; order_index < 2; order_index += 1) {
+            int dx = order_index == 0 ? preferred : -preferred;
+            ivec2 direction = ivec2(dx, 1);
+            ivec2 neighbor_coord = coord + direction;
+            if (!in_bounds(neighbor_coord)) {
+                continue;
+            }
+            int target_variant = imageLoad(state_int_src, neighbor_coord).x;
+            float target_temperature = imageLoad(state_misc_src, neighbor_coord).x;
+            if (!motion_target_can_exchange(variant_index, current_temperature, coord, target_variant, target_temperature, neighbor_coord, direction)) {
+                continue;
+            }
+            float score = direction_score(direction, desired)
+                + direction_jitter(coord, direction, jitter_gain)
+                + direction_tie_break(coord, direction, desired.x);
+            if (score > best_score) {
+                best_score = score;
+                best_direction = direction;
+                best_target = linear_index(neighbor_coord);
+                best_swap = (variant_index != EMPTY_VARIANT_INDEX && target_variant == EMPTY_VARIANT_INDEX) ? 0 : 1;
+            }
+        }
+        return best_target >= 0 ? ivec4(best_target, best_direction.x, best_direction.y, best_swap) : ivec4(-1, 0, 0, 0);
+    }
+
+    float preferred_score = -1000000.0;
+    ivec2 preferred_direction = ivec2(0, 0);
+    int found_preferred = 0;
     for (int index = 0; index < 8; index += 1) {
         ivec2 direction = NEIGHBORS_8[index];
         ivec2 neighbor_coord = coord + direction;
         if (!in_bounds(neighbor_coord)) {
             continue;
         }
+        float score = direction_score(direction, desired)
+            + direction_jitter(coord, direction, jitter_gain)
+            + direction_tie_break(coord, direction, desired.x);
+        if (surface_outflow_direction != 0 && direction.x == surface_outflow_direction && direction.y == 0) {
+            score += LIQUID_SURFACE_SIDEFLOW_BONUS;
+        }
+        if (found_preferred == 0 || score > preferred_score) {
+            preferred_score = score;
+            preferred_direction = direction;
+            found_preferred = 1;
+        }
+    }
+
+    if (found_preferred == 0) {
+        return ivec4(-1, 0, 0, 0);
+    }
+
+    if (directional_fallback_enabled == 0) {
+        ivec2 neighbor_coord = coord + preferred_direction;
+        if (!in_bounds(neighbor_coord)) {
+            return ivec4(-1, 0, 0, 0);
+        }
         int target_variant = imageLoad(state_int_src, neighbor_coord).x;
         float target_temperature = imageLoad(state_misc_src, neighbor_coord).x;
-        if (!motion_target_can_exchange(variant_index, current_temperature, target_variant, target_temperature, direction)) {
+        if (!motion_target_can_exchange(variant_index, current_temperature, coord, target_variant, target_temperature, neighbor_coord, preferred_direction)) {
+            return ivec4(-1, 0, 0, 0);
+        }
+        int best_swap = (variant_index != EMPTY_VARIANT_INDEX && target_variant == EMPTY_VARIANT_INDEX) ? 0 : 1;
+        return ivec4(linear_index(neighbor_coord), preferred_direction.x, preferred_direction.y, best_swap);
+    }
+
+    float best_score = -1000000.0;
+    ivec2 best_direction = ivec2(0, 0);
+    int best_target = -1;
+    int best_swap = 0;
+    float fallback_alignment_threshold = directional_fallback_alignment_threshold();
+    for (int index = 0; index < 8; index += 1) {
+        ivec2 direction = NEIGHBORS_8[index];
+        ivec2 neighbor_coord = coord + direction;
+        if (!in_bounds(neighbor_coord)) {
             continue;
         }
-        float score = direction_score(direction, desired) + direction_jitter(coord, direction, jitter_gain);
+        if (
+            (direction.x != preferred_direction.x || direction.y != preferred_direction.y)
+            && direction_score(direction, desired) < fallback_alignment_threshold - DIRECTION_FALLBACK_ALIGNMENT_EPSILON
+        ) {
+            continue;
+        }
+        int target_variant = imageLoad(state_int_src, neighbor_coord).x;
+        float target_temperature = imageLoad(state_misc_src, neighbor_coord).x;
+        if (!motion_target_can_exchange(variant_index, current_temperature, coord, target_variant, target_temperature, neighbor_coord, direction)) {
+            continue;
+        }
+        float score = direction_score(direction, desired)
+            + direction_jitter(coord, direction, jitter_gain)
+            + direction_tie_break(coord, direction, desired.x);
         if (surface_outflow_direction != 0 && direction.x == surface_outflow_direction && direction.y == 0) {
             score += LIQUID_SURFACE_SIDEFLOW_BONUS;
         }
@@ -1132,12 +1406,21 @@ void main() {
     vec4 cell_vec = imageLoad(state_vec_src, coord);
     vec4 cell_misc = imageLoad(state_misc_src, coord);
     int variant_index = cell_int.x;
+    bool gas_like_current = is_gas_like_variant(variant_index);
 
     if (!can_move_in_current_pass(variant_index)) {
         imageStore(motion_plan_tex, coord, ivec4(-1, 0, 0, 0));
         return;
     }
-    if (variant_index == EMPTY_VARIANT_INDEX && !empty_can_move(cell_vec, cell_misc)) {
+    if (dense_only != 0 && gas_like_current) {
+        imageStore(motion_plan_tex, coord, ivec4(-1, 0, 0, 0));
+        return;
+    }
+    if (gas_like_only != 0 && !gas_like_current) {
+        imageStore(motion_plan_tex, coord, ivec4(-1, 0, 0, 0));
+        return;
+    }
+    if (matter_state_for_variant(variant_index) == MATTER_STATE_GAS && !gas_state_can_move(variant_index, coord, cell_vec, cell_misc)) {
         imageStore(motion_plan_tex, coord, ivec4(-1, 0, 0, 0));
         return;
     }
@@ -1152,7 +1435,6 @@ void main() {
             return;
         }
     }
-
     bool downward_exchange_available = downward_exchange_available_local(coord, variant_index);
     vec2 propagated_force = imageLoad(force_wave_tex, coord).xy;
     vec2 base_velocity = apply_forces_to_velocity(
@@ -1163,7 +1445,7 @@ void main() {
         propagated_force,
         cell_misc.x
     );
-    vec2 desired = base_velocity + blocked_intent(vec2(cell_vec.z, cell_vec.w));
+    vec2 desired = base_velocity + blocked_intent_for_variant(vec2(cell_vec.z, cell_vec.w), variant_index);
     ivec4 plan = find_exchange_plan(coord, variant_index, cell_misc.x, desired);
     imageStore(motion_plan_tex, coord, plan);
 }
@@ -1206,7 +1488,7 @@ void main() {
     }
 
     ivec2 target_coord = ivec2(plan.x % grid_size.x, plan.x / grid_size.x);
-    imageAtomicMin(motion_claim_tex, target_coord, linear_index(coord));
+    imageAtomicMin(motion_claim_tex, target_coord, claim_priority_for_coord(coord));
 }
 """
 
@@ -1225,24 +1507,6 @@ layout(rgba32i, binding = 9) uniform readonly iimage2D motion_plan_tex;
 layout(r32i, binding = 10) uniform readonly iimage2D motion_claim_tex;
 layout(rg32f, binding = 15) uniform readonly image2D force_wave_tex;
 
-int liquid_neighbor_count_local(ivec2 coord) {
-    int count = 0;
-    for (int index = 0; index < 8; index += 1) {
-        ivec2 neighbor_coord = coord + NEIGHBORS_8[index];
-        if (!in_bounds(neighbor_coord)) {
-            continue;
-        }
-        int neighbor_variant = imageLoad(state_int_src, neighbor_coord).x;
-        if (neighbor_variant == EMPTY_VARIANT_INDEX) {
-            continue;
-        }
-        if (matter_state_for_variant(neighbor_variant) == MATTER_STATE_LIQUID) {
-            count += 1;
-        }
-    }
-    return count;
-}
-
 bool downward_exchange_available_local(ivec2 coord, int variant_index) {
     ivec2 below_coord = coord + ivec2(0, 1);
     if (!in_bounds(below_coord)) {
@@ -1252,12 +1516,96 @@ bool downward_exchange_available_local(ivec2 coord, int variant_index) {
     return target_is_lighter(variant_index, below_variant);
 }
 
+vec2 gas_like_motion_vector(ivec2 coord, int variant_index) {
+    if (!is_gas_like_variant(variant_index)) {
+        return vec2(0.0);
+    }
+    vec4 cell_vec = imageLoad(state_vec_src, coord);
+    return vec2(cell_vec.x, cell_vec.y) + blocked_intent_for_variant(vec2(cell_vec.z, cell_vec.w), variant_index);
+}
+
+vec2 local_wind_velocity(ivec2 coord) {
+    vec2 wind = vec2(0.0);
+    float total_weight = 0.0;
+    for (int index = 0; index < 8; index += 1) {
+        ivec2 direction = NEIGHBORS_8[index];
+        ivec2 neighbor_coord = coord + direction;
+        if (!in_bounds(neighbor_coord)) {
+            continue;
+        }
+        int neighbor_variant = imageLoad(state_int_src, neighbor_coord).x;
+        if (!is_gas_like_variant(neighbor_variant)) {
+            continue;
+        }
+        float weight = (direction.x != 0 && direction.y != 0) ? GAS_NEIGHBOR_WIND_DIAGONAL_WEIGHT : 1.0;
+        wind += gas_like_motion_vector(neighbor_coord, neighbor_variant) * weight;
+        total_weight += weight;
+    }
+    if (total_weight <= 0.0) {
+        return vec2(0.0);
+    }
+    return wind / total_weight;
+}
+
+vec2 apply_forces_to_velocity(
+    int variant_index,
+    ivec2 coord,
+    vec2 velocity,
+    bool downward_exchange_available,
+    vec2 propagated_force,
+    float temperature
+) {
+    int matter_state = matter_state_for_variant(variant_index);
+    velocity *= mobility_for_variant(variant_index);
+    vec2 local_pressure_force = local_pressure_force_for_variant(variant_index, coord, downward_exchange_available);
+    velocity += (local_pressure_force + propagated_force) * dt * pressure_response_for_variant(variant_index);
+    if (matter_state == MATTER_STATE_SOLID) {
+        vec2 wind_velocity = local_wind_velocity(coord);
+        float wind_coupling = density_scaled_wind_coupling_for_variant(variant_index, temperature, coord);
+        velocity.x += wind_velocity.x * wind_coupling;
+        velocity.y += wind_velocity.y * wind_coupling * wind_vertical_factor_for_variant(variant_index);
+        velocity.y += GRAVITY_ACCELERATION * dt * gravity_scale_for_variant(variant_index);
+        return velocity;
+    }
+    float ambient_temperature_value = ambient_temperature_at_coord(coord);
+    float random_gain = thermal_random_gain_for_cell(variant_index, temperature, ambient_temperature_value) * clamp(dt * 60.0, 0.0, 1.0);
+    velocity.x += (hash01(coord, 11) - 0.5) * random_gain;
+    float vertical_factor = is_gas_state(matter_state)
+        ? GAS_RANDOM_VERTICAL_FACTOR
+        : LIQUID_RANDOM_VERTICAL_FACTOR;
+    velocity.y += (hash01(coord, 13) - 0.5) * random_gain * vertical_factor;
+    if (is_gas_state(matter_state)) {
+        velocity.y += (
+            effective_density_for_variant_and_temperature(variant_index, temperature, ambient_temperature_value)
+            - density_for_variant(EMPTY_VARIANT_INDEX)
+        ) * GAS_BUOYANCY_SCALE * dt * buoyancy_scale_for_variant(variant_index);
+    } else {
+        velocity.y += GRAVITY_ACCELERATION * dt * gravity_scale_for_variant(variant_index);
+    }
+    return velocity;
+}
+
+int liquid_neighbor_count_local(ivec2 coord) {
+    int count = 0;
+    for (int index = 0; index < 8; index += 1) {
+        ivec2 neighbor_coord = coord + NEIGHBORS_8[index];
+        if (!in_bounds(neighbor_coord)) {
+            continue;
+        }
+        int neighbor_variant = imageLoad(state_int_src, neighbor_coord).x;
+        if (matter_state_for_variant(neighbor_variant) == MATTER_STATE_LIQUID) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
 bool source_displaced_by_swap_local(ivec2 source_coord) {
-    int incoming_winner = imageLoad(motion_claim_tex, source_coord).x;
-    if (incoming_winner == INT_MAX_VALUE) {
+    int incoming_priority = imageLoad(motion_claim_tex, source_coord).x;
+    if (incoming_priority == INT_MAX_VALUE) {
         return false;
     }
-    ivec2 incoming_coord = ivec2(incoming_winner % grid_size.x, incoming_winner / grid_size.x);
+    ivec2 incoming_coord = coord_from_claim_priority(incoming_priority);
     ivec4 incoming_plan = imageLoad(motion_plan_tex, incoming_coord);
     return incoming_plan.x == linear_index(source_coord) && incoming_plan.w != 0;
 }
@@ -1268,9 +1616,9 @@ void main() {
         return;
     }
 
-    int winner_index = imageLoad(motion_claim_tex, coord).x;
-    if (winner_index != INT_MAX_VALUE) {
-        ivec2 source_coord = ivec2(winner_index % grid_size.x, winner_index / grid_size.x);
+    int winner_priority = imageLoad(motion_claim_tex, coord).x;
+    if (winner_priority != INT_MAX_VALUE) {
+        ivec2 source_coord = coord_from_claim_priority(winner_priority);
         if (!source_displaced_by_swap_local(source_coord)) {
             ivec4 source_int = imageLoad(state_int_src, source_coord);
             vec4 source_vec = imageLoad(state_vec_src, source_coord);
@@ -1287,11 +1635,11 @@ void main() {
                 propagated_force,
                 source_misc.x
             );
-            vec2 desired = base_velocity + blocked_intent(vec2(source_vec.z, source_vec.w));
+            vec2 desired = base_velocity + blocked_intent_for_variant(vec2(source_vec.z, source_vec.w), variant_index);
             vec4 out_vec = vec4(0.0);
             vec4 out_misc = source_misc;
-            out_vec.x = base_velocity.x * 0.92;
-            out_vec.y = base_velocity.y * 0.92;
+            out_vec.x = base_velocity.x * velocity_decay_for_variant(variant_index);
+            out_vec.y = base_velocity.y * velocity_decay_for_variant(variant_index);
             if (blocked_impulse_enabled != 0) {
                 out_vec.zw = decayed_blocked_impulse(vec2(
                     axis_remaining_after_step(desired.x, float(plan.y)),
@@ -1312,7 +1660,7 @@ void main() {
     bool moved_away = false;
     if (plan.x >= 0) {
         ivec2 target_coord = ivec2(plan.x % grid_size.x, plan.x / grid_size.x);
-        moved_away = imageLoad(motion_claim_tex, target_coord).x == linear_index(coord);
+        moved_away = imageLoad(motion_claim_tex, target_coord).x == claim_priority_for_coord(coord);
     }
 
     if (moved_away) {
@@ -1321,48 +1669,27 @@ void main() {
             ivec4 displaced_int = imageLoad(state_int_src, target_coord);
             vec4 displaced_vec = imageLoad(state_vec_src, target_coord);
             vec4 displaced_misc = imageLoad(state_misc_src, target_coord);
-            if (motion_mode_for_variant(displaced_int.x) == MOTION_MODE_STATIC) {
-                bool displaced_downward_exchange = downward_exchange_available_local(target_coord, displaced_int.x);
-                vec2 displaced_propagated_force = imageLoad(force_wave_tex, target_coord).xy;
-                vec2 displaced_base_velocity = apply_forces_to_velocity(
-                    displaced_int.x,
-                    target_coord,
-                    vec2(displaced_vec.x, displaced_vec.y),
-                    displaced_downward_exchange,
-                    displaced_propagated_force,
-                    displaced_misc.x
-                );
-                displaced_vec.x = displaced_base_velocity.x * STATIC_VELOCITY_DECAY;
-                displaced_vec.y = displaced_base_velocity.y * STATIC_VELOCITY_DECAY;
-                if (blocked_impulse_enabled != 0) {
-                    displaced_vec.zw = decayed_blocked_impulse(displaced_vec.zw);
-                } else {
-                    displaced_vec.z = 0.0;
-                    displaced_vec.w = 0.0;
-                }
+            bool displaced_downward_exchange = downward_exchange_available_local(target_coord, displaced_int.x);
+            vec2 displaced_propagated_force = imageLoad(force_wave_tex, target_coord).xy;
+            vec2 displaced_base_velocity = apply_forces_to_velocity(
+                displaced_int.x,
+                target_coord,
+                vec2(displaced_vec.x, displaced_vec.y),
+                displaced_downward_exchange,
+                displaced_propagated_force,
+                displaced_misc.x
+            );
+            vec2 displaced_desired = displaced_base_velocity + blocked_intent_for_variant(vec2(displaced_vec.z, displaced_vec.w), displaced_int.x);
+            displaced_vec.x = displaced_base_velocity.x * velocity_decay_for_variant(displaced_int.x);
+            displaced_vec.y = displaced_base_velocity.y * velocity_decay_for_variant(displaced_int.x);
+            if (blocked_impulse_enabled != 0) {
+                displaced_vec.zw = decayed_blocked_impulse(vec2(
+                    axis_remaining_after_step(displaced_desired.x, float(-plan.y)),
+                    axis_remaining_after_step(displaced_desired.y, float(-plan.z))
+                ));
             } else {
-                bool displaced_downward_exchange = downward_exchange_available_local(target_coord, displaced_int.x);
-                vec2 displaced_propagated_force = imageLoad(force_wave_tex, target_coord).xy;
-                vec2 displaced_base_velocity = apply_forces_to_velocity(
-                    displaced_int.x,
-                    target_coord,
-                    vec2(displaced_vec.x, displaced_vec.y),
-                    displaced_downward_exchange,
-                    displaced_propagated_force,
-                    displaced_misc.x
-                );
-                vec2 displaced_desired = displaced_base_velocity + blocked_intent(vec2(displaced_vec.z, displaced_vec.w));
-                displaced_vec.x = displaced_base_velocity.x * VELOCITY_DECAY;
-                displaced_vec.y = displaced_base_velocity.y * VELOCITY_DECAY;
-                if (blocked_impulse_enabled != 0) {
-                    displaced_vec.zw = decayed_blocked_impulse(vec2(
-                        axis_remaining_after_step(displaced_desired.x, float(-plan.y)),
-                        axis_remaining_after_step(displaced_desired.y, float(-plan.z))
-                    ));
-                } else {
-                    displaced_vec.z = 0.0;
-                    displaced_vec.w = 0.0;
-                }
+                displaced_vec.z = 0.0;
+                displaced_vec.w = 0.0;
             }
             imageStore(state_int_dst, coord, displaced_int);
             imageStore(state_vec_dst, coord, displaced_vec);
@@ -1370,7 +1697,7 @@ void main() {
         } else {
             ivec2 target_coord = ivec2(plan.x % grid_size.x, plan.x / grid_size.x);
             vec4 target_misc = imageLoad(state_misc_src, target_coord);
-            vec4 empty_misc = empty_cell_misc();
+            vec4 empty_misc = empty_cell_misc_for_coord(coord);
             empty_misc.x = max(cell_misc.x, target_misc.x);
             imageStore(state_int_dst, coord, empty_cell_int());
             imageStore(state_vec_dst, coord, empty_cell_vec());
@@ -1397,7 +1724,7 @@ void main() {
         }
     }
 
-    if (!can_move_variant(variant_index)) {
+    if (!can_move_in_current_pass(variant_index)) {
         bool downward_exchange_available = downward_exchange_available_local(coord, variant_index);
         vec2 propagated_force = imageLoad(force_wave_tex, coord).xy;
         vec2 base_velocity = apply_forces_to_velocity(
@@ -1408,8 +1735,8 @@ void main() {
             propagated_force,
             cell_misc.x
         );
-        out_vec.x = base_velocity.x * STATIC_VELOCITY_DECAY;
-        out_vec.y = base_velocity.y * STATIC_VELOCITY_DECAY;
+        out_vec.x = base_velocity.x * velocity_decay_for_variant(variant_index);
+        out_vec.y = base_velocity.y * velocity_decay_for_variant(variant_index);
         if (blocked_impulse_enabled != 0) {
             out_vec.zw = decayed_blocked_impulse(cell_vec.zw);
         }
@@ -1429,9 +1756,9 @@ void main() {
         propagated_force,
         cell_misc.x
     );
-    vec2 desired = base_velocity + blocked_intent(vec2(cell_vec.z, cell_vec.w));
-    out_vec.x = base_velocity.x * 0.92;
-    out_vec.y = base_velocity.y * 0.92;
+    vec2 desired = base_velocity + blocked_intent_for_variant(vec2(cell_vec.z, cell_vec.w), variant_index);
+    out_vec.x = base_velocity.x * velocity_decay_for_variant(variant_index);
+    out_vec.y = base_velocity.y * velocity_decay_for_variant(variant_index);
     if (blocked_impulse_enabled != 0) {
         out_vec.zw = decayed_blocked_impulse(desired);
     }
@@ -1482,6 +1809,10 @@ void main() {
 
     vec4 out_misc = cell_misc;
     out_misc.x = next_temperature;
+    if (variant_index == EMPTY_VARIANT_INDEX) {
+        float ambient_temperature_value = ambient_temperature_at_coord(coord);
+        out_misc.x += (ambient_temperature_value - out_misc.x) * AMBIENT_AIR_RESTORE_RATE * dt;
+    }
     imageStore(state_int_dst, coord, cell_int);
     imageStore(state_vec_dst, coord, cell_vec);
     imageStore(state_misc_dst, coord, out_misc);
@@ -1648,7 +1979,7 @@ void main() {
         out_misc.w = cell_misc.w + dt;
         float max_age = family_table[family_index].floats0.x;
         if (out_misc.w >= max_age) {
-            vec4 empty_misc = empty_cell_misc();
+            vec4 empty_misc = empty_cell_misc_for_coord(coord);
             empty_misc.x = out_misc.x;
             imageStore(state_int_dst, coord, empty_cell_int());
             imageStore(state_vec_dst, coord, empty_cell_vec());
@@ -1695,7 +2026,7 @@ void main() {
         out_misc.z = max(0.0, out_misc.z - gathered_corrosion);
     }
     if (caused_corrosion && !reaction_preserves_self_for_variant(variant_index)) {
-        vec4 empty_misc = empty_cell_misc();
+        vec4 empty_misc = empty_cell_misc_for_coord(coord);
         empty_misc.x = out_misc.x;
         imageStore(state_int_dst, coord, empty_cell_int());
         imageStore(state_vec_dst, coord, empty_cell_vec());
@@ -1760,7 +2091,7 @@ void main() {
     if (family.ints0.y < 0) {
         imageStore(state_int_dst, coord, empty_cell_int());
         imageStore(state_vec_dst, coord, empty_cell_vec());
-        imageStore(state_misc_dst, coord, empty_cell_misc());
+        imageStore(state_misc_dst, coord, empty_cell_misc_for_coord(coord));
         return;
     }
 
@@ -1876,7 +2207,7 @@ void main() {
     if (erase_mode != 0) {
         imageStore(state_int_image, coord, empty_cell_int());
         imageStore(state_vec_image, coord, empty_cell_vec());
-        imageStore(state_misc_image, coord, empty_cell_misc());
+        imageStore(state_misc_image, coord, empty_cell_misc_for_coord(coord));
         return;
     }
 
@@ -1904,6 +2235,8 @@ class GpuSimulator:
         self.step_index = grid.step_id
         self.liquid_brownian_enabled = bool(grid.liquid_brownian_enabled)
         self.blocked_impulse_enabled = bool(grid.blocked_impulse_enabled)
+        self.directional_fallback_enabled = bool(grid.directional_fallback_enabled)
+        self.directional_fallback_angle_limit_degrees = float(grid.directional_fallback_angle_limit_degrees)
 
         self.variant_buffer = self.ctx.buffer(self.tables.variant_buffer_data)
         self.family_buffer = self.ctx.buffer(self.tables.family_buffer_data)
@@ -1975,8 +2308,13 @@ class GpuSimulator:
         for program in programs:
             _set_uniform_if_present(program, "grid_size", (self.width, self.height))
             _set_uniform_if_present(program, "step_index", self.step_index)
+            _set_uniform_if_present(program, "liquids_only", 0)
+            _set_uniform_if_present(program, "dense_only", 0)
+            _set_uniform_if_present(program, "gas_like_only", 0)
             _set_uniform_if_present(program, "liquid_brownian_enabled", int(self.liquid_brownian_enabled))
             _set_uniform_if_present(program, "blocked_impulse_enabled", int(self.blocked_impulse_enabled))
+            _set_uniform_if_present(program, "directional_fallback_enabled", int(self.directional_fallback_enabled))
+            _set_uniform_if_present(program, "directional_fallback_angle_limit_degrees", self.directional_fallback_angle_limit_degrees)
 
     def set_liquid_brownian_enabled(self, enabled: bool) -> None:
         self.liquid_brownian_enabled = bool(enabled)
@@ -2000,6 +2338,46 @@ class GpuSimulator:
 
     def set_blocked_impulse_enabled(self, enabled: bool) -> None:
         self.blocked_impulse_enabled = bool(enabled)
+        self._set_common_uniforms(
+            self.pressure_shader,
+            self.source_force_shader,
+            self.force_wave_shader,
+            self.support_shader,
+            self.motion_plan_shader,
+            self.clear_r32i_shader,
+            self.motion_claim_shader,
+            self.motion_resolve_shader,
+            self.thermal_shader,
+            self.phase_shader,
+            self.reaction_plan_shader,
+            self.reaction_resolve_shader,
+            self.collapse_shader,
+            self.render_shader,
+            self.paint_shader,
+        )
+
+    def set_directional_fallback_enabled(self, enabled: bool) -> None:
+        self.directional_fallback_enabled = bool(enabled)
+        self._set_common_uniforms(
+            self.pressure_shader,
+            self.source_force_shader,
+            self.force_wave_shader,
+            self.support_shader,
+            self.motion_plan_shader,
+            self.clear_r32i_shader,
+            self.motion_claim_shader,
+            self.motion_resolve_shader,
+            self.thermal_shader,
+            self.phase_shader,
+            self.reaction_plan_shader,
+            self.reaction_resolve_shader,
+            self.collapse_shader,
+            self.render_shader,
+            self.paint_shader,
+        )
+
+    def set_directional_fallback_angle_limit_degrees(self, angle_limit_degrees: float) -> None:
+        self.directional_fallback_angle_limit_degrees = float(angle_limit_degrees)
         self._set_common_uniforms(
             self.pressure_shader,
             self.source_force_shader,
@@ -2089,7 +2467,15 @@ class GpuSimulator:
         self.ctx.memory_barrier()
         return current_index
 
-    def _run_motion(self, dt: float, *, step_seed: int | None = None, liquids_only: bool = False) -> None:
+    def _run_motion(
+        self,
+        dt: float,
+        *,
+        step_seed: int | None = None,
+        liquids_only: bool = False,
+        dense_only: bool = False,
+        gas_like_only: bool = False,
+    ) -> None:
         self.state_int[self.front_index].bind_to_image(3, read=True, write=False)
         self.state_vec[self.front_index].bind_to_image(4, read=True, write=False)
         self.state_misc[self.front_index].bind_to_image(5, read=True, write=False)
@@ -2099,6 +2485,8 @@ class GpuSimulator:
         _set_uniform_if_present(self.motion_plan_shader, "dt", dt)
         _set_uniform_if_present(self.motion_plan_shader, "step_index", self.step_index if step_seed is None else step_seed)
         _set_uniform_if_present(self.motion_plan_shader, "liquids_only", int(liquids_only))
+        _set_uniform_if_present(self.motion_plan_shader, "dense_only", int(dense_only))
+        _set_uniform_if_present(self.motion_plan_shader, "gas_like_only", int(gas_like_only))
         self.motion_plan_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
         self.ctx.memory_barrier()
 
@@ -2109,6 +2497,8 @@ class GpuSimulator:
         _set_uniform_if_present(self.motion_claim_shader, "dt", dt)
         _set_uniform_if_present(self.motion_claim_shader, "step_index", self.step_index if step_seed is None else step_seed)
         _set_uniform_if_present(self.motion_claim_shader, "liquids_only", int(liquids_only))
+        _set_uniform_if_present(self.motion_claim_shader, "dense_only", int(dense_only))
+        _set_uniform_if_present(self.motion_claim_shader, "gas_like_only", int(gas_like_only))
         self.motion_claim_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
         self.ctx.memory_barrier()
 
@@ -2120,6 +2510,8 @@ class GpuSimulator:
         _set_uniform_if_present(self.motion_resolve_shader, "dt", dt)
         _set_uniform_if_present(self.motion_resolve_shader, "step_index", self.step_index if step_seed is None else step_seed)
         _set_uniform_if_present(self.motion_resolve_shader, "liquids_only", int(liquids_only))
+        _set_uniform_if_present(self.motion_resolve_shader, "dense_only", int(dense_only))
+        _set_uniform_if_present(self.motion_resolve_shader, "gas_like_only", int(gas_like_only))
         self.motion_resolve_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
         self.ctx.memory_barrier()
         self.front_index = 1 - self.front_index
@@ -2148,6 +2540,8 @@ class GpuSimulator:
             raise ValueError("Grid dimensions do not match the GPU simulator.")
         self.set_liquid_brownian_enabled(grid.liquid_brownian_enabled)
         self.set_blocked_impulse_enabled(grid.blocked_impulse_enabled)
+        self.set_directional_fallback_enabled(grid.directional_fallback_enabled)
+        self.set_directional_fallback_angle_limit_degrees(grid.directional_fallback_angle_limit_degrees)
         state_int_data, state_vec_data, state_misc_data = pack_grid_state(grid, self.tables)
         for texture in self.state_int:
             texture.write(state_int_data)
@@ -2177,7 +2571,8 @@ class GpuSimulator:
         self._run_pressure(step_seed=self.step_index)
         self._run_source_force(step_seed=self.step_index)
         next_wave_index = self._run_force_wave(step_seed=self.step_index)
-        self._run_motion(dt, step_seed=self.step_index, liquids_only=False)
+        self._run_motion(dt, step_seed=self.step_index, dense_only=True)
+        self._run_motion(dt, step_seed=self.step_index + 4096, gas_like_only=True)
         self.wave_force_front_index = next_wave_index
         if LIQUID_RELAXATION_PASSES > 0:
             relaxation_dt = dt / LIQUID_RELAXATION_PASSES
@@ -2256,4 +2651,8 @@ class GpuSimulator:
             self.state_misc[self.front_index].read(),
         )
         grid.step_id = self.step_index
+        grid.liquid_brownian_enabled = self.liquid_brownian_enabled
+        grid.blocked_impulse_enabled = self.blocked_impulse_enabled
+        grid.directional_fallback_enabled = self.directional_fallback_enabled
+        grid.directional_fallback_angle_limit_degrees = self.directional_fallback_angle_limit_degrees
         return grid

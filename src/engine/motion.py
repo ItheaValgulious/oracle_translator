@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from math import copysign, hypot, sqrt
+from math import copysign, cos, hypot, radians, sqrt
 
+from .atmosphere import ambient_air_temperature_for_row
 from .grid import Grid
-from .types import MaterialRegistry, MatterState, MotionMode
+from .types import MaterialRegistry, MatterState
 
 
 AIR_PRESSURE = 1.0
@@ -22,16 +23,15 @@ LIQUID_VERTICAL_PRESSURE_SCALE = 0.8
 GAS_PRESSURE_FORCE_SCALE = 0.65
 GRAVITY_ACCELERATION = 1.2
 GAS_BUOYANCY_SCALE = 10.0
-VELOCITY_DECAY = 0.92
-STATIC_VELOCITY_DECAY = 0.96
 INTENT_DECAY = 0.72
 BLOCKED_IMPULSE_MAX = 1.25
 LIQUID_RANDOM_GAIN = 0.012
 LIQUID_RANDOM_VERTICAL_FACTOR = 0.18
-EMPTY_RANDOM_GAIN = 0.52
 GAS_RANDOM_GAIN = 0.42
 GAS_RANDOM_VERTICAL_FACTOR = 0.85
 DIRECTION_JITTER_GAIN = 0.06
+DIRECTION_TIE_BREAK_GAIN = 1e-4
+DIRECTION_FALLBACK_ALIGNMENT_EPSILON = 1e-6
 KELVIN_OFFSET = 273.15
 MIN_THERMAL_KELVIN = 80.0
 EMPTY_MOTION_TEMPERATURE_THRESHOLD = 0.5
@@ -41,6 +41,7 @@ GAS_RANDOM_FLOOR_FACTOR = 0.35
 GAS_RANDOM_HEAT_FACTOR = 1.25
 LIQUID_RANDOM_FLOOR_FACTOR = 0.15
 DENSITY_EPSILON = 1e-6
+GAS_NEIGHBOR_WIND_DIAGONAL_WEIGHT = 0.7
 
 
 def _normalize(x: float, y: float) -> tuple[float, float]:
@@ -75,8 +76,23 @@ def _state_rank(state: MatterState) -> int:
     return 1
 
 
-def _ambient_air_temperature(registry: MaterialRegistry) -> float:
-    return registry.variant("empty", "empty").base_temperature
+def _variant_can_translate(variant) -> bool:
+    return (
+        variant.mobility > 1e-9
+        or variant.pressure_response > 1e-9
+        or variant.gravity_scale > 1e-9
+        or variant.buoyancy_scale > 1e-9
+        or variant.thermal_motion_scale > 1e-9
+        or variant.wind_coupling > 1e-9
+    )
+
+
+def _ambient_air_temperature(grid: Grid, registry: MaterialRegistry, y: int) -> float:
+    return ambient_air_temperature_for_row(
+        grid.height,
+        y,
+        registry.variant("empty", "empty").base_temperature,
+    )
 
 
 def _temperature_kelvin(temperature: float) -> float:
@@ -87,35 +103,38 @@ def _temperature_motion_factor(temperature: float, ambient_temperature: float, *
     return min(1.0, max(0.0, temperature - ambient_temperature) / max(span, 0.001))
 
 
-def _effective_density(cell, variant, registry: MaterialRegistry) -> float:
-    if cell.is_empty or variant.matter_state == MatterState.GAS:
-        ambient_kelvin = _temperature_kelvin(_ambient_air_temperature(registry))
+def _effective_density(cell, variant, *, ambient_temperature: float) -> float:
+    if variant.matter_state == MatterState.GAS:
+        ambient_kelvin = _temperature_kelvin(ambient_temperature)
         return variant.density * ambient_kelvin / _temperature_kelvin(cell.temperature)
     return variant.density
 
 
-def _thermal_random_gain(grid: Grid, registry: MaterialRegistry, cell, variant) -> float:
-    ambient_temperature = _ambient_air_temperature(registry)
-    if cell.is_empty:
-        return EMPTY_RANDOM_GAIN * _temperature_motion_factor(
-            cell.temperature,
-            ambient_temperature,
-            span=GAS_THERMAL_TEMPERATURE_SPAN,
-        )
+def _thermal_random_gain(grid: Grid, registry: MaterialRegistry, y: int, cell, variant) -> float:
+    if variant.thermal_motion_scale <= 0.0:
+        return 0.0
+    ambient_temperature = _ambient_air_temperature(grid, registry, y)
     if variant.matter_state == MatterState.GAS:
         factor = _temperature_motion_factor(
             cell.temperature,
             ambient_temperature,
             span=GAS_THERMAL_TEMPERATURE_SPAN,
         )
-        return GAS_RANDOM_GAIN * (GAS_RANDOM_FLOOR_FACTOR + (1.0 - GAS_RANDOM_FLOOR_FACTOR) * factor * GAS_RANDOM_HEAT_FACTOR)
+        ambient_density = registry.variant("empty", "empty").density
+        density_ratio = ambient_density / max(variant.density, DENSITY_EPSILON)
+        gain_scale = min(1.35, max(0.85, density_ratio))
+        return variant.thermal_motion_scale * GAS_RANDOM_GAIN * gain_scale * (
+            GAS_RANDOM_FLOOR_FACTOR + (1.0 - GAS_RANDOM_FLOOR_FACTOR) * factor * GAS_RANDOM_HEAT_FACTOR
+        )
     if variant.matter_state == MatterState.LIQUID and grid.liquid_brownian_enabled:
         factor = _temperature_motion_factor(
             cell.temperature,
             ambient_temperature,
             span=LIQUID_THERMAL_TEMPERATURE_SPAN,
         )
-        return LIQUID_RANDOM_GAIN * (LIQUID_RANDOM_FLOOR_FACTOR + (1.0 - LIQUID_RANDOM_FLOOR_FACTOR) * factor)
+        return variant.thermal_motion_scale * LIQUID_RANDOM_GAIN * (
+            LIQUID_RANDOM_FLOOR_FACTOR + (1.0 - LIQUID_RANDOM_FLOOR_FACTOR) * factor
+        )
     return 0.0
 
 
@@ -123,24 +142,64 @@ def _random_step_factor(dt: float) -> float:
     return min(1.0, max(0.0, dt * 60.0))
 
 
-def _thermal_buoyancy(registry: MaterialRegistry, cell, variant) -> float:
-    if not (cell.is_empty or variant.matter_state == MatterState.GAS):
+def _thermal_buoyancy(grid: Grid, registry: MaterialRegistry, y: int, cell, variant) -> float:
+    if variant.matter_state != MatterState.GAS:
         return 0.0
     ambient_density = registry.variant("empty", "empty").density
-    return (_effective_density(cell, variant, registry) - ambient_density) * GAS_BUOYANCY_SCALE
+    ambient_temperature = _ambient_air_temperature(grid, registry, y)
+    return (_effective_density(cell, variant, ambient_temperature=ambient_temperature) - ambient_density) * GAS_BUOYANCY_SCALE
 
 
-def _empty_cell_can_move(current, registry: MaterialRegistry) -> bool:
-    ambient_temperature = _ambient_air_temperature(registry)
+def _local_wind_velocity(grid: Grid, registry: MaterialRegistry, x: int, y: int) -> tuple[float, float]:
+    wind_x = 0.0
+    wind_y = 0.0
+    total_weight = 0.0
+
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            nx = x + dx
+            ny = y + dy
+            if not grid.in_bounds(nx, ny):
+                continue
+
+            neighbor = grid.get_cell(nx, ny)
+            neighbor_variant = registry.variant(neighbor.family_id, neighbor.variant_id)
+            if neighbor_variant.matter_state != MatterState.GAS:
+                continue
+
+            weight = GAS_NEIGHBOR_WIND_DIAGONAL_WEIGHT if dx != 0 and dy != 0 else 1.0
+            wind_x += weight * (neighbor.vel_x + neighbor.blocked_x)
+            wind_y += weight * (neighbor.vel_y + neighbor.blocked_y)
+            total_weight += weight
+
+    if total_weight <= 0.0:
+        return (0.0, 0.0)
+    return (wind_x / total_weight, wind_y / total_weight)
+
+
+def _wind_coupling_for_cell(grid: Grid, registry: MaterialRegistry, y: int, cell, variant) -> float:
+    if variant.wind_coupling <= 0.0:
+        return 0.0
+    ambient_density = registry.variant("empty", "empty").density
+    ambient_temperature = _ambient_air_temperature(grid, registry, y)
+    current_density = _effective_density(cell, variant, ambient_temperature=ambient_temperature)
+    density_ratio = ambient_density / max(current_density, DENSITY_EPSILON)
+    return variant.wind_coupling * min(1.0, density_ratio)
+
+
+def _gas_cell_can_move(grid: Grid, registry: MaterialRegistry, x: int, y: int, current, variant) -> bool:
+    ambient_temperature = _ambient_air_temperature(grid, registry, y)
+    ambient_density = registry.variant("empty", "empty").density
+    index = grid.index(x, y)
     return (
-        abs(current.temperature - ambient_temperature) > EMPTY_MOTION_TEMPERATURE_THRESHOLD
+        abs(variant.density - ambient_density) > DENSITY_EPSILON
+        or abs(current.temperature - ambient_temperature) > EMPTY_MOTION_TEMPERATURE_THRESHOLD
         or hypot(current.vel_x, current.vel_y) > 0.01
         or hypot(current.blocked_x, current.blocked_y) > 0.01
+        or hypot(grid.source_force_x[index] + grid.force_wave_x[index], grid.source_force_y[index] + grid.force_wave_y[index]) > 0.01
     )
-
-
-def _is_gas_like(cell, variant) -> bool:
-    return cell.is_empty or variant.matter_state == MatterState.GAS
 
 
 def _gas_like_target_can_exchange(
@@ -149,11 +208,12 @@ def _gas_like_target_can_exchange(
     target,
     target_variant,
     *,
-    registry: MaterialRegistry,
+    current_ambient_temperature: float,
+    target_ambient_temperature: float,
     direction: tuple[int, int],
 ) -> bool:
-    current_density = _effective_density(current, current_variant, registry)
-    target_density = _effective_density(target, target_variant, registry)
+    current_density = _effective_density(current, current_variant, ambient_temperature=current_ambient_temperature)
+    target_density = _effective_density(target, target_variant, ambient_temperature=target_ambient_temperature)
     if direction[1] < 0:
         return current_density < target_density - DENSITY_EPSILON
     if direction[1] > 0:
@@ -167,31 +227,41 @@ def _target_can_exchange(
     target,
     target_variant,
     *,
+    grid: Grid,
     registry: MaterialRegistry,
+    current_y: int,
+    target_y: int,
     direction: tuple[int, int],
 ) -> bool:
-    if current.is_empty and not target.is_empty:
-        return False
     if current_variant.matter_state == MatterState.LIQUID and target_variant.matter_state == MatterState.GAS and direction[1] < 0:
         return False
-    if _is_gas_like(current, current_variant) and _is_gas_like(target, target_variant) and direction[1] != 0:
+    if current_variant.matter_state == MatterState.GAS and target_variant.matter_state == MatterState.GAS:
+        if current.is_empty and not target.is_empty:
+            return False
+        if direction[1] == 0:
+            return True
         return _gas_like_target_can_exchange(
             current,
             current_variant,
             target,
             target_variant,
-            registry=registry,
+            current_ambient_temperature=_ambient_air_temperature(grid, registry, current_y),
+            target_ambient_temperature=_ambient_air_temperature(grid, registry, target_y),
             direction=direction,
         )
-    if current.is_empty:
-        return target.is_empty
-    if target.is_empty:
-        return True
     current_rank = _state_rank(current_variant.matter_state)
     target_rank = _state_rank(target_variant.matter_state)
     if current_rank != target_rank:
         return target_rank < current_rank
-    return _effective_density(target, target_variant, registry) < _effective_density(current, current_variant, registry)
+    return _effective_density(
+        target,
+        target_variant,
+        ambient_temperature=_ambient_air_temperature(grid, registry, target_y),
+    ) < _effective_density(
+        current,
+        current_variant,
+        ambient_temperature=_ambient_air_temperature(grid, registry, current_y),
+    )
 
 
 def _axis_remaining_after_step(desired_component: float, realized_component: float) -> float:
@@ -217,7 +287,7 @@ def _downward_exchange_available(grid: Grid, registry: MaterialRegistry, x: int,
         return False
     target = grid.get_cell(x, ny)
     target_variant = registry.variant(target.family_id, target.variant_id)
-    return _target_can_exchange(current, variant, target, target_variant, registry=registry, direction=(0, 1))
+    return _target_can_exchange(current, variant, target, target_variant, grid=grid, registry=registry, current_y=y, target_y=ny, direction=(0, 1))
 
 
 def _compute_pressure_field(grid: Grid, registry: MaterialRegistry) -> None:
@@ -229,10 +299,9 @@ def _compute_pressure_field(grid: Grid, registry: MaterialRegistry) -> None:
             index = grid.index(x, y)
             cell = grid.get_cell(x, y)
             variant = registry.variant(cell.family_id, cell.variant_id)
-            if cell.is_empty:
-                next_pressure[index] = previous_pressure[index] + (AIR_PRESSURE - previous_pressure[index]) * PRESSURE_RELAXATION
-            elif variant.matter_state == MatterState.GAS:
-                next_pressure[index] = AIR_PRESSURE + _effective_density(cell, variant, registry)
+            ambient_temperature = _ambient_air_temperature(grid, registry, y)
+            if variant.matter_state == MatterState.GAS:
+                next_pressure[index] = AIR_PRESSURE + _effective_density(cell, variant, ambient_temperature=ambient_temperature)
             else:
                 next_pressure[index] = previous_pressure[index] + (AIR_PRESSURE - previous_pressure[index]) * PRESSURE_RELAXATION
 
@@ -241,7 +310,7 @@ def _compute_pressure_field(grid: Grid, registry: MaterialRegistry) -> None:
             index = grid.index(x, y)
             cell = grid.get_cell(x, y)
             variant = registry.variant(cell.family_id, cell.variant_id)
-            if variant.matter_state != MatterState.LIQUID or cell.is_empty:
+            if variant.matter_state != MatterState.LIQUID:
                 continue
             above_pressure = AIR_PRESSURE if y == 0 else next_pressure[grid.index(x, y - 1)]
             next_pressure[index] = above_pressure + variant.density
@@ -299,8 +368,6 @@ def _compute_source_force_field(grid: Grid, registry: MaterialRegistry) -> None:
         for x in range(grid.width):
             index = grid.index(x, y)
             cell = grid.get_cell(x, y)
-            if cell.is_empty:
-                continue
             variant = registry.variant(cell.family_id, cell.variant_id)
             next_source_x[index], next_source_y[index] = _local_pressure_force(grid, registry, x, y, variant)
 
@@ -317,7 +384,7 @@ def _next_force_wave(grid: Grid, registry: MaterialRegistry) -> tuple[list[float
             index = grid.index(x, y)
             cell = grid.get_cell(x, y)
             variant = registry.variant(cell.family_id, cell.variant_id)
-            if cell.is_empty or variant.matter_state != MatterState.LIQUID:
+            if variant.matter_state != MatterState.LIQUID:
                 continue
 
             incoming_x = 0.0
@@ -326,25 +393,25 @@ def _next_force_wave(grid: Grid, registry: MaterialRegistry) -> tuple[list[float
                 left_index = grid.index(x - 1, y)
                 left_cell = grid.get_cell(x - 1, y)
                 left_variant = registry.variant(left_cell.family_id, left_cell.variant_id)
-                if not left_cell.is_empty and left_variant.matter_state == MatterState.LIQUID:
+                if left_variant.matter_state == MatterState.LIQUID:
                     incoming_x += max(0.0, grid.force_wave_x[left_index]) * FORCE_WAVE_DECAY
             if x < grid.width - 1:
                 right_index = grid.index(x + 1, y)
                 right_cell = grid.get_cell(x + 1, y)
                 right_variant = registry.variant(right_cell.family_id, right_cell.variant_id)
-                if not right_cell.is_empty and right_variant.matter_state == MatterState.LIQUID:
+                if right_variant.matter_state == MatterState.LIQUID:
                     incoming_x += min(0.0, grid.force_wave_x[right_index]) * FORCE_WAVE_DECAY
             if y > 0:
                 above_index = grid.index(x, y - 1)
                 above_cell = grid.get_cell(x, y - 1)
                 above_variant = registry.variant(above_cell.family_id, above_cell.variant_id)
-                if not above_cell.is_empty and above_variant.matter_state == MatterState.LIQUID:
+                if above_variant.matter_state == MatterState.LIQUID:
                     incoming_y += max(0.0, grid.force_wave_y[above_index]) * FORCE_WAVE_DECAY
             if y < grid.height - 1:
                 below_index = grid.index(x, y + 1)
                 below_cell = grid.get_cell(x, y + 1)
                 below_variant = registry.variant(below_cell.family_id, below_cell.variant_id)
-                if not below_cell.is_empty and below_variant.matter_state == MatterState.LIQUID:
+                if below_variant.matter_state == MatterState.LIQUID:
                     incoming_y += min(0.0, grid.force_wave_y[below_index]) * FORCE_WAVE_DECAY
 
             delta_x = grid.source_force_x[index] - FORCE_WAVE_DECAY * grid.prev_source_force_x[index]
@@ -367,7 +434,7 @@ def _liquid_neighbor_count(grid: Grid, registry: MaterialRegistry, x: int, y: in
                 continue
             neighbor = grid.get_cell(nx, ny)
             neighbor_variant = registry.variant(neighbor.family_id, neighbor.variant_id)
-            if neighbor_variant.matter_state == MatterState.LIQUID and not neighbor.is_empty:
+            if neighbor_variant.matter_state == MatterState.LIQUID:
                 count += 1
     return count
 
@@ -401,26 +468,108 @@ def _base_velocity(grid: Grid, registry: MaterialRegistry, x: int, y: int, cell,
     index = grid.index(x, y)
     pressure_force_x = grid.source_force_x[index] + grid.force_wave_x[index]
     pressure_force_y = grid.source_force_y[index] + grid.force_wave_y[index]
-    velocity_x = cell.vel_x + pressure_force_x * dt
-    velocity_y = cell.vel_y + pressure_force_y * dt
+    velocity_x = cell.vel_x * variant.mobility + pressure_force_x * dt * variant.pressure_response
+    velocity_y = cell.vel_y * variant.mobility + pressure_force_y * dt * variant.pressure_response
 
-    if variant.motion_mode == MotionMode.POWDER:
-        velocity_y += GRAVITY_ACCELERATION * dt
-    elif variant.motion_mode == MotionMode.FLUID:
-        random_gain = _thermal_random_gain(grid, registry, cell, variant) * _random_step_factor(dt)
+    if variant.matter_state == MatterState.SOLID:
+        wind_x, wind_y = _local_wind_velocity(grid, registry, x, y)
+        wind_coupling = _wind_coupling_for_cell(grid, registry, y, cell, variant)
+        velocity_x += wind_x * wind_coupling
+        velocity_y += wind_y * wind_coupling * variant.wind_vertical_factor
+        velocity_y += GRAVITY_ACCELERATION * dt * variant.gravity_scale
+    else:
+        random_gain = _thermal_random_gain(grid, registry, y, cell, variant) * _random_step_factor(dt)
         velocity_x += (_hash01(step_seed, x, y, 11) - 0.5) * random_gain
-        vertical_factor = GAS_RANDOM_VERTICAL_FACTOR if (cell.is_empty or variant.matter_state == MatterState.GAS) else LIQUID_RANDOM_VERTICAL_FACTOR
+        vertical_factor = GAS_RANDOM_VERTICAL_FACTOR if variant.matter_state == MatterState.GAS else LIQUID_RANDOM_VERTICAL_FACTOR
         velocity_y += (_hash01(step_seed, x, y, 13) - 0.5) * random_gain * vertical_factor
-        if cell.is_empty or variant.matter_state == MatterState.GAS:
-            velocity_y += _thermal_buoyancy(registry, cell, variant) * dt
+        if variant.matter_state == MatterState.GAS:
+            velocity_y += _thermal_buoyancy(grid, registry, y, cell, variant) * dt * variant.buoyancy_scale
         else:
-            velocity_y += GRAVITY_ACCELERATION * dt
+            velocity_y += GRAVITY_ACCELERATION * dt * variant.gravity_scale
 
     return (velocity_x, velocity_y)
 
 
 def _candidate_jitter(step_id: int, x: int, y: int, dx: int, dy: int, *, jitter_gain: float) -> float:
     return (_hash01(step_id, x + dx * 17, y + dy * 31, 97) - 0.5) * jitter_gain
+
+
+def _preferred_side(step_id: int, x: int, y: int, desired_x: float) -> int:
+    if desired_x > 1e-9:
+        return 1
+    if desired_x < -1e-9:
+        return -1
+    return -1 if ((step_id + x + y) & 1) == 0 else 1
+
+
+def _direction_tie_break(step_id: int, x: int, y: int, dx: int, *, desired_x: float) -> float:
+    return dx * _preferred_side(step_id, x, y, desired_x) * DIRECTION_TIE_BREAK_GAIN
+
+
+def _sweep_range(length: int, *, reverse: bool) -> range:
+    if reverse:
+        return range(length - 1, -1, -1)
+    return range(length)
+
+
+def _directional_fallback_alignment_threshold(angle_limit_degrees: float) -> float:
+    clamped_limit = max(0.0, min(180.0, float(angle_limit_degrees)))
+    return cos(radians(clamped_limit))
+
+
+def _limit_directional_fallback_candidates(
+    candidates: list[tuple[tuple[int, int], float]],
+    *,
+    desired_x: float,
+    desired_y: float,
+    angle_limit_degrees: float,
+) -> list[tuple[tuple[int, int], float]]:
+    if len(candidates) <= 1:
+        return candidates
+    desired = _normalize(desired_x, desired_y)
+    threshold = _directional_fallback_alignment_threshold(angle_limit_degrees)
+    limited_candidates = [candidates[0]]
+    for direction, score in candidates[1:]:
+        if _direction_score(direction, desired) >= threshold - DIRECTION_FALLBACK_ALIGNMENT_EPSILON:
+            limited_candidates.append((direction, score))
+    return limited_candidates
+
+
+def _downward_release_candidates(
+    grid: Grid,
+    registry: MaterialRegistry,
+    x: int,
+    y: int,
+    variant,
+    *,
+    desired_x: float,
+    desired_y: float,
+    step_id: int,
+    jitter_gain: float,
+) -> list[tuple[tuple[int, int], float]] | None:
+    if not variant.downward_blocked_diagonal_fallback:
+        return None
+    if desired_y <= 1e-9:
+        return None
+    if desired_y + DIRECTION_FALLBACK_ALIGNMENT_EPSILON < abs(desired_x):
+        return None
+    if _downward_exchange_available(grid, registry, x, y, variant):
+        return None
+    if grid.directional_fallback_angle_limit_degrees + DIRECTION_FALLBACK_ALIGNMENT_EPSILON < 45.0:
+        return []
+
+    desired = _normalize(desired_x, desired_y)
+    preferred_side = _preferred_side(step_id, x, y, desired_x)
+    directions = ((preferred_side, 1), (-preferred_side, 1))
+    return [
+        (
+            direction,
+            _direction_score(direction, desired)
+            + _candidate_jitter(step_id, x, y, direction[0], direction[1], jitter_gain=jitter_gain)
+            + _direction_tie_break(step_id, x, y, direction[0], desired_x=desired_x),
+        )
+        for direction in directions
+    ]
 
 
 def _sorted_candidates(
@@ -440,6 +589,7 @@ def _sorted_candidates(
                 (dx, dy),
                 _direction_score((dx, dy), desired)
                 + _candidate_jitter(step_id, x, y, dx, dy, jitter_gain=jitter_gain)
+                + _direction_tie_break(step_id, x, y, dx, desired_x=desired_x)
                 + (
                     LIQUID_SURFACE_SIDEFLOW_BONUS
                     if surface_outflow_direction != 0 and dx == surface_outflow_direction and dy == 0
@@ -470,22 +620,10 @@ def _resolved_cell_after_forces(
     updated = cell.copy()
     base_velocity_x, base_velocity_y = _base_velocity(grid, registry, x, y, cell, variant, dt, step_seed=step_seed)
     blocked_enabled = grid.blocked_impulse_enabled
-
-    if variant.motion_mode == MotionMode.STATIC:
-        updated.vel_x = base_velocity_x * STATIC_VELOCITY_DECAY
-        updated.vel_y = base_velocity_y * STATIC_VELOCITY_DECAY
-        if blocked_enabled:
-            updated.blocked_x = _decayed_blocked_impulse(updated.blocked_x)
-            updated.blocked_y = _decayed_blocked_impulse(updated.blocked_y)
-        else:
-            updated.blocked_x = 0.0
-            updated.blocked_y = 0.0
-        return updated
-
-    desired_x = base_velocity_x + (cell.blocked_x if blocked_enabled else 0.0)
-    desired_y = base_velocity_y + (cell.blocked_y if blocked_enabled else 0.0)
-    updated.vel_x = base_velocity_x * VELOCITY_DECAY
-    updated.vel_y = base_velocity_y * VELOCITY_DECAY
+    desired_x = base_velocity_x + (cell.blocked_x * variant.mobility if blocked_enabled else 0.0)
+    desired_y = base_velocity_y + (cell.blocked_y * variant.mobility if blocked_enabled else 0.0)
+    updated.vel_x = base_velocity_x * variant.velocity_decay
+    updated.vel_y = base_velocity_y * variant.velocity_decay
 
     if not blocked_enabled:
         updated.blocked_x = 0.0
@@ -500,38 +638,61 @@ def _resolved_cell_after_forces(
     return updated
 
 
-def _apply_motion_pass(grid: Grid, registry: MaterialRegistry, dt: float, *, step_seed: int, liquids_only: bool) -> None:
+def _apply_motion_pass(
+    grid: Grid,
+    registry: MaterialRegistry,
+    dt: float,
+    *,
+    step_seed: int,
+    liquids_only: bool,
+    dense_only: bool = False,
+    gas_like_only: bool = False,
+) -> None:
     grid.copy_cells_to_scratch()
     size = grid.width * grid.height
     processed = [False] * size
     claimed = [False] * size
+    x_range = _sweep_range(grid.width, reverse=bool(step_seed & 1))
+    y_range = _sweep_range(grid.height, reverse=bool(step_seed & 2))
 
-    for y in range(grid.height):
-        for x in range(grid.width):
+    for y in y_range:
+        for x in x_range:
             current_index = grid.index(x, y)
             if processed[current_index]:
                 continue
 
             current = grid.get_cell(x, y)
             variant = registry.variant(current.family_id, current.variant_id)
-            if current.is_empty and not _empty_cell_can_move(current, registry):
-                processed[current_index] = True
+            is_gas_like_current = variant.matter_state == MatterState.GAS
+            if dense_only and is_gas_like_current:
+                continue
+            if gas_like_only and not is_gas_like_current:
+                continue
+            if variant.matter_state == MatterState.GAS and not _gas_cell_can_move(grid, registry, x, y, current, variant):
                 continue
 
             if liquids_only and not _liquid_relaxation_active(grid, registry, x, y, variant):
-                grid.set_cell(x, y, current.copy(), use_scratch=True)
-                processed[current_index] = True
                 continue
 
-            if variant.motion_mode == MotionMode.STATIC:
-                updated = _resolved_cell_after_forces(grid, registry, x, y, current, variant, dt, realized_step=None, step_seed=step_seed)
+            if not _variant_can_translate(variant):
+                updated = _resolved_cell_after_forces(
+                    grid,
+                    registry,
+                    x,
+                    y,
+                    current,
+                    variant,
+                    dt,
+                    realized_step=None,
+                    step_seed=step_seed,
+                )
                 grid.set_cell(x, y, updated, use_scratch=True)
                 processed[current_index] = True
                 continue
 
             base_velocity_x, base_velocity_y = _base_velocity(grid, registry, x, y, current, variant, dt, step_seed=step_seed)
-            desired_x = base_velocity_x + (current.blocked_x if grid.blocked_impulse_enabled else 0.0)
-            desired_y = base_velocity_y + (current.blocked_y if grid.blocked_impulse_enabled else 0.0)
+            desired_x = base_velocity_x + (current.blocked_x * variant.mobility if grid.blocked_impulse_enabled else 0.0)
+            desired_y = base_velocity_y + (current.blocked_y * variant.mobility if grid.blocked_impulse_enabled else 0.0)
             if hypot(desired_x, desired_y) <= 1e-9:
                 updated = _resolved_cell_after_forces(
                     grid,
@@ -552,16 +713,40 @@ def _apply_motion_pass(grid: Grid, registry: MaterialRegistry, dt: float, *, ste
                 jitter_gain = 0.0
             elif variant.matter_state == MatterState.LIQUID and not grid.liquid_brownian_enabled:
                 jitter_gain = 0.0
-            surface_outflow_direction = _liquid_surface_outflow_direction(grid, registry, x, y, variant)
-            candidates = _sorted_candidates(
-                desired_x,
-                desired_y,
-                step_id=step_seed,
-                x=x,
-                y=y,
-                jitter_gain=jitter_gain,
-                surface_outflow_direction=surface_outflow_direction,
-            )
+            if grid.directional_fallback_enabled:
+                candidates = _downward_release_candidates(
+                    grid,
+                    registry,
+                    x,
+                    y,
+                    variant,
+                    desired_x=desired_x,
+                    desired_y=desired_y,
+                    step_id=step_seed,
+                    jitter_gain=jitter_gain,
+                )
+            else:
+                candidates = None
+            if candidates is None:
+                surface_outflow_direction = _liquid_surface_outflow_direction(grid, registry, x, y, variant)
+                candidates = _sorted_candidates(
+                    desired_x,
+                    desired_y,
+                    step_id=step_seed,
+                    x=x,
+                    y=y,
+                    jitter_gain=jitter_gain,
+                    surface_outflow_direction=surface_outflow_direction,
+                )
+                if not grid.directional_fallback_enabled:
+                    candidates = candidates[:1]
+                else:
+                    candidates = _limit_directional_fallback_candidates(
+                        candidates,
+                        desired_x=desired_x,
+                        desired_y=desired_y,
+                        angle_limit_degrees=grid.directional_fallback_angle_limit_degrees,
+                    )
             moved = False
 
             for (dx, dy), score in candidates:
@@ -578,7 +763,17 @@ def _apply_motion_pass(grid: Grid, registry: MaterialRegistry, dt: float, *, ste
 
                 target = grid.get_cell(nx, ny)
                 target_variant = registry.variant(target.family_id, target.variant_id)
-                if not _target_can_exchange(current, variant, target, target_variant, registry=registry, direction=(dx, dy)):
+                if not _target_can_exchange(
+                    current,
+                    variant,
+                    target,
+                    target_variant,
+                    grid=grid,
+                    registry=registry,
+                    current_y=y,
+                    target_y=ny,
+                    direction=(dx, dy),
+                ):
                     continue
 
                 updated = _resolved_cell_after_forces(
@@ -638,6 +833,15 @@ def apply_motion(grid: Grid, registry: MaterialRegistry, dt: float) -> None:
         dt,
         step_seed=grid.step_id,
         liquids_only=False,
+        dense_only=True,
+    )
+    _apply_motion_pass(
+        grid,
+        registry,
+        dt,
+        step_seed=grid.step_id + 4096,
+        liquids_only=False,
+        gas_like_only=True,
     )
     grid.force_wave_x = next_wave_x
     grid.force_wave_y = next_wave_y

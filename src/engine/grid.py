@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .types import CellState, empty_cell
+from .atmosphere import default_ambient_air_temperature_for_row
+from .types import CellState
 
 
 @dataclass
@@ -12,6 +13,8 @@ class Grid:
     step_id: int = 0
     liquid_brownian_enabled: bool = True
     blocked_impulse_enabled: bool = True
+    directional_fallback_enabled: bool = True
+    directional_fallback_angle_limit_degrees: float = 45.0
     cells: list[CellState] = field(default_factory=list)
     scratch: list[CellState] = field(default_factory=list)
     pressure: list[float] = field(default_factory=list)
@@ -25,9 +28,17 @@ class Grid:
     def __post_init__(self) -> None:
         expected = self.width * self.height
         if not self.cells:
-            self.cells = [empty_cell() for _ in range(expected)]
+            self.cells = [
+                CellState(temperature=default_ambient_air_temperature_for_row(self.height, y))
+                for y in range(self.height)
+                for _ in range(self.width)
+            ]
         if not self.scratch:
-            self.scratch = [empty_cell() for _ in range(expected)]
+            self.scratch = [
+                CellState(temperature=default_ambient_air_temperature_for_row(self.height, y))
+                for y in range(self.height)
+                for _ in range(self.width)
+            ]
         if not self.pressure:
             self.pressure = [1.0 for _ in range(expected)]
         if not self.source_force_x:
@@ -61,7 +72,11 @@ class Grid:
         self.scratch = [cell.copy() for cell in self.cells]
 
     def clear_scratch(self) -> None:
-        self.scratch = [empty_cell() for _ in range(self.width * self.height)]
+        self.scratch = [
+            CellState(temperature=default_ambient_air_temperature_for_row(self.height, y))
+            for y in range(self.height)
+            for _ in range(self.width)
+        ]
 
     def swap_buffers(self) -> None:
         self.cells, self.scratch = self.scratch, self.cells

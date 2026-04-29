@@ -8,7 +8,7 @@
   - 定义一个绘制工具的家族、变体和附加覆盖。
 - `VoxelDemoWindow`
   - pyglet 窗口,负责交互、调度、缩放和绘制。
-- `run_demo(grid_width=160, grid_height=96, cell_scale=8, window_width=None, window_height=None, simulation_substeps=2, liquid_brownian_enabled=True, blocked_impulse_enabled=True, vsync=True)`
+- `run_demo(grid_width=160, grid_height=96, cell_scale=8, window_width=None, window_height=None, simulation_substeps=2, liquid_brownian_enabled=True, blocked_impulse_enabled=True, directional_fallback_enabled=True, vsync=True)`
   - 按指定网格分辨率和初始窗口大小启动 demo。
 
 ## 依赖的对外接口
@@ -31,6 +31,8 @@
 - 提供材质笔刷、`fixpoint` 笔刷、暂停、单步、重置、清空、材质/温度/压力三态视图切换、液体布朗运动运行时开关、子步进调节和窗口缩放等交互。
 - `B` 键可在运行时开关液体布朗运动,并把状态同步到 CPU grid 和 GPU backend。
 - `I` 键可在运行时开关 `blocked_impulse`,并把状态同步到 CPU grid 和 GPU backend。
+- `F` 键可在运行时开关“首选方向受阻时是否退而求其次找最近可移动方向”,并把状态同步到 CPU grid 和 GPU backend。
 - 优先创建 `GpuSimulator`,让 demo 在 GPU 上步进并直接输出调试纹理。
 - 当 compute shader 不可用时,回退到 CPU reference 模拟和 `build_rgba_frame()` 上传路径。
-- 在 overlay 中实时显示刷新频率、当前 backend、网格分辨率、窗口尺寸、当前视图、液体布朗开关状态、`blocked_impulse` 开关状态和模拟子步进数。
+- 在 overlay 中实时显示刷新频率、当前 backend、网格分辨率、窗口尺寸、当前视图、液体布朗开关状态、`blocked_impulse` 开关状态、方向 fallback 开关状态及其当前角度上限,以及模拟子步进数。
+- overlay 当前会把方向 fallback 的角度上限明确显示成 `<= angle`。

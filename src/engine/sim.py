@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from .atmosphere import default_ambient_air_temperature_for_row
 from .grid import Grid
 from .materials import build_material_registry
 from .motion import apply_motion
@@ -23,7 +24,12 @@ def _collapse_cells(grid: Grid, registry: MaterialRegistry) -> None:
             family = registry.family(current.family_id)
             collapse_target = family.collapse_target
             if collapse_target is None:
-                grid.set_cell(x, y, CellState(), use_scratch=True)
+                grid.set_cell(
+                    x,
+                    y,
+                    CellState(temperature=default_ambient_air_temperature_for_row(grid.height, y)),
+                    use_scratch=True,
+                )
                 continue
             collapsed = current.copy()
             collapsed.variant_id = collapse_target
@@ -81,6 +87,8 @@ def inject_cells(
         if not grid.in_bounds(x, y):
             continue
         cell = base.copy()
+        if family_id == "empty" and variant_id == "empty" and "temperature" not in overrides:
+            cell.temperature = default_ambient_air_temperature_for_row(grid.height, y)
         if cell.flags & CellFlag.FIXPOINT:
             cell.support_value = SUPPORT_SOURCE_VALUE
         grid.set_cell(x, y, cell)

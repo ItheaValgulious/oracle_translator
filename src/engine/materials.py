@@ -1,13 +1,68 @@
 from __future__ import annotations
 
-from .types import LifetimeMode, MaterialFamily, MaterialRegistry, MatterState, MotionMode, PhaseRule, ReactionKind, VariantDef
+from .types import LifetimeMode, MaterialFamily, MaterialRegistry, MatterState, PhaseRule, ReactionKind, VariantDef
+
+
+DEFAULT_MOBILE_VELOCITY_DECAY = 0.92
+DEFAULT_STATIC_VELOCITY_DECAY = 0.96
+DEFAULT_SOLID_WIND_COUPLING = 1.5
+DEFAULT_SOLID_WIND_VERTICAL_FACTOR = 0.1
+
+
+def _default_motion_profile(matter_state: MatterState, *, support_bearing: bool) -> dict[str, float | bool]:
+    if matter_state == MatterState.SOLID:
+        if support_bearing:
+            return {
+                "mobility": 0.0,
+                "pressure_response": 0.0,
+                "gravity_scale": 0.0,
+                "buoyancy_scale": 0.0,
+                "thermal_motion_scale": 0.0,
+                "wind_coupling": 0.0,
+                "wind_vertical_factor": 0.0,
+                "downward_blocked_diagonal_fallback": False,
+                "velocity_decay": DEFAULT_STATIC_VELOCITY_DECAY,
+            }
+        return {
+            "mobility": 1.0,
+            "pressure_response": 1.0,
+            "gravity_scale": 1.0,
+            "buoyancy_scale": 0.0,
+            "thermal_motion_scale": 0.0,
+            "wind_coupling": DEFAULT_SOLID_WIND_COUPLING,
+            "wind_vertical_factor": DEFAULT_SOLID_WIND_VERTICAL_FACTOR,
+            "downward_blocked_diagonal_fallback": True,
+            "velocity_decay": DEFAULT_MOBILE_VELOCITY_DECAY,
+        }
+    if matter_state == MatterState.LIQUID:
+        return {
+            "mobility": 1.0,
+            "pressure_response": 1.0,
+            "gravity_scale": 1.0,
+            "buoyancy_scale": 0.0,
+            "thermal_motion_scale": 1.0,
+            "wind_coupling": 0.0,
+            "wind_vertical_factor": 0.0,
+            "downward_blocked_diagonal_fallback": False,
+            "velocity_decay": DEFAULT_MOBILE_VELOCITY_DECAY,
+        }
+    return {
+        "mobility": 1.0,
+        "pressure_response": 1.0,
+        "gravity_scale": 0.0,
+        "buoyancy_scale": 1.0,
+        "thermal_motion_scale": 1.0,
+        "wind_coupling": 0.0,
+        "wind_vertical_factor": 0.0,
+        "downward_blocked_diagonal_fallback": False,
+        "velocity_decay": DEFAULT_MOBILE_VELOCITY_DECAY,
+    }
 
 
 def _variant(
     variant_id: str,
     *,
     matter_state: MatterState,
-    motion_mode: MotionMode,
     density: float,
     hardness: float,
     friction: float,
@@ -28,12 +83,26 @@ def _variant(
     reaction_energy: float = 0.0,
     reaction_preserves_self: bool = True,
     lifetime_mode: LifetimeMode = LifetimeMode.NONE,
+    mobility: float | None = None,
+    pressure_response: float | None = None,
+    gravity_scale: float | None = None,
+    buoyancy_scale: float | None = None,
+    thermal_motion_scale: float | None = None,
+    wind_coupling: float | None = None,
+    wind_vertical_factor: float | None = None,
+    downward_blocked_diagonal_fallback: bool | None = None,
+    velocity_decay: float | None = None,
+    liquid_contact_heat_exchange_multiplier: float = 1.0,
+    same_variant_heat_exchange_multiplier: float = 1.0,
     render_color: tuple[int, int, int] = (255, 255, 255),
 ) -> VariantDef:
+    motion_profile = _default_motion_profile(
+        matter_state,
+        support_bearing=support_bearing,
+    )
     return VariantDef(
         variant_id=variant_id,
         matter_state=matter_state,
-        motion_mode=motion_mode,
         density=density,
         hardness=hardness,
         friction=friction,
@@ -54,6 +123,23 @@ def _variant(
         reaction_energy=reaction_energy,
         reaction_preserves_self=reaction_preserves_self,
         lifetime_mode=lifetime_mode,
+        mobility=float(motion_profile["mobility"] if mobility is None else mobility),
+        pressure_response=float(motion_profile["pressure_response"] if pressure_response is None else pressure_response),
+        gravity_scale=float(motion_profile["gravity_scale"] if gravity_scale is None else gravity_scale),
+        buoyancy_scale=float(motion_profile["buoyancy_scale"] if buoyancy_scale is None else buoyancy_scale),
+        thermal_motion_scale=float(motion_profile["thermal_motion_scale"] if thermal_motion_scale is None else thermal_motion_scale),
+        wind_coupling=float(motion_profile["wind_coupling"] if wind_coupling is None else wind_coupling),
+        wind_vertical_factor=float(
+            motion_profile["wind_vertical_factor"] if wind_vertical_factor is None else wind_vertical_factor
+        ),
+        downward_blocked_diagonal_fallback=bool(
+            motion_profile["downward_blocked_diagonal_fallback"]
+            if downward_blocked_diagonal_fallback is None
+            else downward_blocked_diagonal_fallback
+        ),
+        velocity_decay=float(motion_profile["velocity_decay"] if velocity_decay is None else velocity_decay),
+        liquid_contact_heat_exchange_multiplier=liquid_contact_heat_exchange_multiplier,
+        same_variant_heat_exchange_multiplier=same_variant_heat_exchange_multiplier,
         render_color=render_color,
     )
 
@@ -70,7 +156,6 @@ def build_material_registry() -> MaterialRegistry:
             "empty": _variant(
                 "empty",
                 matter_state=MatterState.GAS,
-                motion_mode=MotionMode.FLUID,
                 density=1.0,
                 hardness=0.0,
                 friction=0.0,
@@ -94,7 +179,6 @@ def build_material_registry() -> MaterialRegistry:
             "stone_platform": _variant(
                 "stone_platform",
                 matter_state=MatterState.SOLID,
-                motion_mode=MotionMode.STATIC,
                 density=2.8,
                 hardness=0.95,
                 friction=0.8,
@@ -111,7 +195,6 @@ def build_material_registry() -> MaterialRegistry:
             "stone_powder": _variant(
                 "stone_powder",
                 matter_state=MatterState.SOLID,
-                motion_mode=MotionMode.POWDER,
                 density=2.2,
                 hardness=0.45,
                 friction=0.55,
@@ -128,7 +211,6 @@ def build_material_registry() -> MaterialRegistry:
             "magma": _variant(
                 "magma",
                 matter_state=MatterState.LIQUID,
-                motion_mode=MotionMode.FLUID,
                 density=2.4,
                 hardness=0.05,
                 friction=0.15,
@@ -158,7 +240,6 @@ def build_material_registry() -> MaterialRegistry:
             "sand_powder": _variant(
                 "sand_powder",
                 matter_state=MatterState.SOLID,
-                motion_mode=MotionMode.POWDER,
                 density=1.7,
                 hardness=0.2,
                 friction=0.45,
@@ -191,7 +272,6 @@ def build_material_registry() -> MaterialRegistry:
             "glass_platform": _variant(
                 "glass_platform",
                 matter_state=MatterState.SOLID,
-                motion_mode=MotionMode.STATIC,
                 density=2.5,
                 hardness=0.7,
                 friction=0.6,
@@ -208,7 +288,6 @@ def build_material_registry() -> MaterialRegistry:
             "glass_shards": _variant(
                 "glass_shards",
                 matter_state=MatterState.SOLID,
-                motion_mode=MotionMode.POWDER,
                 density=2.1,
                 hardness=0.35,
                 friction=0.4,
@@ -225,7 +304,6 @@ def build_material_registry() -> MaterialRegistry:
             "molten_glass": _variant(
                 "molten_glass",
                 matter_state=MatterState.LIQUID,
-                motion_mode=MotionMode.FLUID,
                 density=2.3,
                 hardness=0.03,
                 friction=0.1,
@@ -254,7 +332,6 @@ def build_material_registry() -> MaterialRegistry:
             "iron_platform": _variant(
                 "iron_platform",
                 matter_state=MatterState.SOLID,
-                motion_mode=MotionMode.STATIC,
                 density=3.2,
                 hardness=1.0,
                 friction=0.75,
@@ -271,7 +348,6 @@ def build_material_registry() -> MaterialRegistry:
             "iron_grit": _variant(
                 "iron_grit",
                 matter_state=MatterState.SOLID,
-                motion_mode=MotionMode.POWDER,
                 density=2.9,
                 hardness=0.5,
                 friction=0.55,
@@ -288,7 +364,6 @@ def build_material_registry() -> MaterialRegistry:
             "molten_iron": _variant(
                 "molten_iron",
                 matter_state=MatterState.LIQUID,
-                motion_mode=MotionMode.FLUID,
                 density=3.0,
                 hardness=0.02,
                 friction=0.1,
@@ -317,7 +392,6 @@ def build_material_registry() -> MaterialRegistry:
             "ice": _variant(
                 "ice",
                 matter_state=MatterState.SOLID,
-                motion_mode=MotionMode.STATIC,
                 density=1.0,
                 hardness=0.55,
                 friction=0.45,
@@ -334,7 +408,6 @@ def build_material_registry() -> MaterialRegistry:
             "water": _variant(
                 "water",
                 matter_state=MatterState.LIQUID,
-                motion_mode=MotionMode.FLUID,
                 density=1.0,
                 hardness=0.0,
                 friction=0.05,
@@ -351,7 +424,6 @@ def build_material_registry() -> MaterialRegistry:
             "steam": _variant(
                 "steam",
                 matter_state=MatterState.GAS,
-                motion_mode=MotionMode.FLUID,
                 density=0.85,
                 hardness=0.0,
                 friction=0.02,
@@ -362,6 +434,8 @@ def build_material_registry() -> MaterialRegistry:
                 support_transmission=False,
                 base_temperature=120.0,
                 freeze_temperature=65.0,
+                liquid_contact_heat_exchange_multiplier=30.0,
+                same_variant_heat_exchange_multiplier=80.0,
                 render_color=(220, 220, 220),
             ),
         },
@@ -382,7 +456,6 @@ def build_material_registry() -> MaterialRegistry:
             "acid_liquid": _variant(
                 "acid_liquid",
                 matter_state=MatterState.LIQUID,
-                motion_mode=MotionMode.FLUID,
                 density=1.1,
                 hardness=0.0,
                 friction=0.04,
@@ -401,7 +474,6 @@ def build_material_registry() -> MaterialRegistry:
             "acid_gas": _variant(
                 "acid_gas",
                 matter_state=MatterState.GAS,
-                motion_mode=MotionMode.FLUID,
                 density=1.1,
                 hardness=0.0,
                 friction=0.01,
@@ -433,7 +505,6 @@ def build_material_registry() -> MaterialRegistry:
             "poison_liquid": _variant(
                 "poison_liquid",
                 matter_state=MatterState.LIQUID,
-                motion_mode=MotionMode.FLUID,
                 density=0.95,
                 hardness=0.0,
                 friction=0.04,
@@ -452,7 +523,6 @@ def build_material_registry() -> MaterialRegistry:
             "poison_gas": _variant(
                 "poison_gas",
                 matter_state=MatterState.GAS,
-                motion_mode=MotionMode.FLUID,
                 density=1.05,
                 hardness=0.0,
                 friction=0.01,
@@ -484,7 +554,6 @@ def build_material_registry() -> MaterialRegistry:
             "tar_liquid": _variant(
                 "tar_liquid",
                 matter_state=MatterState.LIQUID,
-                motion_mode=MotionMode.FLUID,
                 density=1.3,
                 hardness=0.0,
                 friction=0.1,
@@ -502,7 +571,6 @@ def build_material_registry() -> MaterialRegistry:
             "tar_smoke": _variant(
                 "tar_smoke",
                 matter_state=MatterState.GAS,
-                motion_mode=MotionMode.FLUID,
                 density=0.95,
                 hardness=0.0,
                 friction=0.01,
@@ -527,7 +595,6 @@ def build_material_registry() -> MaterialRegistry:
             "fire": _variant(
                 "fire",
                 matter_state=MatterState.GAS,
-                motion_mode=MotionMode.FLUID,
                 density=0.2,
                 hardness=0.0,
                 friction=0.0,
