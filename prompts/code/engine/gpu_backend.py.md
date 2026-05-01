@@ -22,11 +22,13 @@
     - `set_external_support_anchors(anchors)`
     - `read_region(x, y, width, height)`
     - `write_region(x, y, region, buffer_index=None)`
+    - `write_store_rect(store, world_x, world_y, width, height, dst_x, dst_y, buffer_index=None)`
+    - `fill_empty_region(x, y, width, height, world_row_offset, world_height, buffer_index=None)`
     - `copy_region(src_x, src_y, width, height, dst_x, dst_y, src_buffer_index=None, dst_buffer_index=None)`
     - `copy_transient_region(src_x, src_y, width, height, dst_x, dst_y)`
     - `stage_region(x, y, width, height)`
     - `copy_from_staged_region(staged, src_x, src_y, width, height, dst_x, dst_y, dst_buffer_index=None)`
-    - `read_staged_region(staged)`
+    - `read_staged_region(staged, x=0, y=0, width=None, height=None)`
     - `release_staged_region(staged)`
     - `clear_region_transients(x, y, width, height)`
     - `step(dt)`
@@ -65,14 +67,21 @@
   - `velocity_decay`
   - `downward_blocked_diagonal_fallback`
 - 把 cell 动态状态拆成整数纹理和浮点纹理,并做双缓冲。
-- 额外维护一张 `external_support_anchor` 纹理,供大世界活动窗把冻结区外部支撑源映射到当前边界。
+- 额外维护一份 compact external support edge buffer,供大世界活动窗把冻结区外部支撑源映射到当前四条边。
 - 维护 GPU 侧持久化 `pressure` 标量场、`source_force` 和 `force_wave` 纹理。
 - 提供面向大世界活动窗的区域接口:
   - 局部读回 `cell state`
   - 局部写入 `cell state`
+  - 直接把 `WorldChunkStore` 的稀疏 chunk 内容打包成 GPU state bytes 写入目标条带
+  - 直接在 GPU 上按 world row 环境温度把局部区域填成默认 `empty`
   - 在 GPU 内把重叠区域从旧位置复制到新位置
   - 在活动窗平移时复制 overlap 的 transient 力场,并只清空新暴露条带
   - 把被逐出的区域临时 stage 在 GPU 纹理里,供后续慢速回写或快速装回
+- 新暴露条带的 transient 清理当前使用专用 GPU clear shader,只清下一步真正会被读取的 pressure / source_force / wave_force 目标纹理,不再做多张 transient texture 的 CPU viewport write。
+- staged region 当前除了普通 `(width, height)` 复用,还会优先把常见横向/纵向窄条带写进固定 atlas 槽位,避免分页时频繁分配和释放 staging 资源。
+- external support 当前不再依赖整张 anchor texture image upload,而是把边界 anchor 压成 compact edge buffer,由 support shader 直接按 top / bottom / left / right 读取。
+- `write_external_support_anchor_region()` 现在只是兼容 edge buffer 的单边更新接口,不再依赖旧的 anchor texture。
+- `read_staged_region()` 当前支持按子矩形回读 staged region,供 idle writeback 分片 flush 使用。
 - 用 compute shader 执行:
   - `support`
   - `reactions`
@@ -83,7 +92,7 @@
   - `force_wave`
   - 交换式 `motion`
   - `collapse`
-- GPU `support` 当前除了真实 `FIXPOINT`,还会把 `external_support_anchor` 当作虚拟外部支撑源。
+- GPU `support` 当前除了真实 `FIXPOINT`,还会把 compact external support edge buffer 映射出的边界锚点当作虚拟外部支撑源。
 - GPU `motion` 和 CPU 一样,求解器只按 `matter_state` 分支; 同一物态内部的差异全部由打包后的通用运动参数控制。
 - GPU 里的液体布朗运动、`blocked_impulse` 和方向 fallback 都带运行时开关,语义与 CPU 保持一致。
 - GPU 当前每个外部 `step` 会先跑一次“非气态物质”交换,再跑一次“空气/气体”交换。

@@ -20,6 +20,9 @@
 - demo 可以开窗,实时渲染网格并用笔刷注入材质
 - demo 优先使用 compute shader GPU backend 步进和着色
 - CPU 路径保留为 reference 和 fallback
+- 大世界分页当前额外做了两层流送优化:
+  - 新暴露条带优先先按环境温度整条填默认 `empty`,再只覆写真实存储子矩形
+  - staging 写回 world store 时直接写冻结区 anchored support snapshot,避免 flush 当帧做整图支撑重算
 
 ## 1. 当前目标
 
@@ -355,6 +358,7 @@
 - 优先使用 GPU compute shader,不可用时回退 CPU reference
 - overlay 显示当前 backend、刷新频率和网格/窗口尺寸
 - overlay 显示当前模拟子步进数与调试视图
+- overlay 当前还会显示分页次数、最近/最大分页耗时、pending writeback 压力和分页分阶段耗时
 - 可运行时开关液体布朗运动,便于观察其对液体铺开和性能的影响
 - 可运行时开关 `blocked_impulse`,便于观察残余意图是否导致液体边缘异常运动
 - 可运行时开关“首选方向受阻时是否退而求其次找最近可移动方向”,便于比较狭口喷流和坡面绕流
@@ -364,6 +368,7 @@
 - 可切换材质视图 / 温度视图 / 压力视图
 - 初始网格分辨率和窗口大小可由启动参数配置
 - 窗口可直接拖拽调整大小
+- 相机支持按住 `W/A/S/D` 或方向键连续移动,并按屏幕直觉上下查看
 - 暂停、单步、重置和清空场景
 - 大世界第一版当前拆成两层:
   - `WorldChunkStore`
@@ -373,16 +378,18 @@
   - `ActiveWorldWindow`
     - 负责一个随相机滑动的连续活动模拟窗
     - 当前仍然只保留一个连续 `Grid` / `GpuSimulator`,而不是每个 chunk 各跑一个 backend
-    - viewport 四周默认额外保留 `64` 格 halo
-    - 相机接近活动窗内部安全边界时,按 `64` 格分页平移活动窗
+    - viewport 四周默认额外保留较小 halo
+    - 相机接近活动窗内部安全边界时,按更小的分页步长更频繁平移活动窗,减少单次切页卡顿
 - 活动窗平移时:
   - 只持久化 `cell state`
   - 新暴露区域按矩形从 chunk store 流式载入
-  - 被逐出活动窗的区域按矩形写回 chunk store
+  - 被逐出活动窗的区域先进入 staging / pending writeback 队列
   - `pressure / source_force / force_wave` 只属于当前活动模拟窗,不写入 chunk store
   - GPU 路径当前优先把被逐出的条带先留在 GPU staging 里
+  - 新暴露条带如果在 `WorldChunkStore` 里没有真实存储 cell,当前会直接在 GPU 上按 world row 环境温度填成默认 `empty`
   - 用户操作时先保证“进显存”和活动窗内复制够快
-  - staging 条带会在后续空闲 tick 再慢速回写 CPU world store
+  - staging 条带只有在相机空闲后才会慢速回写 CPU world store
+  - external support anchor 当前只重建和上传活动窗四条边,不再每次切页重扫和重传整张 anchor 纹理
 - `fixpoint` / support 在大世界里当前增加冻结区外部锚定语义:
   - chunk store 会记录冻结承重网络是否仍连到真实 `fixpoint`
   - 活动窗边界可把这些冻结外部连接视为虚拟支撑来源

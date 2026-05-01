@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from array import array
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +29,7 @@ from engine.sim import inject_cells, step
 from engine.support import SUPPORT_SOURCE_VALUE
 from engine.thermal import apply_thermal
 from engine.types import CellFlag, CellState
-from engine.world import ActiveWorldWindow, WorldChunkStore
+from engine.world import ActiveWorldWindow, WorldChunkStore, WorldRect
 from scripts.run_engine_demo import parse_args
 
 
@@ -631,6 +633,43 @@ class EngineCoreTests(unittest.TestCase):
         self.assertEqual(store.get_cell(6, 3).variant_id, "sand_powder")
         self.assertAlmostEqual(store.get_cell(6, 3).blocked_y, 0.25)
 
+    def test_world_chunk_store_rect_has_stored_cells_only_for_non_default_content(self) -> None:
+        store = WorldChunkStore(12, 6, chunk_size=4)
+        self.assertFalse(store.rect_has_stored_cells(WorldRect(4, 1, 3, 3)))
+        store.set_cell(5, 2, CellState(family_id="water", variant_id="water", temperature=85.0))
+        self.assertTrue(store.rect_has_stored_cells(WorldRect(4, 1, 3, 3)))
+
+    def test_world_chunk_store_rect_has_stored_cells_ignores_other_cells_in_same_chunk(self) -> None:
+        store = WorldChunkStore(12, 6, chunk_size=4)
+        store.set_cell(4, 0, CellState(family_id="water", variant_id="water", temperature=85.0))
+        self.assertFalse(store.rect_has_stored_cells(WorldRect(6, 1, 2, 2)))
+        self.assertTrue(store.rect_has_stored_cells(WorldRect(4, 0, 1, 1)))
+
+    def test_world_chunk_store_write_rect_persists_anchored_support_mask(self) -> None:
+        store = WorldChunkStore(6, 2, chunk_size=4)
+        region = store.read_rect(1, 0, 3, 1)
+        region.set_cell(0, 0, CellState(family_id="stone", variant_id="stone_platform", flags=CellFlag.FIXPOINT))
+        region.set_cell(1, 0, CellState(family_id="stone", variant_id="stone_platform", support_value=1.0))
+        region.set_cell(2, 0, CellState(family_id="water", variant_id="water"))
+        region.anchored_support_mask = [True, True, False]
+        store.write_rect(1, 0, region)
+        self.assertTrue(store.anchored_support_at(1, 0))
+        self.assertTrue(store.anchored_support_at(2, 0))
+        self.assertFalse(store.anchored_support_at(3, 0))
+
+    def test_world_chunk_store_stored_cell_rects_merges_rows_into_sparse_rects(self) -> None:
+        store = WorldChunkStore(12, 8, chunk_size=4)
+        for coord in ((2, 1), (3, 1), (2, 2), (3, 2), (8, 4), (8, 5)):
+            store.set_cell(coord[0], coord[1], CellState(family_id="stone", variant_id="stone_platform"))
+        rects = store.stored_cell_rects(WorldRect(0, 0, 10, 6))
+        self.assertEqual(
+            rects,
+            [
+                WorldRect(2, 1, 2, 2),
+                WorldRect(8, 4, 1, 2),
+            ],
+        )
+
     def test_active_world_window_preserves_modified_overlap_when_camera_pages(self) -> None:
         store = WorldChunkStore(12, 1, chunk_size=4)
         for x in range(12):
@@ -678,6 +717,358 @@ class EngineCoreTests(unittest.TestCase):
         target_world_x = 4
         local_x = target_world_x - world.active_origin_x
         self.assertGreater(active.get_cell(local_x, 0).support_value, 0.0)
+
+    def test_active_world_window_clamps_downward_camera_without_wrapping(self) -> None:
+        store = WorldChunkStore(4, 12, chunk_size=4)
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=2,
+            viewport_height=4,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        for _ in range(20):
+            world.pan_camera(0, 1)
+        self.assertEqual(world.camera_y, 8)
+        self.assertEqual(world.active_origin_y, 6)
+        world.pan_camera(0, 1)
+        self.assertEqual(world.camera_y, 8)
+        self.assertEqual(world.active_origin_y, 6)
+
+    def test_active_world_window_clamps_upward_camera_at_top(self) -> None:
+        store = WorldChunkStore(4, 12, chunk_size=4)
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=2,
+            viewport_height=4,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        for _ in range(20):
+            world.pan_camera(0, -1)
+        self.assertEqual(world.camera_y, 0)
+        self.assertEqual(world.active_origin_y, 0)
+
+    def test_active_world_window_vertical_paging_preserves_monotonic_rows(self) -> None:
+        store = WorldChunkStore(2, 12, chunk_size=4)
+        for y in range(12):
+            inject_cells(store, [(0, y)], "stone", "stone_platform", {"temperature": 20.0 + y}, registry=self.registry)
+        store.recompute_anchored_support(self.registry)
+
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=1,
+            viewport_height=4,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        for _ in range(4):
+            world.pan_camera(0, 1)
+        active = world.readback_active_grid()
+        visible_temperatures = [
+            active.get_cell(0, world.camera_y + local_y - world.active_origin_y).temperature
+            for local_y in range(world.viewport_height)
+        ]
+        self.assertEqual(visible_temperatures, sorted(visible_temperatures))
+
+    def test_active_world_window_movement_defers_gpu_writeback_until_idle(self) -> None:
+        ctx = create_compute_context()
+        store = WorldChunkStore(10, 1, chunk_size=4)
+        for x in range(10):
+            inject_cells(store, [(x, 0)], "stone", "stone_platform", {"temperature": 10.0 + x}, registry=self.registry)
+        store.recompute_anchored_support(self.registry)
+
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=1,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            idle_flush_cooldown_seconds=0.1,
+            pending_writeback_limit=8,
+            ctx=ctx,
+        )
+        world.pan_camera(2, 0)
+        pending_before_service = world.pending_writeback_count
+        self.assertGreater(pending_before_service, 0)
+        world.service_background_io()
+        self.assertEqual(world.pending_writeback_count, pending_before_service)
+        world.mark_camera_activity(False, dt=0.11)
+        world.service_background_io()
+        self.assertEqual(world.pending_writeback_count, pending_before_service)
+        world.mark_camera_activity(False, dt=0.11)
+        world.service_background_io()
+        self.assertEqual(world.pending_writeback_count, pending_before_service)
+
+    def test_active_world_window_idle_flush_respects_service_interval(self) -> None:
+        ctx = create_compute_context()
+        store = WorldChunkStore(10, 1, chunk_size=4)
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=1,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            idle_flush_cooldown_seconds=0.1,
+            idle_flush_service_interval_seconds=0.5,
+            ctx=ctx,
+        )
+        import engine.world as world_module
+
+        pending = world_module._PendingGpuWriteback(  # noqa: SLF001
+            rect=WorldRect(0, 0, 1, 1),
+            staged_region=mock.Mock(width=1, height=1),
+            snapshot_region=world_module.GridSlice(width=1, height=1, cells=[CellState(family_id="stone", variant_id="stone_platform", temperature=100.0)]),
+        )
+        world._pending_gpu_writebacks.append(pending)  # noqa: SLF001
+        world.mark_camera_activity(False, dt=0.11)
+        world.service_background_io()
+        self.assertEqual(world.pending_writeback_count, 1)
+        world.mark_camera_activity(False, dt=0.40)
+        world.service_background_io()
+        self.assertLess(world.pending_writeback_count, 1)
+
+    def test_active_world_window_flush_uses_support_snapshot_without_global_recompute(self) -> None:
+        import engine.world as world_module
+
+        store = WorldChunkStore(10, 1, chunk_size=4)
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=1,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        region = world_module.GridSlice(
+            width=2,
+            height=1,
+            cells=[
+                CellState(family_id="stone", variant_id="stone_platform", support_value=1.0),
+                CellState(family_id="water", variant_id="water"),
+            ],
+        )
+        fake_gpu = mock.Mock()
+        fake_gpu.read_staged_region.return_value = region
+        world.gpu_simulator = fake_gpu
+        world._pending_gpu_writebacks.append(  # noqa: SLF001
+            world_module._PendingGpuWriteback(  # noqa: SLF001
+                rect=WorldRect(2, 0, 2, 1),
+                staged_region=object(),
+            )
+        )
+
+        with mock.patch.object(store, "recompute_anchored_support") as recompute:
+            flushed = world._flush_one_pending_gpu_writeback()  # noqa: SLF001
+
+        self.assertTrue(flushed)
+        self.assertEqual(store.get_cell(2, 0).variant_id, "stone_platform")
+        self.assertTrue(store.anchored_support_at(2, 0))
+        self.assertFalse(store.anchored_support_at(3, 0))
+        recompute.assert_not_called()
+
+    def test_active_world_window_flush_slices_pending_writeback_across_idle_calls(self) -> None:
+        import engine.world as world_module
+
+        store = WorldChunkStore(16, 8, chunk_size=4)
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=4,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        world.pending_writeback_slice_cell_budget = 1
+        fake_gpu = mock.Mock()
+        world.gpu_simulator = fake_gpu
+        world._pending_gpu_writebacks.append(  # noqa: SLF001
+            world_module._PendingGpuWriteback(  # noqa: SLF001
+                rect=WorldRect(2, 1, 4, 4),
+                staged_region=object(),
+                snapshot_region=world_module.GridSlice(
+                    width=4,
+                    height=4,
+                    cells=[
+                        CellState(family_id="stone", variant_id="stone_platform", temperature=100.0 + index)
+                        for index in range(16)
+                    ],
+                ),
+            )
+        )
+
+        first_flush = world._flush_one_pending_gpu_writeback()  # noqa: SLF001
+        self.assertTrue(first_flush)
+        self.assertEqual(world.pending_writeback_count, 1)
+        self.assertEqual(store.get_cell(2, 1).temperature, 100.0)
+        self.assertEqual(store.get_cell(2, 2).variant_id, "empty")
+
+        second_flush = world._flush_one_pending_gpu_writeback()  # noqa: SLF001
+        self.assertTrue(second_flush)
+        self.assertEqual(world.pending_writeback_count, 1)
+        self.assertEqual(store.get_cell(2, 2).temperature, 104.0)
+
+    def test_active_world_window_movement_does_not_flush_when_pending_exceeds_limit(self) -> None:
+        ctx = create_compute_context()
+        store = WorldChunkStore(24, 1, chunk_size=4)
+        for x in range(24):
+            inject_cells(store, [(x, 0)], "stone", "stone_platform", {"temperature": 10.0 + x}, registry=self.registry)
+        store.recompute_anchored_support(self.registry)
+
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=1,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            idle_flush_cooldown_seconds=0.1,
+            pending_writeback_limit=1,
+            ctx=ctx,
+        )
+        for _ in range(6):
+            world.pan_camera(2, 0)
+        pending_before_service = world.pending_writeback_count
+        self.assertGreater(pending_before_service, world.pending_writeback_limit)
+        world.service_background_io()
+        self.assertEqual(world.pending_writeback_count, pending_before_service)
+        self.assertGreater(world.pending_writeback_pressure_count, 0)
+
+    def test_active_world_window_gpu_vertical_paging_preserves_monotonic_rows(self) -> None:
+        ctx = create_compute_context()
+        store = WorldChunkStore(2, 12, chunk_size=4)
+        for y in range(12):
+            inject_cells(store, [(0, y)], "stone", "stone_platform", {"temperature": 20.0 + y}, registry=self.registry)
+        store.recompute_anchored_support(self.registry)
+
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=1,
+            viewport_height=4,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=ctx,
+        )
+        for _ in range(4):
+            world.pan_camera(0, 1)
+        active = world.readback_active_grid()
+        visible_temperatures = [
+            active.get_cell(0, world.camera_y + local_y - world.active_origin_y).temperature
+            for local_y in range(world.viewport_height)
+        ]
+        self.assertEqual(visible_temperatures, sorted(visible_temperatures))
+
+    def test_active_world_window_gpu_reuses_staged_overlap_before_empty_fill(self) -> None:
+        ctx = create_compute_context()
+        store = WorldChunkStore(12, 1, chunk_size=4)
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=1,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=ctx,
+        )
+        original_world_x = world.active_origin_x
+        local_x = 0
+        world.gpu_simulator.paint_circle(local_x, 0, 0, "stone", "stone_platform", overrides={"temperature": 456.0})
+        world.pan_camera(2, 0)
+        world.pan_camera(-2, 0)
+        readback = world.readback_active_grid()
+        restored_local_x = original_world_x - world.active_origin_x
+        self.assertEqual(readback.get_cell(restored_local_x, 0).variant_id, "stone_platform")
+        self.assertAlmostEqual(readback.get_cell(restored_local_x, 0).temperature, 456.0)
+
+    def test_active_world_window_incoming_rect_with_stored_cells_uses_full_rect_write(self) -> None:
+        store = WorldChunkStore(12, 4, chunk_size=4)
+        store.set_cell(8, 1, CellState(family_id="stone", variant_id="stone_platform", temperature=333.0))
+        store.set_cell(9, 1, CellState(family_id="stone", variant_id="stone_platform", temperature=334.0))
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=2,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        fake_gpu = mock.Mock()
+        world.gpu_simulator = fake_gpu
+        world._load_incoming_rect_into_gpu_buffer(  # noqa: SLF001
+            WorldRect(6, 0, 4, 3),
+            target_buffer_index=0,
+            target_origin_x=6,
+            target_origin_y=0,
+        )
+        fake_gpu.fill_empty_region.assert_not_called()
+        fake_gpu.write_region.assert_not_called()
+        fake_gpu.write_store_rect.assert_called_once_with(
+            store,
+            world_x=6,
+            world_y=0,
+            width=4,
+            height=3,
+            dst_x=0,
+            dst_y=0,
+            buffer_index=0,
+        )
+
+    def test_active_world_window_incoming_rect_with_stored_cells_uses_direct_store_write(self) -> None:
+        store = WorldChunkStore(12, 4, chunk_size=4)
+        store.set_cell(8, 1, CellState(family_id="stone", variant_id="stone_platform", temperature=333.0))
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=4,
+            viewport_height=2,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        fake_gpu = mock.Mock()
+        world.gpu_simulator = fake_gpu
+
+        world._load_incoming_rect_into_gpu_buffer(  # noqa: SLF001
+            WorldRect(6, 0, 4, 3),
+            target_buffer_index=0,
+            target_origin_x=6,
+            target_origin_y=0,
+        )
+
+        fake_gpu.write_store_rect.assert_called_once_with(
+            store,
+            world_x=6,
+            world_y=0,
+            width=4,
+            height=3,
+            dst_x=0,
+            dst_y=0,
+            buffer_index=0,
+        )
 
     def test_platform_integrity_decays_only_after_support_timeout(self) -> None:
         grid = create_grid(2, 1)
@@ -1386,6 +1777,41 @@ class EngineCoreTests(unittest.TestCase):
         self.assertEqual(writeback.get_cell(1, 2).variant_id, "stone_platform")
         self.assertAlmostEqual(writeback.get_cell(1, 2).temperature, 321.0)
 
+    def test_gpu_external_support_anchor_region_update_clears_old_interior(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(4, 4)
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        anchors = [False for _ in range(16)]
+        anchors[0] = True
+        anchors[5] = True
+        gpu.set_external_support_anchors(anchors)
+        gpu.clear_external_support_anchors()
+        gpu.write_external_support_anchor_region(0, 0, 4, 1, [True, False, False, False])
+        anchor_values = array("i")
+        anchor_values.frombytes(gpu.external_support_edge_buffer.read())
+        self.assertEqual(anchor_values[0], 1)
+        self.assertEqual(anchor_values[5], 0)
+
+    def test_gpu_fill_empty_region_uses_world_row_ambient_temperature(self) -> None:
+        ctx = create_compute_context()
+
+        grid = create_grid(4, 4)
+        inject_cells(grid, [(1, 1)], "stone", "stone_platform", {"temperature": 123.0})
+        gpu = GpuSimulator(ctx, grid, self.registry)
+        target_buffer = 1 - gpu.front_index
+        gpu.copy_region(0, 0, 4, 4, 0, 0, dst_buffer_index=target_buffer)
+        gpu.fill_empty_region(1, 1, 2, 2, world_row_offset=10, world_height=20, buffer_index=target_buffer)
+        gpu.front_index = target_buffer
+        readback = gpu.readback_grid()
+        self.assertTrue(readback.get_cell(1, 1).is_empty)
+        self.assertAlmostEqual(
+            readback.get_cell(1, 1).temperature,
+            ambient_air_temperature_for_row(20, 10, self.registry.variant("empty", "empty").base_temperature),
+            places=5,
+        )
+        self.assertTrue(readback.get_cell(2, 2).is_empty)
+
     def test_gpu_platform_integrity_decays_only_after_support_timeout(self) -> None:
         ctx = create_compute_context()
 
@@ -1636,6 +2062,25 @@ class EngineCoreTests(unittest.TestCase):
         self.assertTrue(args.no_blocked_impulse)
         self.assertTrue(args.no_directional_fallback)
         self.assertTrue(args.no_vsync)
+
+    def test_visible_uv_rect_tracks_camera_downward_without_vertical_wrap(self) -> None:
+        store = WorldChunkStore(4, 12, chunk_size=4)
+        world = ActiveWorldWindow(
+            store,
+            self.registry,
+            viewport_width=2,
+            viewport_height=4,
+            halo_cells=1,
+            page_shift_cells=1,
+            safety_margin_cells=1,
+            ctx=None,
+        )
+        initial_u, initial_v, _, _ = world.visible_uv_rect()
+        self.assertGreaterEqual(initial_v, 0.0)
+        world.pan_camera(0, 4)
+        _, shifted_v, _, _ = world.visible_uv_rect()
+        self.assertLessEqual(shifted_v, initial_v)
+        self.assertGreaterEqual(shifted_v, 0.0)
 
 
 if __name__ == "__main__":

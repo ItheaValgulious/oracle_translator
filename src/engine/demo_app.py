@@ -71,6 +71,9 @@ void main() {
 
 DEFAULT_TICK_RATE_HZ = 60.0
 DEFAULT_SIMULATION_SUBSTEPS = 2
+DEFAULT_CAMERA_SPEED_CELLS_PER_SECOND = 240.0
+MAX_CAMERA_MOTION_DT_SECONDS = 1.0 / 30.0
+BACKGROUND_IO_SERVICE_INTERVAL_SECONDS = 0.5
 VIEW_MODE_ORDER = (
     DebugViewMode.MATERIAL,
     DebugViewMode.TEMPERATURE,
@@ -131,7 +134,21 @@ class VoxelDemoWindow(pyglet.window.Window):
         self.directional_fallback_angle_limit_degrees = 45.0
         self.backend_label = "CPU Reference"
         self.backend_detail = ""
-        self.camera_pan_cells = max(8, self.page_shift_cells // 4)
+        self.camera_speed_cells_per_second = DEFAULT_CAMERA_SPEED_CELLS_PER_SECOND
+        self._camera_move_left = False
+        self._camera_move_right = False
+        self._camera_move_up = False
+        self._camera_move_down = False
+        self.last_camera_pan_cells = 0
+        self.last_camera_stage_ms = 0.0
+        self.last_step_stage_ms = 0.0
+        self.last_background_io_stage_ms = 0.0
+        self.last_upload_stage_ms = 0.0
+        self.last_tick_total_ms = 0.0
+        self.max_tick_total_ms = 0.0
+        self.last_draw_stage_ms = 0.0
+        self.max_draw_stage_ms = 0.0
+        self._background_io_accumulator_seconds = 0.0
         self.world: ActiveWorldWindow | None = None
 
         try:
@@ -277,11 +294,16 @@ class VoxelDemoWindow(pyglet.window.Window):
             f"{status} | Backend: {self.backend_label} | Refresh: {refresh_hz:.1f} Hz | Draw: {self.draw_fps:.1f} FPS\n"
             f"World: {self.world.world_width}x{self.world.world_height} | Active: {self.world.active_width}x{self.world.active_height} | Viewport: {self.world.viewport_width}x{self.world.viewport_height}\n"
             f"Camera: ({self.world.camera_x}, {self.world.camera_y}) | Window Origin: ({self.world.active_origin_x}, {self.world.active_origin_y}) | Window: {self.width}x{self.height}\n"
+            f"Paging: count={self.world.paging_stats.shift_count} avg={self.world.shift_time_average_ms():.2f}ms last={self.world.shift_time_last_ms():.2f}ms max={self.world.shift_time_max_ms():.2f}ms pending={self.world.pending_writeback_count} pressure={self.world.pending_writeback_pressure_count}\n"
+            f"Paging Stages: evict={self.world.stage_time_last_ms():.2f}ms overlap={self.world.overlap_copy_time_last_ms():.2f}ms overlapFx={self.world.overlap_transient_copy_time_last_ms():.2f}ms incoming={self.world.incoming_load_time_last_ms():.2f}ms clearFx={self.world.incoming_transient_clear_time_last_ms():.2f}ms anchorBuild={self.world.anchor_build_time_last_ms():.2f}ms anchorUpload={self.world.anchor_upload_time_last_ms():.2f}ms\n"
+            f"Frame Stages: camera={self.last_camera_stage_ms:.2f}ms step={self.last_step_stage_ms:.2f}ms io={self.last_background_io_stage_ms:.2f}ms upload={self.last_upload_stage_ms:.2f}ms tick={self.last_tick_total_ms:.2f}ms tickMax={self.max_tick_total_ms:.2f}ms draw={self.last_draw_stage_ms:.2f}ms drawMax={self.max_draw_stage_ms:.2f}ms\n"
+            f"Background IO: interval={BACKGROUND_IO_SERVICE_INTERVAL_SECONDS:.1f}s accumulator={self._background_io_accumulator_seconds:.2f}s\n"
+            f"Camera Motion: speed={self.camera_speed_cells_per_second:.0f} cells/s lastPan={self.last_camera_pan_cells} cells\n"
             f"View: {self.view_mode.value.title()} | Substeps: {self.steps_per_tick} | Brush: {self.brush_radius} | Tool: {tool.label}\n"
             f"Liquid Brownian: {'On' if self.liquid_brownian_enabled else 'Off'}\n"
             f"Blocked Impulse: {'On' if self.blocked_impulse_enabled else 'Off'}\n"
             f"Directional Fallback: {'On' if self.directional_fallback_enabled else 'Off'} (<= {self.directional_fallback_angle_limit_degrees:.0f} deg)\n"
-            "1-9/0 switch tools, [ ] brush size, -/= substeps, T cycle views, B toggle liquid Brownian, I toggle blocked impulse, F toggle directional fallback, WASD or arrows pan camera, Space pause, N single-step, R reset scene, C clear"
+            "1-9/0 switch tools, [ ] brush size, -/= substeps, T cycle views, B toggle liquid Brownian, I toggle blocked impulse, F toggle directional fallback, hold WASD or arrows to move camera, Space pause, N single-step, R reset scene, C clear"
             f"{backend_note}"
         )
 
@@ -311,19 +333,69 @@ class VoxelDemoWindow(pyglet.window.Window):
         self.world.pan_camera(dx, dy)
         self._upload_frame()
 
+    def _set_camera_move_state(self, symbol: int, pressed: bool) -> bool:
+        if symbol in {key.A, key.LEFT}:
+            self._camera_move_left = pressed
+            return True
+        if symbol in {key.D, key.RIGHT}:
+            self._camera_move_right = pressed
+            return True
+        if symbol in {key.W, key.UP}:
+            self._camera_move_up = pressed
+            return True
+        if symbol in {key.S, key.DOWN}:
+            self._camera_move_down = pressed
+            return True
+        return False
+
+    def _tick_camera_motion(self, dt: float) -> bool:
+        assert self.world is not None
+        move_x = int(self._camera_move_right) - int(self._camera_move_left)
+        move_y = int(self._camera_move_down) - int(self._camera_move_up)
+        if move_x == 0 and move_y == 0:
+            self.world.mark_camera_activity(False, dt=dt)
+            self.last_camera_pan_cells = 0
+            return False
+        effective_dt = min(max(0.0, float(dt)), MAX_CAMERA_MOTION_DT_SECONDS)
+        distance = max(1, int(round(self.camera_speed_cells_per_second * effective_dt)))
+        self.last_camera_pan_cells = distance
+        self.world.pan_camera(move_x * distance, move_y * distance)
+        return True
+
     def tick(self, dt: float) -> None:
         assert self.world is not None
+        tick_started_at = perf_counter()
         self.last_tick_dt = dt
+        camera_started_at = perf_counter()
+        self._tick_camera_motion(dt)
+        self.last_camera_stage_ms = (perf_counter() - camera_started_at) * 1000.0
         if not self.paused:
+            step_started_at = perf_counter()
             substep_dt = dt / self.steps_per_tick
             for _ in range(self.steps_per_tick):
                 self.world.step(substep_dt)
-        self.world.service_background_io()
+            self.last_step_stage_ms = (perf_counter() - step_started_at) * 1000.0
+        else:
+            self.last_step_stage_ms = 0.0
+        background_io_started_at = perf_counter()
+        if self.last_camera_pan_cells == 0:
+            self._background_io_accumulator_seconds += dt
+            if self._background_io_accumulator_seconds >= BACKGROUND_IO_SERVICE_INTERVAL_SECONDS:
+                self.world.service_background_io()
+                self._background_io_accumulator_seconds = 0.0
+        else:
+            self._background_io_accumulator_seconds = 0.0
+        self.last_background_io_stage_ms = (perf_counter() - background_io_started_at) * 1000.0
+        upload_started_at = perf_counter()
         self._upload_frame()
+        self.last_upload_stage_ms = (perf_counter() - upload_started_at) * 1000.0
+        self.last_tick_total_ms = (perf_counter() - tick_started_at) * 1000.0
+        self.max_tick_total_ms = max(self.max_tick_total_ms, self.last_tick_total_ms)
         self._refresh_overlay()
 
     def on_draw(self) -> None:
         assert self.texture is not None
+        draw_started_at = perf_counter()
         self._draw_counter += 1
         now = perf_counter()
         elapsed = now - self._draw_sample_started_at
@@ -336,6 +408,8 @@ class VoxelDemoWindow(pyglet.window.Window):
         self.texture.use(location=0)
         self.vao.render(moderngl.TRIANGLE_STRIP)
         self.overlay.draw()
+        self.last_draw_stage_ms = (perf_counter() - draw_started_at) * 1000.0
+        self.max_draw_stage_ms = max(self.max_draw_stage_ms, self.last_draw_stage_ms)
 
     def on_resize(self, width: int, height: int) -> None:
         super().on_resize(width, height)
@@ -365,6 +439,8 @@ class VoxelDemoWindow(pyglet.window.Window):
         del modifiers
         if symbol in TOOLS:
             self.current_tool_key = symbol
+        elif self._set_camera_move_state(symbol, True):
+            pass
         elif symbol == key.SPACE:
             self.paused = not self.paused
         elif symbol == key.N:
@@ -403,18 +479,15 @@ class VoxelDemoWindow(pyglet.window.Window):
             self.brush_radius = max(0, self.brush_radius - 1)
         elif symbol == key.BRACKETRIGHT:
             self.brush_radius = min(8, self.brush_radius + 1)
-        elif symbol in {key.A, key.LEFT}:
-            self._pan_camera(-self.camera_pan_cells, 0)
-        elif symbol in {key.D, key.RIGHT}:
-            self._pan_camera(self.camera_pan_cells, 0)
-        elif symbol in {key.W, key.UP}:
-            self._pan_camera(0, -self.camera_pan_cells)
-        elif symbol in {key.S, key.DOWN}:
-            self._pan_camera(0, self.camera_pan_cells)
         elif symbol == key.ESCAPE:
             self.close()
             return
         self._refresh_overlay()
+
+    def on_key_release(self, symbol: int, modifiers: int) -> None:
+        del modifiers
+        if self._set_camera_move_state(symbol, False):
+            self._refresh_overlay()
 
 
 def run_demo(

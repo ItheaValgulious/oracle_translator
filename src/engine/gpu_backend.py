@@ -6,6 +6,7 @@ import struct
 
 import moderngl
 
+from .atmosphere import default_ambient_air_temperature_for_row
 from .grid import Grid
 from .render import DebugViewMode
 from .support import SUPPORT_FAILURE_THRESHOLD, SUPPORT_SOURCE_VALUE
@@ -185,6 +186,22 @@ class GpuStagedRegion:
     state_int: moderngl.Texture
     state_vec: moderngl.Texture
     state_misc: moderngl.Texture
+    src_origin_x: int = 0
+    src_origin_y: int = 0
+    atlas_kind: str | None = None
+    atlas_slot_index: int = -1
+
+
+@dataclass
+class _GpuStageAtlas:
+    kind: str
+    slot_width: int
+    slot_height: int
+    slot_count: int
+    state_int: moderngl.Texture
+    state_vec: moderngl.Texture
+    state_misc: moderngl.Texture
+    free_slots: list[int]
 
 
 def _pack_cells_state(cells: list[CellState], tables: GpuMaterialTables) -> tuple[bytes, bytes, bytes]:
@@ -1062,7 +1079,26 @@ layout(rgba32f, binding = 5) uniform readonly image2D state_misc_src;
 layout(rgba32i, binding = 6) uniform writeonly iimage2D state_int_dst;
 layout(rgba32f, binding = 7) uniform writeonly image2D state_vec_dst;
 layout(rgba32f, binding = 8) uniform writeonly image2D state_misc_dst;
-layout(r32i, binding = 17) uniform readonly iimage2D external_support_anchor_tex;
+layout(std430, binding = 3) readonly buffer ExternalSupportEdgeBuffer {
+    int external_support_edge_values[];
+};
+
+int external_support_anchor_at(ivec2 coord) {
+    if (coord.y == 0) {
+        return external_support_edge_values[coord.x];
+    }
+    if (coord.y == grid_size.y - 1) {
+        return external_support_edge_values[grid_size.x + coord.x];
+    }
+    int vertical_offset = grid_size.x * 2;
+    if (coord.x == 0) {
+        return external_support_edge_values[vertical_offset + (coord.y - 1)];
+    }
+    if (coord.x == grid_size.x - 1) {
+        return external_support_edge_values[vertical_offset + max(0, grid_size.y - 2) + (coord.y - 1)];
+    }
+    return 0;
+}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -1075,7 +1111,7 @@ void main() {
     vec4 cell_misc = imageLoad(state_misc_src, coord);
     vec4 out_misc = cell_misc;
     int variant_index = cell_int.x;
-    int external_anchor = imageLoad(external_support_anchor_tex, coord).x;
+    int external_anchor = external_support_anchor_at(coord);
 
     int incoming_generation = cell_int.y;
     if ((cell_int.z & CELL_FLAG_FIXPOINT) != 0 || external_anchor != 0) {
@@ -1586,6 +1622,73 @@ void main() {
     ivec2 src_coord = copy_src_origin + local_coord;
     ivec2 dst_coord = copy_dst_origin + local_coord;
     imageStore(dst_tex, dst_coord, imageLoad(src_tex, src_coord));
+}
+"""
+
+
+def _fill_empty_region_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32i, binding = 6) uniform writeonly iimage2D state_int_dst;
+layout(rgba32f, binding = 7) uniform writeonly image2D state_vec_dst;
+layout(rgba32f, binding = 8) uniform writeonly image2D state_misc_dst;
+
+uniform ivec2 fill_dst_origin;
+uniform ivec2 fill_size;
+uniform int fill_world_row_offset;
+uniform int fill_world_height;
+
+float fill_ambient_temperature_for_world_y(int world_y) {
+    if (fill_world_height <= 1) {
+        return base_temperature_for_variant(EMPTY_VARIANT_INDEX);
+    }
+    float normalized_height = clamp(float(world_y) / float(fill_world_height - 1), 0.0, 1.0);
+    return base_temperature_for_variant(EMPTY_VARIANT_INDEX)
+        + (normalized_height - 0.5) * AMBIENT_AIR_STRATIFICATION_DELTA;
+}
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= fill_size.x || local_coord.y >= fill_size.y) {
+        return;
+    }
+    ivec2 dst_coord = fill_dst_origin + local_coord;
+    int world_y = fill_world_row_offset + local_coord.y;
+    imageStore(state_int_dst, dst_coord, empty_cell_int());
+    imageStore(state_vec_dst, dst_coord, empty_cell_vec());
+    imageStore(state_misc_dst, dst_coord, vec4(fill_ambient_temperature_for_world_y(world_y), 0.0, 1.0, 0.0));
+}
+"""
+
+
+def _clear_transient_region_shader_source() -> str:
+    return """
+#version 430
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f, binding = 12) uniform writeonly image2D pressure_tex;
+layout(rg32f, binding = 13) uniform writeonly image2D source_force_tex;
+layout(rg32f, binding = 14) uniform writeonly image2D wave_force_tex;
+
+uniform ivec2 grid_size;
+uniform ivec2 clear_dst_origin;
+uniform ivec2 clear_size;
+uniform float clear_pressure;
+uniform vec2 clear_force;
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= clear_size.x || local_coord.y >= clear_size.y) {
+        return;
+    }
+    ivec2 dst_coord = clear_dst_origin + local_coord;
+    if (dst_coord.x < 0 || dst_coord.y < 0 || dst_coord.x >= grid_size.x || dst_coord.y >= grid_size.y) {
+        return;
+    }
+    imageStore(pressure_tex, dst_coord, vec4(clear_pressure, 0.0, 0.0, 0.0));
+    imageStore(source_force_tex, dst_coord, vec4(clear_force, 0.0, 0.0));
+    imageStore(wave_force_tex, dst_coord, vec4(clear_force, 0.0, 0.0));
 }
 """
 
@@ -2353,11 +2456,15 @@ class GpuSimulator:
         self.pressure_group_x = (self.width + 63) // 64
         self.front_index = 0
         self.pressure_front_index = 0
+        self.source_force_front_index = 0
+        self.wave_force_front_index = 0
         self.step_index = grid.step_id
         self.liquid_brownian_enabled = bool(grid.liquid_brownian_enabled)
         self.blocked_impulse_enabled = bool(grid.blocked_impulse_enabled)
         self.directional_fallback_enabled = bool(grid.directional_fallback_enabled)
         self.directional_fallback_angle_limit_degrees = float(grid.directional_fallback_angle_limit_degrees)
+        self._staged_region_pool: dict[tuple[int, int], list[GpuStagedRegion]] = {}
+        self._stage_atlases: dict[str, _GpuStageAtlas] = {}
 
         self.variant_buffer = self.ctx.buffer(self.tables.variant_buffer_data)
         self.family_buffer = self.ctx.buffer(self.tables.family_buffer_data)
@@ -2365,6 +2472,10 @@ class GpuSimulator:
         self.variant_buffer.bind_to_storage_buffer(0)
         self.family_buffer.bind_to_storage_buffer(1)
         self.phase_buffer.bind_to_storage_buffer(2)
+        self.external_support_edge_buffer = self.ctx.buffer(
+            reserve=max(4, (self.width * 2 + max(0, self.height - 2) * 2) * 4)
+        )
+        self.external_support_edge_buffer.bind_to_storage_buffer(3)
 
         self.state_int = [self._make_texture(4, "i4"), self._make_texture(4, "i4")]
         self.state_vec = [self._make_texture(4, "f4"), self._make_texture(4, "f4")]
@@ -2372,7 +2483,6 @@ class GpuSimulator:
         self.pressure_tex = [self._make_texture(1, "f4"), self._make_texture(1, "f4")]
         self.source_force_tex = [self._make_texture(2, "f4"), self._make_texture(2, "f4")]
         self.wave_force_tex = [self._make_texture(2, "f4"), self._make_texture(2, "f4")]
-        self.external_support_anchor_tex = self._make_texture(1, "i4")
         self.source_force_front_index = 0
         self.wave_force_front_index = 0
         self.motion_plan = self._make_texture(4, "i4")
@@ -2402,6 +2512,8 @@ class GpuSimulator:
         self.collapse_shader = self.ctx.compute_shader(_collapse_shader_source(self.tables))
         self.render_shader = self.ctx.compute_shader(_render_shader_source(self.tables))
         self.paint_shader = self.ctx.compute_shader(_paint_shader_source(self.tables))
+        self.fill_empty_region_shader = self.ctx.compute_shader(_fill_empty_region_shader_source(self.tables))
+        self.clear_transient_region_shader = self.ctx.compute_shader(_clear_transient_region_shader_source())
 
         self._set_common_uniforms(
             self.pressure_shader,
@@ -2419,7 +2531,9 @@ class GpuSimulator:
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.fill_empty_region_shader,
         )
+        _set_uniform_if_present(self.clear_transient_region_shader, "grid_size", (self.width, self.height))
 
         self.load_grid(grid)
         self.render()
@@ -2463,6 +2577,7 @@ class GpuSimulator:
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.fill_empty_region_shader,
         )
 
     def set_blocked_impulse_enabled(self, enabled: bool) -> None:
@@ -2483,6 +2598,7 @@ class GpuSimulator:
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.fill_empty_region_shader,
         )
 
     def set_directional_fallback_enabled(self, enabled: bool) -> None:
@@ -2507,6 +2623,7 @@ class GpuSimulator:
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.fill_empty_region_shader,
         )
 
     def set_directional_fallback_angle_limit_degrees(self, angle_limit_degrees: float) -> None:
@@ -2527,6 +2644,7 @@ class GpuSimulator:
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.fill_empty_region_shader,
         )
 
     def _pressure_bytes(self, value: float = 1.0, *, width: int | None = None, height: int | None = None) -> bytes:
@@ -2539,6 +2657,24 @@ class GpuSimulator:
 
     def _external_anchor_bytes(self, anchors: list[bool]) -> bytes:
         return array("i", [1 if anchor else 0 for anchor in anchors]).tobytes()
+
+    def _external_anchor_clear_bytes(self) -> bytes:
+        return self._external_anchor_bytes([False for _ in range(self.width * self.height)])
+
+    def _external_edge_bytes(self, anchors: list[bool]) -> bytes:
+        if len(anchors) != self.width * self.height:
+            raise ValueError("External support anchor mask size does not match the GPU simulator.")
+        edge_values: list[int] = []
+        edge_values.extend(1 if anchors[x] else 0 for x in range(self.width))
+        if self.height > 1:
+            bottom_offset = (self.height - 1) * self.width
+            edge_values.extend(1 if anchors[bottom_offset + x] else 0 for x in range(self.width))
+        else:
+            edge_values.extend(0 for _ in range(self.width))
+        if self.height > 2:
+            edge_values.extend(1 if anchors[y * self.width] else 0 for y in range(1, self.height - 1))
+            edge_values.extend(1 if anchors[y * self.width + (self.width - 1)] else 0 for y in range(1, self.height - 1))
+        return array("i", edge_values).tobytes()
 
     def _read_texture_region(
         self,
@@ -2561,6 +2697,22 @@ class GpuSimulator:
             )
         finally:
             framebuffer.release()
+
+    def _acquire_stage_atlas(self, kind: str, *, slot_width: int, slot_height: int, slot_count: int = 16) -> _GpuStageAtlas:
+        atlas = self._stage_atlases.get(kind)
+        if atlas is None:
+            atlas = _GpuStageAtlas(
+                kind=kind,
+                slot_width=slot_width,
+                slot_height=slot_height,
+                slot_count=slot_count,
+                state_int=self._make_texture_for_size(slot_width * slot_count, slot_height, 4, "i4"),
+                state_vec=self._make_texture_for_size(slot_width * slot_count, slot_height, 4, "f4"),
+                state_misc=self._make_texture_for_size(slot_width * slot_count, slot_height, 4, "f4"),
+                free_slots=list(reversed(range(slot_count))),
+            )
+            self._stage_atlases[kind] = atlas
+        return atlas
 
     def _run_copy_shader(
         self,
@@ -2604,7 +2756,7 @@ class GpuSimulator:
             self.front_index = dst_index
 
     def _run_support(self, dt: float) -> None:
-        self.external_support_anchor_tex.bind_to_image(17, read=True, write=False)
+        self.external_support_edge_buffer.bind_to_storage_buffer(3)
         self._run_stage(self.support_shader, dt)
 
     def _clear_r32i_texture(self, texture: moderngl.Texture, clear_value: int) -> None:
@@ -2750,18 +2902,95 @@ class GpuSimulator:
     def set_external_support_anchors(self, anchors: list[bool]) -> None:
         if len(anchors) != self.width * self.height:
             raise ValueError("External support anchor mask size does not match the GPU simulator.")
-        self.external_support_anchor_tex.write(self._external_anchor_bytes(anchors))
+        self.external_support_edge_buffer.write(self._external_edge_bytes(anchors))
+
+    def clear_external_support_anchors(self) -> None:
+        self.external_support_edge_buffer.write(
+            array("i", [0 for _ in range(self.width * 2 + max(0, self.height - 2) * 2)]).tobytes()
+        )
+
+    def write_external_support_anchor_region(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        values: list[bool],
+    ) -> None:
+        if width <= 0 or height <= 0:
+            return
+        if len(values) != width * height:
+            raise ValueError("External support anchor region size does not match provided values.")
+        current = array("i")
+        current.frombytes(self.external_support_edge_buffer.read())
+        if x == 0 and y == 0 and width == self.width and height == 1:
+            for index, value in enumerate(values):
+                current[index] = 1 if value else 0
+            self.external_support_edge_buffer.write(current.tobytes())
+            return
+        if x == 0 and y == self.height - 1 and width == self.width and height == 1:
+            base = self.width
+            for index, value in enumerate(values):
+                current[base + index] = 1 if value else 0
+            self.external_support_edge_buffer.write(current.tobytes())
+            return
+        if width == 1 and x == 0 and y >= 1 and y + height <= self.height - 1:
+            base = self.width * 2 + (y - 1)
+            for index, value in enumerate(values):
+                current[base + index] = 1 if value else 0
+            self.external_support_edge_buffer.write(current.tobytes())
+            return
+        if width == 1 and x == self.width - 1 and y >= 1 and y + height <= self.height - 1:
+            base = self.width * 2 + max(0, self.height - 2) + (y - 1)
+            for index, value in enumerate(values):
+                current[base + index] = 1 if value else 0
+            self.external_support_edge_buffer.write(current.tobytes())
+            return
+        raise ValueError("External support anchor region updates must target a single outer edge.")
+
+    def update_external_support_anchor_regions(self, updates) -> None:
+        del updates
+
+    def fill_empty_region(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        world_row_offset: int,
+        world_height: int,
+        buffer_index: int | None = None,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            return
+        target_index = self.front_index if buffer_index is None else buffer_index
+        self.state_int[target_index].bind_to_image(6, read=False, write=True)
+        self.state_vec[target_index].bind_to_image(7, read=False, write=True)
+        self.state_misc[target_index].bind_to_image(8, read=False, write=True)
+        _set_uniform_if_present(self.fill_empty_region_shader, "dt", 0.0)
+        _set_uniform_if_present(self.fill_empty_region_shader, "step_index", self.step_index)
+        self.fill_empty_region_shader["fill_dst_origin"].value = (x, y)
+        self.fill_empty_region_shader["fill_size"].value = (width, height)
+        self.fill_empty_region_shader["fill_world_row_offset"].value = int(world_row_offset)
+        self.fill_empty_region_shader["fill_world_height"].value = int(world_height)
+        group_x, group_y = _dispatch_groups(width, height)
+        self.fill_empty_region_shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
 
     def clear_region_transients(self, x: int, y: int, width: int, height: int) -> None:
-        viewport = (x, y, width, height)
-        pressure_bytes = self._pressure_bytes(width=width, height=height)
-        for texture in self.pressure_tex:
-            texture.write(pressure_bytes, viewport=viewport)
-        force_bytes = self._force_bytes(width=width, height=height)
-        for texture in self.source_force_tex:
-            texture.write(force_bytes, viewport=viewport)
-        for texture in self.wave_force_tex:
-            texture.write(force_bytes, viewport=viewport)
+        if width <= 0 or height <= 0:
+            return
+        self.pressure_tex[1 - self.pressure_front_index].bind_to_image(12, read=False, write=True)
+        self.source_force_tex[self.source_force_front_index].bind_to_image(13, read=False, write=True)
+        self.wave_force_tex[self.wave_force_front_index].bind_to_image(14, read=False, write=True)
+        self.clear_transient_region_shader["clear_dst_origin"].value = (x, y)
+        self.clear_transient_region_shader["clear_size"].value = (width, height)
+        self.clear_transient_region_shader["clear_pressure"].value = 1.0
+        self.clear_transient_region_shader["clear_force"].value = (0.0, 0.0)
+        group_x, group_y = _dispatch_groups(width, height)
+        self.clear_transient_region_shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
 
     def read_region(self, x: int, y: int, width: int, height: int):
         from .world import GridSlice
@@ -2799,10 +3028,106 @@ class GpuSimulator:
     def write_region(self, x: int, y: int, region, *, buffer_index: int | None = None) -> None:
         target_index = self.front_index if buffer_index is None else buffer_index
         state_int_data, state_vec_data, state_misc_data = _pack_cells_state(region.cells, self.tables)
-        viewport = (x, y, region.width, region.height)
+        self.write_region_bytes(
+            x,
+            y,
+            region.width,
+            region.height,
+            state_int_data,
+            state_vec_data,
+            state_misc_data,
+            buffer_index=target_index,
+        )
+
+    def write_region_bytes(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        state_int_data: bytes,
+        state_vec_data: bytes,
+        state_misc_data: bytes,
+        *,
+        buffer_index: int | None = None,
+    ) -> None:
+        target_index = self.front_index if buffer_index is None else buffer_index
+        viewport = (x, y, width, height)
         self.state_int[target_index].write(state_int_data, viewport=viewport)
         self.state_vec[target_index].write(state_vec_data, viewport=viewport)
         self.state_misc[target_index].write(state_misc_data, viewport=viewport)
+
+    def write_store_rect(
+        self,
+        store,
+        *,
+        world_x: int,
+        world_y: int,
+        width: int,
+        height: int,
+        dst_x: int,
+        dst_y: int,
+        buffer_index: int | None = None,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            return
+
+        cell_count = width * height
+        state_int = array("i", [self.tables.empty_variant_index, 0, int(CellFlag.NONE), 0]) * cell_count
+        state_vec = array("f", [0.0]) * (cell_count * 4)
+        state_misc = array("f")
+        for local_y in range(height):
+            cell_y = world_y + local_y
+            ambient = 20.0
+            if 0 <= cell_y < store.height:
+                ambient = default_ambient_air_temperature_for_row(store.height, cell_y)
+            state_misc.extend(array("f", [ambient, 0.0, 1.0, 0.0]) * width)
+
+        rect_right = world_x + width
+        rect_bottom = world_y + height
+        chunk_min_x = max(0, world_x) // store.chunk_size
+        chunk_max_x = max(0, rect_right - 1) // store.chunk_size
+        chunk_min_y = max(0, world_y) // store.chunk_size
+        chunk_max_y = max(0, rect_bottom - 1) // store.chunk_size
+        for chunk_y in range(chunk_min_y, chunk_max_y + 1):
+            for chunk_x in range(chunk_min_x, chunk_max_x + 1):
+                chunk = store._chunk(chunk_x, chunk_y, create=False)  # noqa: SLF001
+                if chunk is None or not chunk.cells:
+                    continue
+                chunk_world_x = chunk_x * store.chunk_size
+                chunk_world_y = chunk_y * store.chunk_size
+                for local_index, cell in chunk.cells.items():
+                    cell_local_x = local_index % store.chunk_size
+                    cell_local_y = local_index // store.chunk_size
+                    cell_world_x = chunk_world_x + cell_local_x
+                    cell_world_y = chunk_world_y + cell_local_y
+                    if not (world_x <= cell_world_x < rect_right and world_y <= cell_world_y < rect_bottom):
+                        continue
+                    rect_index = (cell_world_y - world_y) * width + (cell_world_x - world_x)
+                    int_offset = rect_index * 4
+                    state_int[int_offset] = self.tables.variant_index_by_key[(cell.family_id, cell.variant_id)]
+                    state_int[int_offset + 1] = cell.generation
+                    state_int[int_offset + 2] = int(cell.flags)
+                    vec_offset = rect_index * 4
+                    state_vec[vec_offset] = cell.vel_x
+                    state_vec[vec_offset + 1] = cell.vel_y
+                    state_vec[vec_offset + 2] = cell.blocked_x
+                    state_vec[vec_offset + 3] = cell.blocked_y
+                    state_misc[vec_offset] = cell.temperature
+                    state_misc[vec_offset + 1] = cell.support_value
+                    state_misc[vec_offset + 2] = cell.integrity
+                    state_misc[vec_offset + 3] = cell.age
+
+        self.write_region_bytes(
+            dst_x,
+            dst_y,
+            width,
+            height,
+            state_int.tobytes(),
+            state_vec.tobytes(),
+            state_misc.tobytes(),
+            buffer_index=buffer_index,
+        )
 
     def copy_region(
         self,
@@ -2899,13 +3224,41 @@ class GpuSimulator:
         self.wave_force_front_index = 1 - self.wave_force_front_index
 
     def stage_region(self, x: int, y: int, width: int, height: int) -> GpuStagedRegion:
-        staged = GpuStagedRegion(
-            width=width,
-            height=height,
-            state_int=self._make_texture_for_size(width, height, 4, "i4"),
-            state_vec=self._make_texture_for_size(width, height, 4, "f4"),
-            state_misc=self._make_texture_for_size(width, height, 4, "f4"),
-        )
+        stage_kind: str | None = None
+        atlas: _GpuStageAtlas | None = None
+        if width <= 64 and height == self.height:
+            stage_kind = f"vertical_strip:{width}x{height}"
+            atlas = self._acquire_stage_atlas(stage_kind, slot_width=width, slot_height=height)
+        elif height <= 64 and width == self.width:
+            stage_kind = f"horizontal_strip:{width}x{height}"
+            atlas = self._acquire_stage_atlas(stage_kind, slot_width=width, slot_height=height)
+
+        if atlas is not None and atlas.free_slots:
+            slot_index = atlas.free_slots.pop()
+            staged = GpuStagedRegion(
+                width=width,
+                height=height,
+                state_int=atlas.state_int,
+                state_vec=atlas.state_vec,
+                state_misc=atlas.state_misc,
+                src_origin_x=slot_index * atlas.slot_width,
+                src_origin_y=0,
+                atlas_kind=atlas.kind,
+                atlas_slot_index=slot_index,
+            )
+        else:
+            pool_key = (width, height)
+            pooled = self._staged_region_pool.get(pool_key)
+            if pooled:
+                staged = pooled.pop()
+            else:
+                staged = GpuStagedRegion(
+                    width=width,
+                    height=height,
+                    state_int=self._make_texture_for_size(width, height, 4, "i4"),
+                    state_vec=self._make_texture_for_size(width, height, 4, "f4"),
+                    state_misc=self._make_texture_for_size(width, height, 4, "f4"),
+                )
         self._run_copy_shader(
             self.copy_rgba32i_shader,
             self.state_int[self.front_index],
@@ -2914,8 +3267,8 @@ class GpuSimulator:
             src_y=y,
             width=width,
             height=height,
-            dst_x=0,
-            dst_y=0,
+            dst_x=staged.src_origin_x,
+            dst_y=staged.src_origin_y,
         )
         self._run_copy_shader(
             self.copy_rgba32f_shader,
@@ -2925,8 +3278,8 @@ class GpuSimulator:
             src_y=y,
             width=width,
             height=height,
-            dst_x=0,
-            dst_y=0,
+            dst_x=staged.src_origin_x,
+            dst_y=staged.src_origin_y,
         )
         self._run_copy_shader(
             self.copy_rgba32f_shader,
@@ -2936,8 +3289,8 @@ class GpuSimulator:
             src_y=y,
             width=width,
             height=height,
-            dst_x=0,
-            dst_y=0,
+            dst_x=staged.src_origin_x,
+            dst_y=staged.src_origin_y,
         )
         return staged
 
@@ -2958,8 +3311,8 @@ class GpuSimulator:
             self.copy_rgba32i_shader,
             staged.state_int,
             self.state_int[target_index],
-            src_x=src_x,
-            src_y=src_y,
+            src_x=staged.src_origin_x + src_x,
+            src_y=staged.src_origin_y + src_y,
             width=width,
             height=height,
             dst_x=dst_x,
@@ -2969,8 +3322,8 @@ class GpuSimulator:
             self.copy_rgba32f_shader,
             staged.state_vec,
             self.state_vec[target_index],
-            src_x=src_x,
-            src_y=src_y,
+            src_x=staged.src_origin_x + src_x,
+            src_y=staged.src_origin_y + src_y,
             width=width,
             height=height,
             dst_x=dst_x,
@@ -2980,51 +3333,68 @@ class GpuSimulator:
             self.copy_rgba32f_shader,
             staged.state_misc,
             self.state_misc[target_index],
-            src_x=src_x,
-            src_y=src_y,
+            src_x=staged.src_origin_x + src_x,
+            src_y=staged.src_origin_y + src_y,
             width=width,
             height=height,
             dst_x=dst_x,
             dst_y=dst_y,
         )
 
-    def read_staged_region(self, staged: GpuStagedRegion):
+    def read_staged_region(
+        self,
+        staged: GpuStagedRegion,
+        *,
+        x: int = 0,
+        y: int = 0,
+        width: int | None = None,
+        height: int | None = None,
+    ):
         from .world import GridSlice
 
+        read_width = staged.width - x if width is None else width
+        read_height = staged.height - y if height is None else height
+        if x < 0 or y < 0 or read_width <= 0 or read_height <= 0:
+            raise ValueError("Staged region read must be within bounds.")
+        if x + read_width > staged.width or y + read_height > staged.height:
+            raise ValueError("Staged region read exceeds staged bounds.")
         state_int_data = self._read_texture_region(
             staged.state_int,
-            0,
-            0,
-            staged.width,
-            staged.height,
+            staged.src_origin_x + x,
+            staged.src_origin_y + y,
+            read_width,
+            read_height,
             components=4,
             dtype="i4",
         )
         state_vec_data = self._read_texture_region(
             staged.state_vec,
-            0,
-            0,
-            staged.width,
-            staged.height,
+            staged.src_origin_x + x,
+            staged.src_origin_y + y,
+            read_width,
+            read_height,
             components=4,
             dtype="f4",
         )
         state_misc_data = self._read_texture_region(
             staged.state_misc,
-            0,
-            0,
-            staged.width,
-            staged.height,
+            staged.src_origin_x + x,
+            staged.src_origin_y + y,
+            read_width,
+            read_height,
             components=4,
             dtype="f4",
         )
         cells = _unpack_cells_state(self.tables, state_int_data, state_vec_data, state_misc_data)
-        return GridSlice(width=staged.width, height=staged.height, cells=cells)
+        return GridSlice(width=read_width, height=read_height, cells=cells)
 
     def release_staged_region(self, staged: GpuStagedRegion) -> None:
-        staged.state_int.release()
-        staged.state_vec.release()
-        staged.state_misc.release()
+        if staged.atlas_kind is not None:
+            atlas = self._stage_atlases.get(staged.atlas_kind)
+            if atlas is not None and staged.atlas_slot_index >= 0:
+                atlas.free_slots.append(staged.atlas_slot_index)
+            return
+        self._staged_region_pool.setdefault((staged.width, staged.height), []).append(staged)
 
     def step(self, dt: float) -> None:
         self._run_support(dt)

@@ -61,6 +61,7 @@
 - demo 可显示材质视图与温度视图
 - 温度视图现在在室温附近使用更高对比的调色带,弱环境梯度也能直接看出来
 - demo 支持每帧多次模拟子步进
+- demo 相机现在支持按住 `W/A/S/D` 或方向键连续移动,不再是按一下跳一段
 - 支撑信号可沿连通承重网络逐帧一格、无距离衰减地向远处传播
 - 热量可通过空气和固体一起扩散
 - 热空气现在除了导热,还会作为空气格在空域内发生更强的温度相关布朗运动与上浮
@@ -82,6 +83,18 @@
 - 主 `motion` 当前会先让非气态物质完成交换,再让空气/气体完成交换,减少空气抢先占掉本该让沙子落入的空格
 - 气体支持逐步随机漂移扩散
 - 酸液可在成功腐蚀后自耗
+- 大世界活动窗当前会更早、更小步地分页平移,以减少单次切页卡顿
+- GPU 路径下被逐出活动窗的区域当前会先留在 staging 队列里,只有相机空闲一小段时间后才逐步回写 world store
+- GPU staging 区写回 `WorldChunkStore` 时,当前直接把 region 内仍有支撑的承重格作为冻结区锚定快照一并写回,不再在 flush 当帧对整张世界做全图 `recompute_anchored_support`
+- `WorldChunkStore.rect_has_stored_cells()` 当前只会在矩形内真实命中已存储 cell 时才返回 true,不会因为同 chunk 其他位置有内容就误把整条 incoming strip 判成非空
+- 新暴露条带如果对应的是空世界默认区,当前会直接在 GPU 上按 world row 环境温度填成默认 `empty`
+- 新暴露条带如果确实命中已存储 cell,当前会直接把 world store 的 chunk 稀疏内容打包成 GPU state bytes 写入 incoming strip,不再先走完整 `read_rect + GridSlice(CellState) + pack + write_region` 慢链
+- 冻结区外部支撑锚点当前只重建活动窗四条边,并压成 compact edge buffer 供 support shader 读取,切页时不再上传整张 anchor 纹理
+- incoming 条带的 transient 清理当前改成 GPU region clear,只清下一步真正会被读取的 transient 纹理,不再对整组六张 transient texture 做 CPU 侧分块上传
+- GPU staging region 当前除了普通尺寸分桶复用,还会优先把常见横向/纵向窄条带放进固定 atlas 槽位,减少切页时的 staging 分配和释放尖刺
+- 停止移动后的 GPU staging writeback 当前会按小 slice 分多次 readback + write_rect,而不是一口气 flush 整条 strip
+- demo 相机当前会限制单帧用于移动的有效 `dt`,避免掉帧后单帧位移暴涨,进一步触发连续多次分页
+- demo overlay 当前会额外显示分页次数、最近/最大切页耗时、pending writeback 压力和分页分阶段耗时,便于直接观察分块流送性能
 
 当前仍不做：
 

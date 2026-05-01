@@ -21,13 +21,13 @@ def _positive_int(value: str) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the voxel engine desktop demo.")
-    parser.add_argument("--grid-width", type=_positive_int, default=1280, help="Viewport width in cells.")
-    parser.add_argument("--grid-height", type=_positive_int, default=760, help="Viewport height in cells.")
+    parser.add_argument("--grid-width", type=_positive_int, default=640, help="Viewport width in cells.")
+    parser.add_argument("--grid-height", type=_positive_int, default=380, help="Viewport height in cells.")
     parser.add_argument("--world-width", type=_positive_int, help="Finite world width in cells. Defaults to a value larger than the viewport.")
     parser.add_argument("--world-height", type=_positive_int, help="Finite world height in cells. Defaults to a value larger than the viewport.")
-    parser.add_argument("--halo-cells", type=_positive_int, default=64, help="Extra simulated cells kept around the viewport on each side.")
-    parser.add_argument("--page-shift-cells", type=_positive_int, default=64, help="How far the active simulation window moves when the camera nears its safety band.")
-    parser.add_argument("--cell-scale", type=_positive_int, default=1, help="Default pixels per cell when window size is not given.")
+    parser.add_argument("--halo-cells", type=_positive_int, default=32, help="Extra simulated cells kept around the viewport on each side.")
+    parser.add_argument("--page-shift-cells", type=_positive_int, default=32, help="How far the active simulation window moves when the camera nears its safety band.")
+    parser.add_argument("--cell-scale", type=_positive_int, default=4, help="Default pixels per cell when window size is not given.")
     parser.add_argument("--window-width", type=_positive_int, help="Initial window width in pixels.")
     parser.add_argument("--window-height", type=_positive_int, help="Initial window height in pixels.")
     parser.add_argument("--substeps", type=_positive_int, default=1, help="Simulation substeps executed for each scheduled frame.")

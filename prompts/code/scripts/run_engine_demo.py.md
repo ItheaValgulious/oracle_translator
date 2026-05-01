@@ -24,7 +24,7 @@
 - 把 `src` 加入 `sys.path`
 - 启动 `pyglet + ModernGL` 体素 demo
 - demo 默认优先使用 GPU compute backend,不可用时自动回退 CPU reference
-- CLI 默认 viewport 当前仍以单像素大世界目标为准,默认 `1280x760`,默认 `cell_scale=1`
+- CLI 默认 viewport 当前改为 `640x380`,默认 `halo_cells=32`,默认 `page_shift_cells=32`,默认 `cell_scale=4`
 - 允许通过命令行参数配置:
   - viewport 尺寸
   - finite world 尺寸

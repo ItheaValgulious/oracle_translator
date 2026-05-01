@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 from .atmosphere import default_ambient_air_temperature_for_row
@@ -15,9 +16,13 @@ if TYPE_CHECKING:
 
 
 DEFAULT_WORLD_CHUNK_SIZE = 320
-DEFAULT_HALO_CELLS = 64
-DEFAULT_PAGE_SHIFT_CELLS = 64
-DEFAULT_SAFETY_MARGIN_CELLS = 32
+DEFAULT_HALO_CELLS = 32
+DEFAULT_PAGE_SHIFT_CELLS = 16
+DEFAULT_SAFETY_MARGIN_CELLS = 16
+DEFAULT_IDLE_FLUSH_COOLDOWN_SECONDS = 0.2
+DEFAULT_IDLE_FLUSH_SERVICE_INTERVAL_SECONDS = 300.0
+DEFAULT_PENDING_WRITEBACK_LIMIT = 256
+DEFAULT_GPU_WRITEBACK_SLICE_CELL_BUDGET = 64
 
 NEIGHBORS_8 = (
     (-1, -1),
@@ -94,6 +99,39 @@ class _WorldChunk:
 class _PendingGpuWriteback:
     rect: WorldRect
     staged_region: object
+    snapshot_region: GridSlice | None = None
+    major_axis_offset: int = 0
+
+
+@dataclass
+class PagingStats:
+    shift_count: int = 0
+    total_shift_seconds: float = 0.0
+    last_shift_seconds: float = 0.0
+    max_shift_seconds: float = 0.0
+    last_evict_stage_seconds: float = 0.0
+    last_overlap_copy_seconds: float = 0.0
+    last_overlap_transient_copy_seconds: float = 0.0
+    last_incoming_load_seconds: float = 0.0
+    last_incoming_transient_clear_seconds: float = 0.0
+    last_anchor_build_seconds: float = 0.0
+    last_anchor_upload_seconds: float = 0.0
+    max_evict_stage_seconds: float = 0.0
+    max_overlap_copy_seconds: float = 0.0
+    max_overlap_transient_copy_seconds: float = 0.0
+    max_incoming_load_seconds: float = 0.0
+    max_incoming_transient_clear_seconds: float = 0.0
+    max_anchor_build_seconds: float = 0.0
+    max_anchor_upload_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class _AnchorRegionUpdate:
+    local_x: int
+    local_y: int
+    width: int
+    height: int
+    values: list[bool]
 
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
@@ -148,6 +186,20 @@ def _write_grid_region(grid: Grid, x: int, y: int, region: GridSlice) -> None:
     for local_y in range(region.height):
         for local_x in range(region.width):
             grid.set_cell(x + local_x, y + local_y, region.get_cell(local_x, local_y).copy())
+
+
+def _slice_grid_region(region: GridSlice, x: int, y: int, width: int, height: int) -> GridSlice:
+    cells = [
+        region.get_cell(x + local_x, y + local_y).copy()
+        for local_y in range(height)
+        for local_x in range(width)
+    ]
+    anchors = [
+        bool(region.anchored_support_mask[region.index(x + local_x, y + local_y)])
+        for local_y in range(height)
+        for local_x in range(width)
+    ]
+    return GridSlice(width=width, height=height, cells=cells, anchored_support_mask=anchors)
 
 
 def _rect_difference(rect: WorldRect, overlap: WorldRect | None) -> list[WorldRect]:
@@ -232,43 +284,143 @@ class WorldChunkStore:
             return False
         return self._chunk_local_index(x, y) in chunk.anchored_support_indices
 
+    def _chunk_rect_local_bounds(self, rect: WorldRect, chunk_x: int, chunk_y: int) -> tuple[int, int, int, int] | None:
+        chunk_world_x = chunk_x * self.chunk_size
+        chunk_world_y = chunk_y * self.chunk_size
+        local_x0 = max(0, rect.x - chunk_world_x)
+        local_y0 = max(0, rect.y - chunk_world_y)
+        local_x1 = min(self.chunk_size, rect.right - chunk_world_x)
+        local_y1 = min(self.chunk_size, rect.bottom - chunk_world_y)
+        if local_x1 <= local_x0 or local_y1 <= local_y0:
+            return None
+        return (local_x0, local_y0, local_x1, local_y1)
+
+    def rect_has_stored_cells(self, rect: WorldRect) -> bool:
+        clipped = rect.intersection(WorldRect(0, 0, self.width, self.height))
+        if clipped is None:
+            return False
+        chunk_min_x = clipped.x // self.chunk_size
+        chunk_max_x = (clipped.right - 1) // self.chunk_size
+        chunk_min_y = clipped.y // self.chunk_size
+        chunk_max_y = (clipped.bottom - 1) // self.chunk_size
+        for chunk_y in range(chunk_min_y, chunk_max_y + 1):
+            for chunk_x in range(chunk_min_x, chunk_max_x + 1):
+                chunk = self._chunk(chunk_x, chunk_y, create=False)
+                if chunk is None or not chunk.cells:
+                    continue
+                local_bounds = self._chunk_rect_local_bounds(clipped, chunk_x, chunk_y)
+                if local_bounds is None:
+                    continue
+                local_x0, local_y0, local_x1, local_y1 = local_bounds
+                for local_index in chunk.cells:
+                    cell_local_x = local_index % self.chunk_size
+                    cell_local_y = local_index // self.chunk_size
+                    if local_x0 <= cell_local_x < local_x1 and local_y0 <= cell_local_y < local_y1:
+                        return True
+        return False
+
     def read_rect(self, world_x: int, world_y: int, width: int, height: int) -> GridSlice:
         cells: list[CellState] = []
-        anchors: list[bool] = []
-        for y in range(height):
-            for x in range(width):
-                cell_x = world_x + x
-                cell_y = world_y + y
-                if self.in_bounds(cell_x, cell_y):
-                    cell_ref = self._cell_ref(cell_x, cell_y)
-                    cells.append(cell_ref.copy() if cell_ref is not None else _default_world_cell(self.height, cell_y))
-                    chunk = self._chunk(*self._chunk_coord(cell_x, cell_y), create=False)
-                    local_index = self._chunk_local_index(cell_x, cell_y)
-                    anchors.append(bool(chunk is not None and local_index in chunk.anchored_support_indices))
-                else:
-                    cells.append(CellState())
-                    anchors.append(False)
+        anchors = [False for _ in range(width * height)]
+        rect = WorldRect(world_x, world_y, width, height)
+        clipped = rect.intersection(WorldRect(0, 0, self.width, self.height))
+
+        for local_y in range(height):
+            cell_y = world_y + local_y
+            if 0 <= cell_y < self.height:
+                ambient = default_ambient_air_temperature_for_row(self.height, cell_y)
+                cells.extend(CellState(temperature=ambient) for _ in range(width))
+            else:
+                cells.extend(CellState() for _ in range(width))
+
+        if clipped is None:
+            return GridSlice(width=width, height=height, cells=cells, anchored_support_mask=anchors)
+
+        chunk_min_x = clipped.x // self.chunk_size
+        chunk_max_x = (clipped.right - 1) // self.chunk_size
+        chunk_min_y = clipped.y // self.chunk_size
+        chunk_max_y = (clipped.bottom - 1) // self.chunk_size
+        for chunk_y in range(chunk_min_y, chunk_max_y + 1):
+            for chunk_x in range(chunk_min_x, chunk_max_x + 1):
+                chunk = self._chunk(chunk_x, chunk_y, create=False)
+                if chunk is None or (not chunk.cells and not chunk.anchored_support_indices):
+                    continue
+                local_bounds = self._chunk_rect_local_bounds(clipped, chunk_x, chunk_y)
+                if local_bounds is None:
+                    continue
+                local_x0, local_y0, local_x1, local_y1 = local_bounds
+                chunk_world_x = chunk_x * self.chunk_size
+                chunk_world_y = chunk_y * self.chunk_size
+
+                if chunk.cells:
+                    for local_index, cell in chunk.cells.items():
+                        cell_local_x = local_index % self.chunk_size
+                        cell_local_y = local_index // self.chunk_size
+                        if not (local_x0 <= cell_local_x < local_x1 and local_y0 <= cell_local_y < local_y1):
+                            continue
+                        rect_local_x = chunk_world_x + cell_local_x - world_x
+                        rect_local_y = chunk_world_y + cell_local_y - world_y
+                        cells[rect_local_y * width + rect_local_x] = cell.copy()
+
+                if chunk.anchored_support_indices:
+                    for local_index in chunk.anchored_support_indices:
+                        cell_local_x = local_index % self.chunk_size
+                        cell_local_y = local_index // self.chunk_size
+                        if not (local_x0 <= cell_local_x < local_x1 and local_y0 <= cell_local_y < local_y1):
+                            continue
+                        rect_local_x = chunk_world_x + cell_local_x - world_x
+                        rect_local_y = chunk_world_y + cell_local_y - world_y
+                        anchors[rect_local_y * width + rect_local_x] = True
+
         return GridSlice(width=width, height=height, cells=cells, anchored_support_mask=anchors)
 
     def write_rect(self, world_x: int, world_y: int, region: GridSlice) -> None:
-        for y in range(region.height):
-            for x in range(region.width):
-                target_x = world_x + x
-                target_y = world_y + y
-                if not self.in_bounds(target_x, target_y):
-                    continue
-                cell = region.get_cell(x, y)
-                chunk_x, chunk_y = self._chunk_coord(target_x, target_y)
-                chunk = self._chunk(chunk_x, chunk_y, create=True)
-                assert chunk is not None
-                local_index = self._chunk_local_index(target_x, target_y)
-                if _is_default_empty_cell(cell, self.height, target_y):
-                    chunk.cells.pop(local_index, None)
-                    chunk.anchored_support_indices.discard(local_index)
-                    if not chunk.cells and not chunk.anchored_support_indices:
-                        self._chunks.pop((chunk_x, chunk_y), None)
-                    continue
-                chunk.cells[local_index] = cell.copy()
+        rect = WorldRect(world_x, world_y, region.width, region.height)
+        clipped = rect.intersection(WorldRect(0, 0, self.width, self.height))
+        if clipped is None:
+            return
+
+        for target_y in range(clipped.y, clipped.bottom):
+            region_y = target_y - world_y
+            chunk_y = target_y // self.chunk_size
+            chunk_local_y = target_y % self.chunk_size
+            target_x = clipped.x
+            region_x = clipped.x - world_x
+            row_offset = region_y * region.width
+
+            while target_x < clipped.right:
+                chunk_x = target_x // self.chunk_size
+                chunk_world_x = chunk_x * self.chunk_size
+                segment_right = min(clipped.right, chunk_world_x + self.chunk_size)
+                chunk = self._chunk(chunk_x, chunk_y, create=False)
+                local_x_start = target_x - chunk_world_x
+                base_local_index = chunk_local_y * self.chunk_size + local_x_start
+                segment_width = segment_right - target_x
+
+                for delta_x in range(segment_width):
+                    index = row_offset + region_x + delta_x
+                    local_index = base_local_index + delta_x
+                    cell = region.cells[index]
+                    if _is_default_empty_cell(cell, self.height, target_y):
+                        if chunk is None:
+                            continue
+                        chunk.cells.pop(local_index, None)
+                        chunk.anchored_support_indices.discard(local_index)
+                        continue
+                    if chunk is None:
+                        chunk = self._chunk(chunk_x, chunk_y, create=True)
+                        assert chunk is not None
+                    chunk.cells[local_index] = cell.copy()
+                    if region.anchored_support_mask[index]:
+                        chunk.anchored_support_indices.add(local_index)
+                    else:
+                        chunk.anchored_support_indices.discard(local_index)
+
+                if chunk is not None and not chunk.cells and not chunk.anchored_support_indices:
+                    self._chunks.pop((chunk_x, chunk_y), None)
+
+                target_x = segment_right
+                region_x += segment_width
 
     def recompute_anchored_support(self, registry: MaterialRegistry) -> None:
         support_cells: set[tuple[int, int]] = set()
@@ -337,6 +489,9 @@ class ActiveWorldWindow:
         halo_cells: int = DEFAULT_HALO_CELLS,
         page_shift_cells: int = DEFAULT_PAGE_SHIFT_CELLS,
         safety_margin_cells: int = DEFAULT_SAFETY_MARGIN_CELLS,
+        idle_flush_cooldown_seconds: float = DEFAULT_IDLE_FLUSH_COOLDOWN_SECONDS,
+        idle_flush_service_interval_seconds: float = DEFAULT_IDLE_FLUSH_SERVICE_INTERVAL_SECONDS,
+        pending_writeback_limit: int = DEFAULT_PENDING_WRITEBACK_LIMIT,
         ctx: moderngl.Context | None = None,
         liquid_brownian_enabled: bool = True,
         blocked_impulse_enabled: bool = True,
@@ -356,6 +511,10 @@ class ActiveWorldWindow:
         self.halo_cells = max(0, int(halo_cells))
         self.page_shift_cells = max(1, int(page_shift_cells))
         self.safety_margin_cells = max(0, int(safety_margin_cells))
+        self.idle_flush_cooldown_seconds = max(0.0, float(idle_flush_cooldown_seconds))
+        self.idle_flush_service_interval_seconds = max(0.0, float(idle_flush_service_interval_seconds))
+        self.pending_writeback_limit = max(1, int(pending_writeback_limit))
+        self.pending_writeback_slice_cell_budget = max(64, int(DEFAULT_GPU_WRITEBACK_SLICE_CELL_BUDGET))
         self.active_width = min(store.width, self.viewport_width + self.halo_cells * 2)
         self.active_height = min(store.height, self.viewport_height + self.halo_cells * 2)
         self.camera_x = max(0, (store.width - self.viewport_width) // 2)
@@ -370,6 +529,10 @@ class ActiveWorldWindow:
         self.gpu_simulator = None
         self._pending_gpu_writebacks: list[_PendingGpuWriteback] = []
         self._pending_flush_cooldown_steps = 0
+        self._camera_idle_elapsed_seconds = self.idle_flush_cooldown_seconds
+        self._last_background_io_flush_idle_seconds = 0.0
+        self._camera_recently_moved = False
+        self.paging_stats = PagingStats()
         self._materialize_active_grid_from_store()
         if ctx is not None:
             from .gpu_backend import GpuSimulator
@@ -393,6 +556,14 @@ class ActiveWorldWindow:
     def active_rect(self) -> WorldRect:
         return WorldRect(self.active_origin_x, self.active_origin_y, self.active_width, self.active_height)
 
+    @property
+    def pending_writeback_count(self) -> int:
+        return len(self._pending_gpu_writebacks)
+
+    @property
+    def pending_writeback_pressure_count(self) -> int:
+        return max(0, len(self._pending_gpu_writebacks) - self.pending_writeback_limit)
+
     def _materialize_active_grid_from_store(self) -> None:
         loaded = self.store.read_rect(self.active_origin_x, self.active_origin_y, self.active_width, self.active_height)
         grid = create_grid(self.active_width, self.active_height)
@@ -403,33 +574,220 @@ class ActiveWorldWindow:
         )
         self.active_grid = grid
 
+    def _border_has_external_support_anchor(self, rect: WorldRect, local_x: int, local_y: int) -> bool:
+        world_x = rect.x + local_x
+        world_y = rect.y + local_y
+        for dx, dy in NEIGHBORS_8:
+            neighbor_x = world_x + dx
+            neighbor_y = world_y + dy
+            if rect.x <= neighbor_x < rect.right and rect.y <= neighbor_y < rect.bottom:
+                continue
+            if self.store.has_support_anchor_source(
+                neighbor_x,
+                neighbor_y,
+                support_transmission_keys=self._support_transmission_keys,
+            ):
+                return True
+        return False
+
+    def _neighboring_anchor_positions(self, positions: set[int]) -> set[int]:
+        anchored: set[int] = set()
+        for position in positions:
+            anchored.add(position - 1)
+            anchored.add(position)
+            anchored.add(position + 1)
+        return anchored
+
+    def _top_anchor_row(self, rect: WorldRect) -> list[bool]:
+        if rect.y <= 0:
+            return [False for _ in range(rect.width)]
+        positions: set[int] = set()
+        world_y = rect.y - 1
+        for world_x in range(rect.x - 1, rect.right + 1):
+            if self.store.has_support_anchor_source(
+                world_x,
+                world_y,
+                support_transmission_keys=self._support_transmission_keys,
+            ):
+                positions.add(world_x)
+        neighboring = self._neighboring_anchor_positions(positions)
+        return [rect.x + local_x in neighboring for local_x in range(rect.width)]
+
+    def _bottom_anchor_row(self, rect: WorldRect) -> list[bool]:
+        if rect.bottom >= self.store.height:
+            return [False for _ in range(rect.width)]
+        positions: set[int] = set()
+        world_y = rect.bottom
+        for world_x in range(rect.x - 1, rect.right + 1):
+            if self.store.has_support_anchor_source(
+                world_x,
+                world_y,
+                support_transmission_keys=self._support_transmission_keys,
+            ):
+                positions.add(world_x)
+        neighboring = self._neighboring_anchor_positions(positions)
+        return [rect.x + local_x in neighboring for local_x in range(rect.width)]
+
+    def _left_anchor_column(self, rect: WorldRect) -> list[bool]:
+        if rect.x <= 0:
+            return [False for _ in range(max(0, rect.height - 2))]
+        positions: set[int] = set()
+        world_x = rect.x - 1
+        for world_y in range(rect.y, rect.bottom):
+            if self.store.has_support_anchor_source(
+                world_x,
+                world_y,
+                support_transmission_keys=self._support_transmission_keys,
+            ):
+                positions.add(world_y)
+        if rect.y > 0:
+            corner_y = rect.y - 1
+            for world_x_candidate in (rect.x - 1, rect.x):
+                if self.store.has_support_anchor_source(
+                    world_x_candidate,
+                    corner_y,
+                    support_transmission_keys=self._support_transmission_keys,
+                ):
+                    positions.add(corner_y)
+        if rect.bottom < self.store.height:
+            corner_y = rect.bottom
+            for world_x_candidate in (rect.x - 1, rect.x):
+                if self.store.has_support_anchor_source(
+                    world_x_candidate,
+                    corner_y,
+                    support_transmission_keys=self._support_transmission_keys,
+                ):
+                    positions.add(corner_y)
+        neighboring = self._neighboring_anchor_positions(positions)
+        return [rect.y + local_y in neighboring for local_y in range(1, rect.height - 1)]
+
+    def _right_anchor_column(self, rect: WorldRect) -> list[bool]:
+        if rect.right >= self.store.width:
+            return [False for _ in range(max(0, rect.height - 2))]
+        positions: set[int] = set()
+        world_x = rect.right
+        for world_y in range(rect.y, rect.bottom):
+            if self.store.has_support_anchor_source(
+                world_x,
+                world_y,
+                support_transmission_keys=self._support_transmission_keys,
+            ):
+                positions.add(world_y)
+        if rect.y > 0:
+            corner_y = rect.y - 1
+            for world_x_candidate in (rect.right - 1, rect.right):
+                if self.store.has_support_anchor_source(
+                    world_x_candidate,
+                    corner_y,
+                    support_transmission_keys=self._support_transmission_keys,
+                ):
+                    positions.add(corner_y)
+        if rect.bottom < self.store.height:
+            corner_y = rect.bottom
+            for world_x_candidate in (rect.right - 1, rect.right):
+                if self.store.has_support_anchor_source(
+                    world_x_candidate,
+                    corner_y,
+                    support_transmission_keys=self._support_transmission_keys,
+                ):
+                    positions.add(corner_y)
+        neighboring = self._neighboring_anchor_positions(positions)
+        return [rect.y + local_y in neighboring for local_y in range(1, rect.height - 1)]
+
     def _build_external_support_anchor_mask(self, rect: WorldRect) -> list[bool]:
         anchors = [False for _ in range(rect.width * rect.height)]
-        for local_y in range(rect.height):
-            for local_x in range(rect.width):
-                if local_x not in {0, rect.width - 1} and local_y not in {0, rect.height - 1}:
-                    continue
-                world_x = rect.x + local_x
-                world_y = rect.y + local_y
-                for dx, dy in NEIGHBORS_8:
-                    neighbor_x = world_x + dx
-                    neighbor_y = world_y + dy
-                    if rect.x <= neighbor_x < rect.right and rect.y <= neighbor_y < rect.bottom:
-                        continue
-                    if self.store.has_support_anchor_source(
-                        neighbor_x,
-                        neighbor_y,
-                        support_transmission_keys=self._support_transmission_keys,
-                    ):
-                        anchors[local_y * rect.width + local_x] = True
-                        break
+        if rect.width <= 0 or rect.height <= 0:
+            return anchors
+        top_y = 0
+        bottom_y = rect.height - 1
+        left_x = 0
+        right_x = rect.width - 1
+        for local_x in range(rect.width):
+            anchors[top_y * rect.width + local_x] = self._border_has_external_support_anchor(rect, local_x, top_y)
+            if bottom_y != top_y:
+                anchors[bottom_y * rect.width + local_x] = self._border_has_external_support_anchor(rect, local_x, bottom_y)
+        for local_y in range(1, bottom_y):
+            anchors[local_y * rect.width + left_x] = self._border_has_external_support_anchor(rect, left_x, local_y)
+            if right_x != left_x:
+                anchors[local_y * rect.width + right_x] = self._border_has_external_support_anchor(rect, right_x, local_y)
         return anchors
 
+    def _build_external_support_anchor_updates(self, rect: WorldRect) -> tuple[list[bool], list[_AnchorRegionUpdate]]:
+        anchors = self.active_grid.external_support_anchors
+        expected_size = rect.width * rect.height
+        if len(anchors) != expected_size:
+            anchors = [False for _ in range(expected_size)]
+        updates: list[_AnchorRegionUpdate] = []
+        if rect.width <= 0 or rect.height <= 0:
+            return anchors, updates
+        top_values = self._top_anchor_row(rect)
+        previous_top_values = anchors[: rect.width]
+        anchors[: rect.width] = top_values
+        if top_values != previous_top_values:
+            updates.append(_AnchorRegionUpdate(local_x=0, local_y=0, width=rect.width, height=1, values=top_values))
+        if rect.height > 1:
+            bottom_offset = (rect.height - 1) * rect.width
+            bottom_values = self._bottom_anchor_row(rect)
+            previous_bottom_values = anchors[bottom_offset : bottom_offset + rect.width]
+            anchors[bottom_offset : bottom_offset + rect.width] = bottom_values
+            if bottom_values != previous_bottom_values:
+                updates.append(
+                    _AnchorRegionUpdate(
+                        local_x=0,
+                        local_y=rect.height - 1,
+                        width=rect.width,
+                        height=1,
+                        values=bottom_values,
+                    )
+                )
+        if rect.height > 2:
+            left_values = self._left_anchor_column(rect)
+            previous_left_values = [anchors[local_y * rect.width] for local_y in range(1, rect.height - 1)]
+            for local_y, value in enumerate(left_values, start=1):
+                anchors[local_y * rect.width] = value
+            if left_values != previous_left_values:
+                updates.append(
+                    _AnchorRegionUpdate(
+                        local_x=0,
+                        local_y=1,
+                        width=1,
+                        height=rect.height - 2,
+                        values=left_values,
+                    )
+                )
+            if rect.width > 1:
+                right_values = self._right_anchor_column(rect)
+                previous_right_values = [
+                    anchors[local_y * rect.width + (rect.width - 1)]
+                    for local_y in range(1, rect.height - 1)
+                ]
+                for local_y, value in enumerate(right_values, start=1):
+                    anchors[local_y * rect.width + (rect.width - 1)] = value
+                if right_values != previous_right_values:
+                    updates.append(
+                        _AnchorRegionUpdate(
+                            local_x=rect.width - 1,
+                            local_y=1,
+                            width=1,
+                            height=rect.height - 2,
+                            values=right_values,
+                        )
+                    )
+        return anchors, updates
+
     def _set_external_support_anchors(self) -> None:
-        anchors = self._build_external_support_anchor_mask(self.active_rect)
+        build_started_at = perf_counter()
+        anchors, updates = self._build_external_support_anchor_updates(self.active_rect)
+        build_elapsed = perf_counter() - build_started_at
         self.active_grid.external_support_anchors = anchors
+        upload_started_at = perf_counter()
         if self.gpu_simulator is not None:
             self.gpu_simulator.set_external_support_anchors(anchors)
+        upload_elapsed = perf_counter() - upload_started_at
+        self.paging_stats.last_anchor_build_seconds = build_elapsed
+        self.paging_stats.max_anchor_build_seconds = max(self.paging_stats.max_anchor_build_seconds, build_elapsed)
+        self.paging_stats.last_anchor_upload_seconds = upload_elapsed
+        self.paging_stats.max_anchor_upload_seconds = max(self.paging_stats.max_anchor_upload_seconds, upload_elapsed)
 
     def _pending_overlap(self, rect: WorldRect) -> list[tuple[_PendingGpuWriteback, WorldRect]]:
         overlaps: list[tuple[_PendingGpuWriteback, WorldRect]] = []
@@ -438,6 +796,15 @@ class ActiveWorldWindow:
             if overlap is not None:
                 overlaps.append((pending, overlap))
         return overlaps
+
+    def _capture_frozen_support_snapshot(self, region: GridSlice) -> GridSlice:
+        anchored_mask = [
+            (cell.family_id, cell.variant_id) in self._support_transmission_keys
+            and ((cell.flags & CellFlag.FIXPOINT) != 0 or cell.support_value > 0.0)
+            for cell in region.cells
+        ]
+        region.anchored_support_mask = anchored_mask
+        return region
 
     def _stage_evicted_region(self, rect: WorldRect) -> None:
         if self.gpu_simulator is None:
@@ -453,10 +820,49 @@ class ActiveWorldWindow:
     def _flush_one_pending_gpu_writeback(self) -> bool:
         if self.gpu_simulator is None or not self._pending_gpu_writebacks:
             return False
-        pending = self._pending_gpu_writebacks.pop(0)
-        region = self.gpu_simulator.read_staged_region(pending.staged_region)
-        self.store.write_rect(pending.rect.x, pending.rect.y, region)
-        self.store.recompute_anchored_support(self.registry)
+        pending = self._pending_gpu_writebacks[0]
+        flush_along_y = pending.rect.height >= pending.rect.width
+        if flush_along_y:
+            slice_width = pending.rect.width
+            slice_height = min(
+                pending.rect.height - pending.major_axis_offset,
+                1,
+            )
+            src_x = 0
+            src_y = pending.major_axis_offset
+            world_x = pending.rect.x
+            world_y = pending.rect.y + pending.major_axis_offset
+            pending.major_axis_offset += slice_height
+            flush_complete = pending.major_axis_offset >= pending.rect.height
+        else:
+            slice_width = min(
+                pending.rect.width - pending.major_axis_offset,
+                1,
+            )
+            slice_height = pending.rect.height
+            src_x = pending.major_axis_offset
+            src_y = 0
+            world_x = pending.rect.x + pending.major_axis_offset
+            world_y = pending.rect.y
+            pending.major_axis_offset += slice_width
+            flush_complete = pending.major_axis_offset >= pending.rect.width
+
+        if pending.snapshot_region is None:
+            region = self._capture_frozen_support_snapshot(
+                self.gpu_simulator.read_staged_region(
+                    pending.staged_region,
+                    x=src_x,
+                    y=src_y,
+                    width=slice_width,
+                    height=slice_height,
+                )
+            )
+        else:
+            region = _slice_grid_region(pending.snapshot_region, src_x, src_y, slice_width, slice_height)
+        self.store.write_rect(world_x, world_y, region)
+        if not flush_complete:
+            return True
+        self._pending_gpu_writebacks.pop(0)
         self.gpu_simulator.release_staged_region(pending.staged_region)
         return True
 
@@ -489,13 +895,27 @@ class ActiveWorldWindow:
             if overlap == pending.rect:
                 consumed_pending.append(pending)
         for missing in remaining:
-            incoming = self.store.read_rect(missing.x, missing.y, missing.width, missing.height)
-            self.gpu_simulator.write_region(
-                missing.x - target_origin_x,
-                missing.y - target_origin_y,
-                incoming,
-                buffer_index=target_buffer_index,
-            )
+            if self.store.rect_has_stored_cells(missing):
+                self.gpu_simulator.write_store_rect(
+                    self.store,
+                    world_x=missing.x,
+                    world_y=missing.y,
+                    width=missing.width,
+                    height=missing.height,
+                    dst_x=missing.x - target_origin_x,
+                    dst_y=missing.y - target_origin_y,
+                    buffer_index=target_buffer_index,
+                )
+            else:
+                self.gpu_simulator.fill_empty_region(
+                    missing.x - target_origin_x,
+                    missing.y - target_origin_y,
+                    missing.width,
+                    missing.height,
+                    world_row_offset=missing.y,
+                    world_height=self.store.height,
+                    buffer_index=target_buffer_index,
+                )
         for pending in consumed_pending:
             if pending in self._pending_gpu_writebacks:
                 self._pending_gpu_writebacks.remove(pending)
@@ -509,12 +929,19 @@ class ActiveWorldWindow:
         return _capture_grid_region(self.active_grid, local_x, local_y, rect.width, rect.height)
 
     def _shift_active_window(self, new_origin_x: int, new_origin_y: int) -> None:
+        shift_started_at = perf_counter()
+        self.paging_stats.last_evict_stage_seconds = 0.0
+        self.paging_stats.last_overlap_copy_seconds = 0.0
+        self.paging_stats.last_overlap_transient_copy_seconds = 0.0
+        self.paging_stats.last_incoming_load_seconds = 0.0
+        self.paging_stats.last_incoming_transient_clear_seconds = 0.0
         old_rect = self.active_rect
         new_rect = WorldRect(new_origin_x, new_origin_y, self.active_width, self.active_height)
         overlap = old_rect.intersection(new_rect)
         evicted_rects = _rect_difference(old_rect, overlap)
         incoming_rects = _rect_difference(new_rect, overlap)
 
+        evict_started_at = perf_counter()
         if self.gpu_simulator is None:
             for evicted_rect in evicted_rects:
                 region = self._capture_active_region(evicted_rect)
@@ -523,6 +950,9 @@ class ActiveWorldWindow:
         else:
             for evicted_rect in evicted_rects:
                 self._stage_evicted_region(evicted_rect)
+        evict_elapsed = perf_counter() - evict_started_at
+        self.paging_stats.last_evict_stage_seconds = evict_elapsed
+        self.paging_stats.max_evict_stage_seconds = max(self.paging_stats.max_evict_stage_seconds, evict_elapsed)
 
         if self.gpu_simulator is None:
             next_grid = create_grid(self.active_width, self.active_height)
@@ -543,6 +973,7 @@ class ActiveWorldWindow:
         else:
             target_buffer_index = 1 - self.gpu_simulator.front_index
             if overlap is not None:
+                overlap_copy_started_at = perf_counter()
                 self.gpu_simulator.copy_region(
                     overlap.x - old_rect.x,
                     overlap.y - old_rect.y,
@@ -552,6 +983,13 @@ class ActiveWorldWindow:
                     overlap.y - new_rect.y,
                     dst_buffer_index=target_buffer_index,
                 )
+                overlap_copy_elapsed = perf_counter() - overlap_copy_started_at
+                self.paging_stats.last_overlap_copy_seconds = overlap_copy_elapsed
+                self.paging_stats.max_overlap_copy_seconds = max(
+                    self.paging_stats.max_overlap_copy_seconds,
+                    overlap_copy_elapsed,
+                )
+                overlap_transient_started_at = perf_counter()
                 self.gpu_simulator.copy_transient_region(
                     overlap.x - old_rect.x,
                     overlap.y - old_rect.y,
@@ -560,6 +998,13 @@ class ActiveWorldWindow:
                     overlap.x - new_rect.x,
                     overlap.y - new_rect.y,
                 )
+                overlap_transient_elapsed = perf_counter() - overlap_transient_started_at
+                self.paging_stats.last_overlap_transient_copy_seconds = overlap_transient_elapsed
+                self.paging_stats.max_overlap_transient_copy_seconds = max(
+                    self.paging_stats.max_overlap_transient_copy_seconds,
+                    overlap_transient_elapsed,
+                )
+            incoming_load_started_at = perf_counter()
             for incoming_rect in incoming_rects:
                 self._load_incoming_rect_into_gpu_buffer(
                     incoming_rect,
@@ -567,18 +1012,49 @@ class ActiveWorldWindow:
                     target_origin_x=new_rect.x,
                     target_origin_y=new_rect.y,
                 )
+            incoming_load_elapsed = perf_counter() - incoming_load_started_at
+            self.paging_stats.last_incoming_load_seconds = incoming_load_elapsed
+            self.paging_stats.max_incoming_load_seconds = max(
+                self.paging_stats.max_incoming_load_seconds,
+                incoming_load_elapsed,
+            )
+            transient_clear_started_at = perf_counter()
+            for incoming_rect in incoming_rects:
                 self.gpu_simulator.clear_region_transients(
                     incoming_rect.x - new_rect.x,
                     incoming_rect.y - new_rect.y,
                     incoming_rect.width,
                     incoming_rect.height,
                 )
+            transient_clear_elapsed = perf_counter() - transient_clear_started_at
+            self.paging_stats.last_incoming_transient_clear_seconds = transient_clear_elapsed
+            self.paging_stats.max_incoming_transient_clear_seconds = max(
+                self.paging_stats.max_incoming_transient_clear_seconds,
+                transient_clear_elapsed,
+            )
             self.gpu_simulator.front_index = target_buffer_index
-            self._pending_flush_cooldown_steps = max(self._pending_flush_cooldown_steps, 8)
 
         self.active_origin_x = new_origin_x
         self.active_origin_y = new_origin_y
         self._set_external_support_anchors()
+        self._record_shift_stats(perf_counter() - shift_started_at)
+
+    def _record_shift_stats(self, shift_seconds: float) -> None:
+        self.paging_stats.shift_count += 1
+        self.paging_stats.total_shift_seconds += shift_seconds
+        self.paging_stats.last_shift_seconds = shift_seconds
+        self.paging_stats.max_shift_seconds = max(self.paging_stats.max_shift_seconds, shift_seconds)
+
+    def mark_camera_activity(self, moved: bool, *, dt: float | None = None) -> None:
+        if moved:
+            self._camera_recently_moved = True
+            self._camera_idle_elapsed_seconds = 0.0
+            self._last_background_io_flush_idle_seconds = 0.0
+            return
+        if dt is not None:
+            self._camera_idle_elapsed_seconds += max(0.0, float(dt))
+        if self._camera_idle_elapsed_seconds >= self.idle_flush_cooldown_seconds:
+            self._camera_recently_moved = False
 
     def ensure_resident_for_camera(self) -> None:
         new_origin_x = self.active_origin_x
@@ -600,8 +1076,12 @@ class ActiveWorldWindow:
             self._shift_active_window(new_origin_x, new_origin_y)
 
     def pan_camera(self, dx: int, dy: int) -> None:
-        self.camera_x = _clamp(self.camera_x + int(dx), 0, max(0, self.store.width - self.viewport_width))
-        self.camera_y = _clamp(self.camera_y + int(dy), 0, max(0, self.store.height - self.viewport_height))
+        next_camera_x = _clamp(self.camera_x + int(dx), 0, max(0, self.store.width - self.viewport_width))
+        next_camera_y = _clamp(self.camera_y + int(dy), 0, max(0, self.store.height - self.viewport_height))
+        moved = next_camera_x != self.camera_x or next_camera_y != self.camera_y
+        self.camera_x = next_camera_x
+        self.camera_y = next_camera_y
+        self.mark_camera_activity(moved)
         self.ensure_resident_for_camera()
 
     def screen_to_world(self, sx: int, sy: int, *, screen_width: int, screen_height: int) -> tuple[int, int]:
@@ -668,11 +1148,13 @@ class ActiveWorldWindow:
     def service_background_io(self) -> None:
         if self.gpu_simulator is None:
             return
-        if self._pending_flush_cooldown_steps > 0:
-            self._pending_flush_cooldown_steps -= 1
+        if self._camera_recently_moved:
+            return
+        if self._camera_idle_elapsed_seconds - self._last_background_io_flush_idle_seconds < self.idle_flush_service_interval_seconds:
             return
         if self._pending_gpu_writebacks:
-            self._flush_one_pending_gpu_writeback()
+            if self._flush_one_pending_gpu_writeback():
+                self._last_background_io_flush_idle_seconds = self._camera_idle_elapsed_seconds
 
     def step(self, dt: float) -> None:
         if self.gpu_simulator is not None:
@@ -688,12 +1170,45 @@ class ActiveWorldWindow:
     def visible_uv_rect(self) -> tuple[float, float, float, float]:
         local_x = self.camera_x - self.active_origin_x
         local_y = self.camera_y - self.active_origin_y
+        uv_origin_y = 1.0 - (local_y + self.viewport_height) / max(1, self.active_height)
         return (
             local_x / max(1, self.active_width),
-            local_y / max(1, self.active_height),
+            max(0.0, uv_origin_y),
             self.viewport_width / max(1, self.active_width),
             self.viewport_height / max(1, self.active_height),
         )
+
+    def shift_time_average_ms(self) -> float:
+        if self.paging_stats.shift_count <= 0:
+            return 0.0
+        return self.paging_stats.total_shift_seconds * 1000.0 / self.paging_stats.shift_count
+
+    def shift_time_last_ms(self) -> float:
+        return self.paging_stats.last_shift_seconds * 1000.0
+
+    def shift_time_max_ms(self) -> float:
+        return self.paging_stats.max_shift_seconds * 1000.0
+
+    def stage_time_last_ms(self) -> float:
+        return self.paging_stats.last_evict_stage_seconds * 1000.0
+
+    def overlap_copy_time_last_ms(self) -> float:
+        return self.paging_stats.last_overlap_copy_seconds * 1000.0
+
+    def overlap_transient_copy_time_last_ms(self) -> float:
+        return self.paging_stats.last_overlap_transient_copy_seconds * 1000.0
+
+    def incoming_load_time_last_ms(self) -> float:
+        return self.paging_stats.last_incoming_load_seconds * 1000.0
+
+    def incoming_transient_clear_time_last_ms(self) -> float:
+        return self.paging_stats.last_incoming_transient_clear_seconds * 1000.0
+
+    def anchor_build_time_last_ms(self) -> float:
+        return self.paging_stats.last_anchor_build_seconds * 1000.0
+
+    def anchor_upload_time_last_ms(self) -> float:
+        return self.paging_stats.last_anchor_upload_seconds * 1000.0
 
     def readback_active_grid(self) -> Grid:
         if self.gpu_simulator is not None:
