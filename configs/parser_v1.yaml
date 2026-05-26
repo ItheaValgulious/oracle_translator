@@ -1,23 +1,33 @@
 backbone_name: Qwen/Qwen3-0.6B-Base
 max_length: 128
-batch_size: 2
+batch_size: 8
+grad_accum_steps: 4
 max_epochs: 300
-early_stopping_patience: 3
-early_stopping_min_delta: 0.0
+early_stopping_patience: 10
+early_stopping_min_delta: 0.0001
+val_ratio: 0.1
+rng_seed: 42
 learning_rate: 0.0002
 weight_decay: 0.01
+layer_mix_count: 4
+dropout: 0.1
 big_head: false
-lora_rank: 0
-lora_alpha: 16.0
-lora_dropout: 0.0
-lora_target_modules:
-  - q_proj
-  - v_proj
 train_backbone: false
 unfreeze_last_n_layers: 0
+output_dir: artifacts
+
+loss_weights:
+  subject.material_template: 1.0
+  reaction.reaction_template: 1.0
+  release.release_template: 1.0
+  motion.motion_template: 1.0
+  motion.motion_direction: 1.0
+  motion.origin: 1.0
+  motion.target: 1.0
+  politeness: 1.0
+
 dataset:
-  curated: data/raw/curated_v1.jsonl
-  api: data/raw/api_v1.jsonl
-  train: data/processed/train_v1.jsonl
-  val: data/processed/val_v1.jsonl
-  manifest: data/processed/manifest_v1.json
+  source_paths:
+    - data/source/spell_to_model_socket.jsonl
+    - data/source/random_spell_to_model_socket.jsonl
+    - data/source/random_model_socket_to_spell.jsonl

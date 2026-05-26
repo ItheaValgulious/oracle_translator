@@ -27,6 +27,10 @@ from .model_socket_schema import (
 
 ROOT = Path(__file__).resolve().parents[2]
 PROMPTS_DIR = ROOT / "src" / "prompts"
+DEFAULT_EXTERNAL_MODEL_NAME = "qwen3.5-27b"
+DEFAULT_MANUAL_SEED_EXAMPLES_PATH = ROOT / "data" / "source" / "manual_spell_seeds.jsonl"
+DEFAULT_BATCH_SIZE = 6
+DEFAULT_REQUEST_PAUSE_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,8 @@ CONTENT_MOTIFS = [
     ContentMotif("laser_like_light", "灼热白光, 激光般光束, 切割白线"),
 ]
 
+CONTENT_MOTIF_LOOKUP = {item.motif_id: item for item in CONTENT_MOTIFS}
+
 
 MODEL_SOCKET_BLUEPRINTS = {
     "holy_fire": {"material_template": "fire", "reaction_template": "burn", "release_template": "spray", "motion_template": "flow", "motion_direction": "forward", "origin": "self", "target": "enemy"},
@@ -108,7 +114,6 @@ MODEL_SOCKET_BLUEPRINTS = {
     "paper_flood": {"material_template": "unknown", "reaction_template": "none", "release_template": "appear", "motion_template": "flow", "motion_direction": "forward", "origin": "self", "target": "none"},
     "laser_like_light": {"material_template": "light", "reaction_template": "burn", "release_template": "appear", "motion_template": "fixed", "motion_direction": "forward", "origin": "self", "target": "enemy"},
 }
-
 
 def load_api_credentials(path: str | Path = ROOT / "api.txt") -> tuple[str, str]:
     raw = Path(path).read_text(encoding="utf-8").strip()
@@ -205,6 +210,7 @@ def _chat_completion(
             "model": model_name,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -219,6 +225,15 @@ def _log(log_path: str | Path, payload: dict[str, Any]) -> None:
     append_jsonl(log_path, payload)
 
 
+def _retry_sleep_seconds(exc: Exception, attempt: int) -> float:
+    text = repr(exc)
+    if "429" in text or "Too Many Requests" in text:
+        return min(120.0, 20.0 * attempt)
+    if "ReadTimeout" in text or "timed out" in text:
+        return min(45.0, 8.0 * attempt)
+    return min(10.0, float(attempt * 2))
+
+
 def _pick_examples(seed_rows: list[dict[str, Any]], *, recipe: StyleRecipe, motif: ContentMotif, rng: random.Random, limit: int = 4) -> list[dict[str, Any]]:
     same_motif = [row for row in seed_rows if row.get("meta", {}).get("motif_id") == motif.motif_id]
     same_recipe = [row for row in seed_rows if row.get("meta", {}).get("recipe_id") == recipe.recipe_id]
@@ -231,6 +246,98 @@ def _pick_examples(seed_rows: list[dict[str, Any]], *, recipe: StyleRecipe, moti
             deduped.append(row)
     rng.shuffle(deduped)
     return deduped[:limit]
+
+
+def _batched(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _pick_translation_examples(
+    seed_rows: list[dict[str, Any]],
+    *,
+    source: dict[str, Any],
+    limit: int = 4,
+) -> list[dict[str, Any]]:
+    source_meta = source.get("meta", {})
+    source_id = source.get("id")
+    motif_id = source_meta.get("motif_id")
+    recipe_id = source_meta.get("recipe_id")
+    prioritized = [
+        row
+        for row in seed_rows
+        if row.get("id") != source_id
+        and row.get("meta", {}).get("motif_id") == motif_id
+        and row.get("meta", {}).get("recipe_id") == recipe_id
+    ]
+    if len(prioritized) < limit:
+        prioritized.extend(
+            row
+            for row in seed_rows
+            if row.get("id") != source_id
+            and row.get("meta", {}).get("motif_id") == motif_id
+            and row not in prioritized
+        )
+    if len(prioritized) < limit:
+        prioritized.extend(row for row in seed_rows if row.get("id") != source_id and row not in prioritized)
+    return prioritized[:limit]
+
+
+def _model_socket_signature(model_socket: dict[str, Any]) -> tuple[str, str, str, str, str, str, str, int]:
+    motion = model_socket["motion"]
+    return (
+        model_socket["subject"]["material_template"],
+        model_socket["reaction"]["reaction_template"],
+        model_socket["release"]["release_template"],
+        motion["motion_template"],
+        motion["motion_direction"],
+        motion["origin"],
+        motion["target"],
+        int(round(float(model_socket["expression"]["politeness"]))),
+    )
+
+
+def _expected_model_socket_from_source(source: dict[str, Any]) -> dict[str, Any] | None:
+    meta = source.get("meta", {})
+    motif_id = meta.get("motif_id")
+    politeness = meta.get("politeness_target")
+    if motif_id not in MODEL_SOCKET_BLUEPRINTS or politeness is None:
+        return None
+    return _model_socket_from_blueprint(str(motif_id), int(politeness))
+
+
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _parse_batch_text_response(raw: str, expected_request_ids: set[str]) -> dict[str, str]:
+    parsed = _extract_json(raw)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+        raise ValueError("batch text response must be an object with items")
+    outputs: dict[str, str] = {}
+    for item in parsed["items"]:
+        if not isinstance(item, dict):
+            continue
+        request_id = item.get("request_id")
+        if request_id not in expected_request_ids:
+            continue
+        outputs[str(request_id)] = _parse_text_payload({"text": item.get("text", "")})
+    return outputs
+
+
+def _parse_batch_model_socket_response(raw: str, expected_request_ids: set[str]) -> dict[str, dict[str, Any]]:
+    parsed = _extract_json(raw)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+        raise ValueError("batch model_socket response must be an object with items")
+    outputs: dict[str, dict[str, Any]] = {}
+    for item in parsed["items"]:
+        if not isinstance(item, dict):
+            continue
+        request_id = item.get("request_id")
+        if request_id not in expected_request_ids:
+            continue
+        model_socket = item.get("model_socket")
+        outputs[str(request_id)] = normalize_model_socket(model_socket)
+    return outputs
 
 
 def _build_spell_generation_user_prompt(
@@ -257,15 +364,142 @@ def _build_spell_generation_user_prompt(
     )
 
 
-def _build_spell_to_json_user_prompt(*, template: str, text: str) -> str:
-    return f"{template}\n\n待解析咒语:\n{text}\n"
-
-
-def _build_json_to_spell_user_prompt(*, template: str, model_socket: dict[str, Any], recipe: StyleRecipe) -> str:
+def _build_spell_to_json_user_prompt(
+    *,
+    template: str,
+    text: str,
+    translation_examples: list[dict[str, Any]],
+    expected_model_socket: dict[str, Any] | None,
+) -> str:
+    example_blocks = []
+    for row in translation_examples:
+        expected = _expected_model_socket_from_source(row)
+        if expected is None:
+            continue
+        example_blocks.append(f'- text: {row["text"]}\n  json: {_compact_json(expected)}')
+    examples_block = "\n".join(example_blocks) if example_blocks else "- 无"
+    expected_block = _compact_json(expected_model_socket) if expected_model_socket is not None else "无"
     return (
         f"{template}\n\n"
+        f"few_shot_examples:\n{examples_block}\n\n"
+        f"candidate_model_socket_from_source_meta:\n{expected_block}\n\n"
+        f"待解析咒语:\n{text}\n"
+    )
+
+
+def _build_spell_generation_batch_user_prompt(
+    *,
+    template: str,
+    tasks: list[dict[str, Any]],
+    recent_outputs: list[str],
+) -> str:
+    payload = []
+    for task in tasks:
+        payload.append(
+            {
+                "request_id": task["request_id"],
+                "recipe_name": task["recipe"].name,
+                "politeness_target": task["recipe"].politeness,
+                "recipe_guidance": task["recipe"].guidance,
+                "content_motif": task["motif"].prompt_hint,
+                "avoid_patterns": task["recipe"].avoid,
+                "model_socket": _model_socket_from_blueprint(task["motif"].motif_id, task["recipe"].politeness),
+                "reference_examples": [row["text"] for row in task["examples"]],
+            }
+        )
+    return (
+        f"{template}\n\n"
+        "本次请同时生成多个 items.\n"
+        "只输出 JSON 对象, 格式严格为:\n"
+        "{\"items\":[{\"request_id\":\"...\",\"text\":\"一句完整咒语\"}]}\n"
+        "要求:\n"
+        "- 每个 request_id 恰好返回一条\n"
+        "- items 之间不能重复\n"
+        "- 不要与 recent_outputs 重复\n\n"
+        f"tasks:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        f"recent_outputs:\n{json.dumps(recent_outputs, ensure_ascii=False)}\n"
+    )
+
+
+def _build_spell_to_json_batch_user_prompt(
+    *,
+    template: str,
+    tasks: list[dict[str, Any]],
+) -> str:
+    payload = []
+    for task in tasks:
+        example_payload = []
+        for row in task["examples"]:
+            expected = _expected_model_socket_from_source(row)
+            if expected is None:
+                continue
+            example_payload.append({"text": row["text"], "model_socket": expected})
+        payload.append(
+            {
+                "request_id": task["request_id"],
+                "text": task["source"]["text"],
+                "candidate_model_socket_from_source_meta": task["expected_model_socket"],
+                "few_shot_examples": example_payload,
+            }
+        )
+    return (
+        f"{template}\n\n"
+        "本次请同时解析多个 items.\n"
+        "只输出 JSON 对象, 格式严格为:\n"
+        "{\"items\":[{\"request_id\":\"...\",\"model_socket\":{...}}]}\n"
+        "要求:\n"
+        "- 每个 request_id 恰好返回一个合法 model_socket\n"
+        "- `model_socket` 必须保持完整嵌套结构\n"
+        "- 只使用闭集枚举值\n\n"
+        f"items:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
+    )
+
+
+def _build_json_to_spell_user_prompt(
+    *,
+    template: str,
+    model_socket: dict[str, Any],
+    recipe: StyleRecipe,
+    reference_examples: list[dict[str, Any]],
+) -> str:
+    example_block = "\n".join(f'- {row["text"]}' for row in reference_examples) if reference_examples else "- 无"
+    return (
+        f"{template}\n\n"
+        f"recipe_name:\n{recipe.name}\n\n"
         f"politeness_target:\n{json.dumps(recipe.politeness, ensure_ascii=False)}\n\n"
-        f"model_socket:\n{json.dumps(model_socket, ensure_ascii=False, indent=2)}\n"
+        f"recipe_guidance:\n{recipe.guidance}\n\n"
+        f"model_socket:\n{json.dumps(model_socket, ensure_ascii=False, indent=2)}\n\n"
+        f"reference_examples:\n{example_block}\n"
+    )
+
+
+def _build_json_to_spell_batch_user_prompt(
+    *,
+    template: str,
+    tasks: list[dict[str, Any]],
+) -> str:
+    payload = []
+    for task in tasks:
+        payload.append(
+            {
+                "request_id": task["request_id"],
+                "recipe_name": task["recipe"].name,
+                "politeness_target": task["recipe"].politeness,
+                "recipe_guidance": task["recipe"].guidance,
+                "model_socket": task["model_socket"],
+                "reference_examples": [row["text"] for row in task["reference_examples"]],
+            }
+        )
+    return (
+        f"{template}\n\n"
+        "本次请同时生成多个 items.\n"
+        "只输出 JSON 对象, 格式严格为:\n"
+        "{\"items\":[{\"request_id\":\"...\",\"text\":\"一句完整咒语\"}]}\n"
+        "要求:\n"
+        "- 每个 request_id 恰好返回一条\n"
+        "- items 之间不能重复\n"
+        "- 句子必须可逆回对应的 model_socket\n\n"
+        f"items:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
     )
 
 
@@ -284,73 +518,8 @@ def _model_socket_from_blueprint(blueprint_id: str, politeness: int) -> dict[str
         },
         "expression": {"politeness": politeness},
     }
-    validate_model_socket(model_socket)
+    validate_model_socket(model_socket, require_binary_politeness=True)
     return model_socket
-
-
-def _fallback_model_socket_from_source(source: dict[str, Any]) -> dict[str, Any]:
-    meta = source.get("meta", {})
-    motif_id = meta.get("motif_id")
-    politeness = meta.get("politeness_target")
-    if motif_id is None or politeness is None:
-        raise ValueError("source row does not have motif_id/politeness_target for fallback")
-    if motif_id not in MODEL_SOCKET_BLUEPRINTS:
-        if motif_id == "wild_fire":
-            motif_id = "holy_fire"
-        else:
-            raise KeyError(motif_id)
-    return _model_socket_from_blueprint(motif_id, int(politeness))
-
-
-def _fallback_spell_from_model_socket(model_socket: dict[str, Any]) -> str:
-    material = model_socket["subject"]["material_template"]
-    reaction = model_socket["reaction"]["reaction_template"]
-    release = model_socket["release"]["release_template"]
-    motion = model_socket["motion"]
-    politeness = int(model_socket["expression"]["politeness"])
-
-    noun_map = {
-        "fire": "火潮",
-        "acid": "酸液",
-        "poison_slurry": "毒雾",
-        "tar": "黑沥",
-        "quicksilver": "银流",
-        "granite": "石锋",
-        "obsidian": "黑岩",
-        "earth": "土潮",
-        "sand": "砂流",
-        "water": "水流",
-        "ice": "冰棱",
-        "steam": "寒气",
-        "light": "白光",
-        "wind": "风压",
-        "lightning": "雷弧",
-        "explosive_slurry": "灼液",
-        "grass": "草蔓",
-        "wood": "荆藤",
-        "glass": "晶锋",
-        "iron": "铁砂",
-    }
-    noun = noun_map.get(material, "异质")
-
-    release_phrase = {
-        "spray": "散出一片",
-        "appear": "骤然现身",
-    }[release]
-    direction_phrase = {
-        "forward": "向前而行",
-        "backward": "反卷身后",
-        "up": "向上而起",
-        "down": "向下而落",
-        "target": "直取前敌",
-        "self": "环归我身",
-        "front_up": "自前上方压下",
-        "front_down": "自前下方翻起",
-    }[motion["motion_direction"]]
-
-    if politeness >= 1:
-        return f"愿{noun}{release_phrase}, {direction_phrase}."
-    return f"给我来点{noun}, {direction_phrase}."
 
 
 def write_model_socket_seed_samples(*, output_path: str | Path, target_count: int, rng_seed: int = 23) -> list[dict[str, Any]]:
@@ -387,7 +556,7 @@ def generate_spells(
     output_path: str | Path,
     log_path: str | Path,
     target_count: int,
-    model_name: str = "minimax-m2.5",
+    model_name: str = DEFAULT_EXTERNAL_MODEL_NAME,
     max_retries: int = 3,
     rng_seed: int = 23,
 ) -> list[dict[str, Any]]:
@@ -397,46 +566,71 @@ def generate_spells(
     template = load_prompt_template("spell_generation_prompt.md")
     system_prompt = "你是中文奇幻咒语语料生成器. 只返回合法 JSON. 回答的第一个字符必须是 {. 不要解释, 不要分析, 不要代码块, 不要 <think>."
     rng = random.Random(rng_seed)
-    client = _build_client()
-    try:
-        while len(rows) < target_count:
-            recipe = rng.choice(STYLE_RECIPES)
-            motif = rng.choice(CONTENT_MOTIFS)
-            examples = _pick_examples(seed_rows, recipe=recipe, motif=motif, rng=rng)
+    while len(rows) < target_count:
+        client = _build_client()
+        try:
+            batch_target = min(DEFAULT_BATCH_SIZE, target_count - len(rows))
+            tasks: list[dict[str, Any]] = []
+            for offset in range(batch_target):
+                recipe = rng.choice(STYLE_RECIPES)
+                motif = rng.choice(CONTENT_MOTIFS)
+                tasks.append(
+                    {
+                        "request_id": f"spell_req_{len(rows) + offset}",
+                        "recipe": recipe,
+                        "motif": motif,
+                        "examples": _pick_examples(seed_rows, recipe=recipe, motif=motif, rng=rng),
+                    }
+                )
             recent_outputs = [row["text"] for row in rows[-8:]]
-            user_prompt = _build_spell_generation_user_prompt(template=template, recipe=recipe, motif=motif, examples=examples, recent_outputs=recent_outputs)
             last_error: str | None = None
             for attempt in range(1, max_retries + 1):
                 try:
-                    raw = _chat_completion(client, model_name=model_name, system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.9, max_tokens=1800)
-                    text = _parse_text_completion(raw)
-                    if text in existing_texts:
-                        raise ValueError(f"duplicate text: {text}")
-                    row = {
-                        "id": _stable_id("spell", text),
-                        "text": text,
-                        "meta": {
-                            "source": "spell_generation",
-                            "recipe_id": recipe.recipe_id,
-                            "recipe_name": recipe.name,
-                            "politeness_target": recipe.politeness,
-                            "motif_id": motif.motif_id,
-                            "motif_hint": motif.prompt_hint,
-                            "model_name": model_name,
-                        },
-                    }
-                    _write_success_row(output_path, rows, row)
-                    existing_texts.add(text)
-                    _log(log_path, {"event": "spell_generation_success", "row_id": row["id"], "recipe_id": recipe.recipe_id, "motif_id": motif.motif_id, "attempt": attempt, "response_preview": raw[:500]})
+                    user_prompt = _build_spell_generation_batch_user_prompt(template=template, tasks=tasks, recent_outputs=recent_outputs)
+                    if last_error is not None:
+                        user_prompt += f"\n上一次输出的问题:\n{last_error}\n请整批修正并只输出最终 JSON.\n"
+                    raw = _chat_completion(client, model_name=model_name, system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.9, max_tokens=1200)
+                    outputs = _parse_batch_text_response(raw, {task["request_id"] for task in tasks})
+                    if len(outputs) != len(tasks):
+                        raise ValueError(f"batch spell generation returned {len(outputs)} items, expected {len(tasks)}")
+                    batch_texts = list(outputs.values())
+                    if len(set(batch_texts)) != len(batch_texts):
+                        raise ValueError(f"batch spell generation returned duplicate texts: {batch_texts}")
+                    for task in tasks:
+                        text = outputs[task["request_id"]]
+                        if text in existing_texts:
+                            raise ValueError(f"duplicate text: {text}")
+                    for task in tasks:
+                        text = outputs[task["request_id"]]
+                        recipe = task["recipe"]
+                        motif = task["motif"]
+                        row = {
+                            "id": _stable_id("spell", text),
+                            "text": text,
+                            "meta": {
+                                "source": "spell_generation",
+                                "recipe_id": recipe.recipe_id,
+                                "recipe_name": recipe.name,
+                                "politeness_target": recipe.politeness,
+                                "motif_id": motif.motif_id,
+                                "motif_hint": motif.prompt_hint,
+                                "model_name": model_name,
+                            },
+                        }
+                        _write_success_row(output_path, rows, row)
+                        existing_texts.add(text)
+                        _log(log_path, {"event": "spell_generation_success", "row_id": row["id"], "recipe_id": recipe.recipe_id, "motif_id": motif.motif_id, "attempt": attempt, "response_preview": raw[:500]})
+                    time.sleep(DEFAULT_REQUEST_PAUSE_SECONDS)
                     break
                 except Exception as exc:  # noqa: BLE001
                     last_error = repr(exc)
-                    _log(log_path, {"event": "spell_generation_retry", "recipe_id": recipe.recipe_id, "motif_id": motif.motif_id, "attempt": attempt, "error": last_error})
-                    time.sleep(min(10, attempt * 2))
+                    _log(log_path, {"event": "spell_generation_retry", "request_ids": [task["request_id"] for task in tasks], "attempt": attempt, "error": last_error})
+                    time.sleep(_retry_sleep_seconds(exc, attempt))
             else:
-                _log(log_path, {"event": "spell_generation_failed", "recipe_id": recipe.recipe_id, "motif_id": motif.motif_id, "error": last_error})
-    finally:
-        client.close()
+                _log(log_path, {"event": "spell_generation_failed", "request_ids": [task["request_id"] for task in tasks], "error": last_error})
+                raise RuntimeError(f"external spell generation failed for request_ids={[task['request_id'] for task in tasks]}: {last_error}")
+        finally:
+            client.close()
     return rows
 
 
@@ -445,66 +639,78 @@ def translate_spells_to_json(
     input_path: str | Path,
     output_path: str | Path,
     log_path: str | Path,
-    model_name: str = "minimax-m2.5",
+    model_name: str = DEFAULT_EXTERNAL_MODEL_NAME,
     max_retries: int = 3,
 ) -> list[dict[str, Any]]:
     source_rows = read_jsonl(input_path)
     rows = read_jsonl(output_path) if Path(output_path).exists() else []
     translated_source_ids = {row["meta"]["source_spell_id"] for row in rows}
+    seed_rows = read_jsonl(DEFAULT_MANUAL_SEED_EXAMPLES_PATH) if DEFAULT_MANUAL_SEED_EXAMPLES_PATH.exists() else []
     template = load_prompt_template("spell_to_json_prompt.md")
     system_prompt = "你是中文奇幻咒语结构化标注器. 只返回合法 JSON. 回答的第一个字符必须是 {. 不要解释, 不要分析, 不要代码块, 不要 <think>."
-    client = _build_client()
-    try:
-        for source in source_rows:
-            if source["id"] in translated_source_ids:
-                continue
-            user_prompt = _build_spell_to_json_user_prompt(template=template, text=source["text"])
+    pending_sources = [source for source in source_rows if source["id"] not in translated_source_ids]
+    for batch_sources in _batched(pending_sources, DEFAULT_BATCH_SIZE):
+        client = _build_client()
+        try:
+            tasks = []
+            for source in batch_sources:
+                tasks.append(
+                    {
+                        "request_id": source["id"],
+                        "source": source,
+                        "expected_model_socket": _expected_model_socket_from_source(source),
+                        "examples": _pick_translation_examples(seed_rows, source=source),
+                    }
+                )
             last_error: str | None = None
             for attempt in range(1, max_retries + 1):
                 try:
-                    raw = _chat_completion(client, model_name=model_name, system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.1, max_tokens=1200)
-                    model_socket = normalize_model_socket(_extract_json(raw))
-                    validate_model_socket(model_socket)
-                    row = {
-                        "id": _stable_id("spell_to_model_socket", source["id"] + "::" + source["text"]),
-                        "text": source["text"],
-                        "model_socket": model_socket,
-                        "meta": {
-                            "source": "spell_to_model_socket",
-                            "source_spell_id": source["id"],
-                            "source_meta": source.get("meta", {}),
-                            "model_name": model_name,
-                        },
-                    }
-                    _write_success_row(output_path, rows, row)
-                    translated_source_ids.add(source["id"])
-                    _log(log_path, {"event": "spell_to_json_success", "source_spell_id": source["id"], "attempt": attempt, "response_preview": raw[:500]})
+                    user_prompt = _build_spell_to_json_batch_user_prompt(template=template, tasks=tasks)
+                    if last_error is not None:
+                        user_prompt += f"\n上一次输出的问题:\n{last_error}\n请整批修正并只输出最终 JSON.\n"
+                    raw = _chat_completion(client, model_name=model_name, system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.1, max_tokens=1800)
+                    outputs = _parse_batch_model_socket_response(raw, {task["request_id"] for task in tasks})
+                    if len(outputs) != len(tasks):
+                        raise ValueError(f"batch spell_to_json returned {len(outputs)} items, expected {len(tasks)}")
+                    normalized_outputs: dict[str, dict[str, Any]] = {}
+                    for task in tasks:
+                        model_socket = outputs[task["request_id"]]
+                        validate_model_socket(model_socket, require_binary_politeness=True)
+                        expected_model_socket = task["expected_model_socket"]
+                        if expected_model_socket is not None and _model_socket_signature(model_socket) != _model_socket_signature(expected_model_socket):
+                            raise ValueError(
+                                "model output does not match source meta expectation: "
+                                f"request_id={task['request_id']} expected={_compact_json(expected_model_socket)} actual={_compact_json(model_socket)}"
+                            )
+                        normalized_outputs[task["request_id"]] = model_socket
+                    for task in tasks:
+                        source = task["source"]
+                        model_socket = normalized_outputs[task["request_id"]]
+                        row = {
+                            "id": _stable_id("spell_to_model_socket", source["id"] + "::" + source["text"]),
+                            "text": source["text"],
+                            "model_socket": model_socket,
+                            "meta": {
+                                "source": "spell_to_model_socket",
+                                "source_spell_id": source["id"],
+                                "source_meta": source.get("meta", {}),
+                                "model_name": model_name,
+                            },
+                        }
+                        _write_success_row(output_path, rows, row)
+                        translated_source_ids.add(source["id"])
+                        _log(log_path, {"event": "spell_to_json_success", "source_spell_id": source["id"], "attempt": attempt, "response_preview": raw[:500]})
+                    time.sleep(DEFAULT_REQUEST_PAUSE_SECONDS)
                     break
                 except Exception as exc:  # noqa: BLE001
                     last_error = repr(exc)
-                    _log(log_path, {"event": "spell_to_json_retry", "source_spell_id": source["id"], "attempt": attempt, "error": last_error})
-                    time.sleep(min(10, attempt * 2))
+                    _log(log_path, {"event": "spell_to_json_retry", "source_spell_ids": [task["source"]["id"] for task in tasks], "attempt": attempt, "error": last_error})
+                    time.sleep(_retry_sleep_seconds(exc, attempt))
             else:
-                try:
-                    model_socket = _fallback_model_socket_from_source(source)
-                    row = {
-                        "id": _stable_id("spell_to_model_socket", source["id"] + "::" + source["text"]),
-                        "text": source["text"],
-                        "model_socket": model_socket,
-                        "meta": {
-                            "source": "spell_to_model_socket_fallback",
-                            "source_spell_id": source["id"],
-                            "source_meta": source.get("meta", {}),
-                            "model_name": model_name,
-                        },
-                    }
-                    _write_success_row(output_path, rows, row)
-                    translated_source_ids.add(source["id"])
-                    _log(log_path, {"event": "spell_to_json_fallback_success", "source_spell_id": source["id"], "error": last_error})
-                except Exception as fallback_exc:  # noqa: BLE001
-                    _log(log_path, {"event": "spell_to_json_failed", "source_spell_id": source["id"], "error": last_error, "fallback_error": repr(fallback_exc)})
-    finally:
-        client.close()
+                _log(log_path, {"event": "spell_to_json_failed", "source_spell_ids": [task["source"]["id"] for task in tasks], "error": last_error})
+                raise RuntimeError(f"external spell_to_json failed for source_spell_ids={[task['source']['id'] for task in tasks]}: {last_error}")
+        finally:
+            client.close()
     return rows
 
 
@@ -513,68 +719,67 @@ def json_rows_to_spells(
     input_path: str | Path,
     output_path: str | Path,
     log_path: str | Path,
-    model_name: str = "minimax-m2.5",
+    model_name: str = DEFAULT_EXTERNAL_MODEL_NAME,
     max_retries: int = 3,
 ) -> list[dict[str, Any]]:
     source_rows = read_jsonl(input_path)
     rows = read_jsonl(output_path) if Path(output_path).exists() else []
     translated_source_ids = {row["meta"]["source_model_socket_id"] for row in rows}
     existing_texts = {_normalized_text(row["text"]) for row in rows}
+    seed_rows = read_jsonl(DEFAULT_MANUAL_SEED_EXAMPLES_PATH) if DEFAULT_MANUAL_SEED_EXAMPLES_PATH.exists() else []
     template = load_prompt_template("json_to_spell_prompt.md")
     system_prompt = "你是中文奇幻咒语反推生成器. 只返回合法 JSON. 回答的第一个字符必须是 {. 不要解释, 不要分析, 不要代码块, 不要 <think>."
-    client = _build_client()
-    try:
-        for source in source_rows:
-            if source["id"] in translated_source_ids:
-                continue
-            model_socket = source["model_socket"]
-            validate_model_socket(model_socket)
-            recipe_politeness = source.get("meta", {}).get("politeness_target")
-            recipe = StyleRecipe(
-                source.get("meta", {}).get("recipe_id", "external"),
-                source.get("meta", {}).get("recipe_name", "external"),
-                int(recipe_politeness if recipe_politeness is not None else model_socket["expression"]["politeness"]),
-                "按给定 politeness 生成.",
-                "不要重复原句.",
-            )
-            user_prompt = _build_json_to_spell_user_prompt(template=template, model_socket=model_socket, recipe=recipe)
+    pending_sources = [source for source in source_rows if source["id"] not in translated_source_ids]
+    for batch_sources in _batched(pending_sources, DEFAULT_BATCH_SIZE):
+        client = _build_client()
+        try:
+            tasks = []
+            for source in batch_sources:
+                model_socket = source["model_socket"]
+                validate_model_socket(model_socket)
+                recipe_politeness = source.get("meta", {}).get("politeness_target")
+                recipe = StyleRecipe(
+                    source.get("meta", {}).get("recipe_id", "external"),
+                    source.get("meta", {}).get("recipe_name", "external"),
+                    int(recipe_politeness if recipe_politeness is not None else model_socket["expression"]["politeness"]),
+                    "按给定 politeness 生成.",
+                    "不要重复原句.",
+                )
+                tasks.append(
+                    {
+                        "request_id": source["id"],
+                        "source": source,
+                        "model_socket": model_socket,
+                        "recipe": recipe,
+                        "reference_examples": _pick_translation_examples(seed_rows, source=source),
+                    }
+                )
             last_error: str | None = None
             for attempt in range(1, max_retries + 1):
                 try:
-                    raw = _chat_completion(client, model_name=model_name, system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.8, max_tokens=1800)
-                    text = _parse_text_completion(raw)
-                    if text in existing_texts:
-                        raise ValueError(f"duplicate text: {text}")
-                    row = {
-                        "id": _stable_id("json_to_spell", source["id"] + "::" + text),
-                        "text": text,
-                        "model_socket": model_socket,
-                        "meta": {
-                            "source": "json_to_spell",
-                            "source_model_socket_id": source["id"],
-                            "source_meta": source.get("meta", {}),
-                            "model_name": model_name,
-                        },
-                    }
-                    _write_success_row(output_path, rows, row)
-                    translated_source_ids.add(source["id"])
-                    existing_texts.add(text)
-                    _log(log_path, {"event": "json_rows_to_spell_success", "source_model_socket_id": source["id"], "attempt": attempt, "response_preview": raw[:500]})
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    last_error = repr(exc)
-                    _log(log_path, {"event": "json_rows_to_spell_retry", "source_model_socket_id": source["id"], "attempt": attempt, "error": last_error})
-                    time.sleep(min(10, attempt * 2))
-            else:
-                try:
-                    text = _normalized_text(_fallback_spell_from_model_socket(model_socket))
-                    if text not in existing_texts:
+                    user_prompt = _build_json_to_spell_batch_user_prompt(template=template, tasks=tasks)
+                    if last_error is not None:
+                        user_prompt += f"\n上一次输出的问题:\n{last_error}\n请整批修正并只输出最终 JSON.\n"
+                    raw = _chat_completion(client, model_name=model_name, system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.8, max_tokens=1200)
+                    outputs = _parse_batch_text_response(raw, {task["request_id"] for task in tasks})
+                    if len(outputs) != len(tasks):
+                        raise ValueError(f"batch json_to_spell returned {len(outputs)} items, expected {len(tasks)}")
+                    batch_texts = list(outputs.values())
+                    if len(set(batch_texts)) != len(batch_texts):
+                        raise ValueError(f"batch json_to_spell returned duplicate texts: {batch_texts}")
+                    for task in tasks:
+                        text = outputs[task["request_id"]]
+                        if text in existing_texts:
+                            raise ValueError(f"duplicate text: {text}")
+                    for task in tasks:
+                        source = task["source"]
+                        text = outputs[task["request_id"]]
                         row = {
                             "id": _stable_id("json_to_spell", source["id"] + "::" + text),
                             "text": text,
-                            "model_socket": model_socket,
+                            "model_socket": task["model_socket"],
                             "meta": {
-                                "source": "json_to_spell_fallback",
+                                "source": "json_to_spell",
                                 "source_model_socket_id": source["id"],
                                 "source_meta": source.get("meta", {}),
                                 "model_name": model_name,
@@ -583,11 +788,18 @@ def json_rows_to_spells(
                         _write_success_row(output_path, rows, row)
                         translated_source_ids.add(source["id"])
                         existing_texts.add(text)
-                        _log(log_path, {"event": "json_rows_to_spell_fallback_success", "source_model_socket_id": source["id"], "error": last_error})
-                except Exception as fallback_exc:  # noqa: BLE001
-                    _log(log_path, {"event": "json_rows_to_spell_failed", "source_model_socket_id": source["id"], "error": last_error, "fallback_error": repr(fallback_exc)})
-    finally:
-        client.close()
+                        _log(log_path, {"event": "json_rows_to_spell_success", "source_model_socket_id": source["id"], "attempt": attempt, "response_preview": raw[:500]})
+                    time.sleep(DEFAULT_REQUEST_PAUSE_SECONDS)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_error = repr(exc)
+                    _log(log_path, {"event": "json_rows_to_spell_retry", "source_model_socket_ids": [task["source"]["id"] for task in tasks], "attempt": attempt, "error": last_error})
+                    time.sleep(_retry_sleep_seconds(exc, attempt))
+            else:
+                _log(log_path, {"event": "json_rows_to_spell_failed", "source_model_socket_ids": [task["source"]["id"] for task in tasks], "error": last_error})
+                raise RuntimeError(f"external json_to_spell failed for source_model_socket_ids={[task['source']['id'] for task in tasks]}: {last_error}")
+        finally:
+            client.close()
     return rows
 
 
@@ -596,7 +808,7 @@ def generate_json_to_spell_dataset(
     output_path: str | Path,
     log_path: str | Path,
     target_count: int,
-    model_name: str = "minimax-m2.5",
+    model_name: str = DEFAULT_EXTERNAL_MODEL_NAME,
     max_retries: int = 3,
     rng_seed: int = 23,
 ) -> list[dict[str, Any]]:
@@ -613,8 +825,8 @@ def build_random_spell_to_json_dataset(
     translated_output_path: str | Path,
     translated_log_path: str | Path,
     target_count: int,
-    spell_model_name: str = "minimax-m2.5",
-    translation_model_name: str = "minimax-m2.5",
+    spell_model_name: str = DEFAULT_EXTERNAL_MODEL_NAME,
+    translation_model_name: str = DEFAULT_EXTERNAL_MODEL_NAME,
     max_retries: int = 3,
     rng_seed: int = 23,
 ) -> list[dict[str, Any]]:

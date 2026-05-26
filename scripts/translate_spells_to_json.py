@@ -17,7 +17,7 @@ def main() -> None:
     parser.add_argument("--input", default=str(ROOT / "data" / "source" / "generated_spells.jsonl"))
     parser.add_argument("--output", default=str(ROOT / "data" / "source" / "spell_to_model_socket.jsonl"))
     parser.add_argument("--log", default=str(ROOT / "data" / "logs" / "spell_to_model_socket_log.jsonl"))
-    parser.add_argument("--model", default="minimax-m2.5")
+    parser.add_argument("--model", default="qwen3.5-27b")
     parser.add_argument("--max-retries", type=int, default=3)
     args = parser.parse_args()
     rows = translate_spells_to_json(

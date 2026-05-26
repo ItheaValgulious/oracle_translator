@@ -137,7 +137,7 @@ def normalize_model_socket(model_socket: dict[str, Any]) -> dict[str, Any]:
     politeness = get_nested(normalized, ("expression", "politeness"))
     if isinstance(politeness, str):
         try:
-            set_nested(normalized, ("expression", "politeness"), int(float(politeness)))
+            set_nested(normalized, ("expression", "politeness"), float(politeness))
         except ValueError:
             pass
     expression = normalized.get("expression")
@@ -152,7 +152,12 @@ def normalize_model_socket(model_socket: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def validate_model_socket(model_socket: dict[str, Any] | None, *, allow_none: bool = False) -> None:
+def validate_model_socket(
+    model_socket: dict[str, Any] | None,
+    *,
+    allow_none: bool = False,
+    require_binary_politeness: bool = False,
+) -> None:
     if model_socket is None:
         if allow_none:
             return
@@ -170,5 +175,8 @@ def validate_model_socket(model_socket: dict[str, Any] | None, *, allow_none: bo
         raise ValueError("missing expression.politeness")
     if not isinstance(politeness, (int, float)):
         raise ValueError("expression.politeness must be numeric")
-    if int(politeness) not in {0, 1}:
+    politeness_value = float(politeness)
+    if not 0.0 <= politeness_value <= 1.0:
         raise ValueError(f"expression.politeness out of range: {politeness}")
+    if require_binary_politeness and politeness_value not in {0.0, 1.0}:
+        raise ValueError(f"expression.politeness must be binary for training data: {politeness}")

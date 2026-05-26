@@ -39,3 +39,5 @@
 - `reference_examples`
 
 请根据这些输入生成一句新的中文咒语.
+`reference_examples` 只是风格锚点, 不能直接照抄.
+你必须优先保证这句咒语之后还能被重新解析回输入的 `model_socket`.

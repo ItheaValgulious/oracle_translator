@@ -18,7 +18,7 @@ def main() -> None:
     parser.add_argument("--output", default=str(ROOT / "data" / "source" / "generated_spells.jsonl"))
     parser.add_argument("--log", default=str(ROOT / "data" / "logs" / "generated_spells_log.jsonl"))
     parser.add_argument("--target-count", type=int, default=100)
-    parser.add_argument("--model", default="minimax-m2.5")
+    parser.add_argument("--model", default="qwen3.5-27b")
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--rng-seed", type=int, default=23)
     args = parser.parse_args()
