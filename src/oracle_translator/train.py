@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def _head_name(spec_path: tuple[str, str]) -> str:
-    return f"{spec_path[0]}.{spec_path[1]}"
+    return f"{spec_path[0]}_{spec_path[1]}"
 
 
 def compute_loss(

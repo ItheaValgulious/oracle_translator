@@ -47,7 +47,7 @@ class OracleTranslatorModel(nn.Module):
         self.categorical_heads = nn.ModuleDict()
         self.num_classes: dict[tuple[str, str], int] = {}
         for spec in CATEGORICAL_SPECS:
-            key = f"{spec.path[0]}.{spec.path[1]}"
+            key = f"{spec.path[0]}_{spec.path[1]}"
             num_class = len(spec.labels)
             self.num_classes[spec.path] = num_class
             self.categorical_heads[key] = nn.Linear(hidden_size, num_class)
@@ -88,7 +88,7 @@ class OracleTranslatorModel(nn.Module):
 
         logits: dict[str, torch.Tensor] = {}
         for spec in CATEGORICAL_SPECS:
-            key = f"{spec.path[0]}.{spec.path[1]}"
+            key = f"{spec.path[0]}_{spec.path[1]}"
             logits[key] = self.categorical_heads[key](z_global)
 
         politeness_logit = self.politeness_head(z_global).squeeze(-1)

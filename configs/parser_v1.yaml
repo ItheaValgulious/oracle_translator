@@ -17,13 +17,13 @@ unfreeze_last_n_layers: 0
 output_dir: artifacts
 
 loss_weights:
-  subject.material_template: 1.0
-  reaction.reaction_template: 1.0
-  release.release_template: 1.0
-  motion.motion_template: 1.0
-  motion.motion_direction: 1.0
-  motion.origin: 1.0
-  motion.target: 1.0
+  subject_material_template: 1.0
+  reaction_reaction_template: 1.0
+  release_release_template: 1.0
+  motion_motion_template: 1.0
+  motion_motion_direction: 1.0
+  motion_origin: 1.0
+  motion_target: 1.0
   politeness: 1.0
 
 dataset:
