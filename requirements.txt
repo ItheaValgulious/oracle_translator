@@ -6,3 +6,6 @@ transformers>=4.40
 accelerate>=0.20
 pyyaml>=6.0
 tqdm>=4.60
+sherpa-onnx>=1.13
+sounddevice>=0.5
+numpy

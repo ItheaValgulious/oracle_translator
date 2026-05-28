@@ -10,7 +10,7 @@ from .atmosphere import default_ambient_air_temperature_for_row
 from .grid import Grid
 from .render import DebugViewMode
 from .support import SUPPORT_FAILURE_THRESHOLD, SUPPORT_SOURCE_VALUE
-from .types import CellFlag, CellState, LifetimeMode, MaterialRegistry, MatterState, ReactionKind
+from .types import DAMAGE_MASK_LIVING, DAMAGE_MASK_TERRAIN, CellFlag, CellState, LifetimeMode, MaterialRegistry, MatterState
 
 
 WORKGROUP_SIZE = 8
@@ -28,20 +28,12 @@ MATTER_STATE_CODES = {
     MatterState.GAS: 2,
 }
 
-REACTION_KIND_CODES = {
-    ReactionKind.NONE: 0,
-    ReactionKind.HEAT_SOURCE: 1,
-    ReactionKind.CORROSIVE: 2,
-    ReactionKind.TOXIC: 3,
-    ReactionKind.FLAMMABLE: 4,
-}
-
 LIFETIME_MODE_CODES = {
     LifetimeMode.NONE: 0,
     LifetimeMode.DECAY_WITH_AGE: 1,
 }
 
-VARIANT_PACK_FORMAT = "<8i28f"
+VARIANT_PACK_FORMAT = "<8i32f"
 FAMILY_PACK_FORMAT = "<4i4f"
 PHASE_PACK_FORMAT = "<4i4f"
 
@@ -115,11 +107,13 @@ class GpuMaterialTables:
                     phase_offset,
                     phase_count,
                     float(family.reaction_profile.get("max_age", 0.0)),
-                    0.0,
+                    float(family.reaction_profile.get("max_generation", 0.0)),
                     0.0,
                     0.0,
                 )
             )
+
+        empty_variant_index = variant_index_by_key[("empty", "empty")]
 
         variant_buffer = bytearray()
         for family_id, variant_id in variant_keys:
@@ -129,7 +123,7 @@ class GpuMaterialTables:
                 struct.pack(
                     VARIANT_PACK_FORMAT,
                     family_index_by_id[family_id],
-                    REACTION_KIND_CODES[variant.reaction_kind],
+                    variant.damage_mask_bitmask,
                     LIFETIME_MODE_CODES[variant.lifetime_mode],
                     int(variant.downward_blocked_diagonal_fallback),
                     int(variant.support_bearing),
@@ -144,11 +138,11 @@ class GpuMaterialTables:
                     float(variant.heat_capacity),
                     float(variant.base_temperature),
                     float(variant.reaction_strength),
-                    float(variant.ignite_temperature or 0.0),
+                    float(variant.reaction_min_temperature),
+                    float(variant.reaction_max_temperature),
                     float(variant.melt_temperature or 0.0),
                     float(variant.freeze_temperature or 0.0),
                     float(variant.boil_temperature or 0.0),
-                    float(variant.decompose_temperature or 0.0),
                     float(variant.integrity_decay_from_heat),
                     float(red),
                     float(green),
@@ -164,6 +158,13 @@ class GpuMaterialTables:
                     float(variant.wind_coupling),
                     float(variant.wind_vertical_factor),
                     float(variant.velocity_decay),
+                    float(variant_index_by_key.get(
+                        (variant.ignite_target_family_id or "", variant.ignite_target_variant_id or ""),
+                        variant_index_by_key.get(("fire", "fire"), empty_variant_index),
+                    ) if variant.ignite_target_family_id is not None else empty_variant_index),
+                    0.0,
+                    0.0,
+                    0.0,
                 )
             )
 
@@ -303,11 +304,8 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define MATTER_STATE_LIQUID {MATTER_STATE_CODES[MatterState.LIQUID]}
 #define MATTER_STATE_GAS {MATTER_STATE_CODES[MatterState.GAS]}
 
-#define REACTION_NONE {REACTION_KIND_CODES[ReactionKind.NONE]}
-#define REACTION_HEAT_SOURCE {REACTION_KIND_CODES[ReactionKind.HEAT_SOURCE]}
-#define REACTION_CORROSIVE {REACTION_KIND_CODES[ReactionKind.CORROSIVE]}
-#define REACTION_TOXIC {REACTION_KIND_CODES[ReactionKind.TOXIC]}
-#define REACTION_FLAMMABLE {REACTION_KIND_CODES[ReactionKind.FLAMMABLE]}
+#define DAMAGE_MASK_TERRAIN {DAMAGE_MASK_TERRAIN}
+#define DAMAGE_MASK_LIVING {DAMAGE_MASK_LIVING}
 
 #define FIRE_FAMILY_INDEX {tables.family_index_by_id["fire"]}
 
@@ -373,6 +371,7 @@ struct VariantData {{
     vec4 floats4;
     vec4 floats5;
     vec4 floats6;
+    vec4 floats7;
 }};
 
 struct FamilyData {{
@@ -466,12 +465,24 @@ int family_index_for_variant(int variant_index) {{
     return variant_table[variant_index].ints0.x;
 }}
 
-int reaction_kind_for_variant(int variant_index) {{
+int damage_mask_for_variant(int variant_index) {{
     return variant_table[variant_index].ints0.y;
 }}
 
 int lifetime_mode_for_variant(int variant_index) {{
     return variant_table[variant_index].ints0.z;
+}}
+
+float ignite_target_variant_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats7.x;
+}}
+
+bool damage_mask_has_terrain(int mask) {{
+    return (mask & DAMAGE_MASK_TERRAIN) != 0;
+}}
+
+bool damage_mask_has_living(int mask) {{
+    return (mask & DAMAGE_MASK_LIVING) != 0;
 }}
 
 bool downward_blocked_diagonal_fallback_for_variant(int variant_index) {{
@@ -510,19 +521,23 @@ float density_for_variant(int variant_index) {{
     return variant_table[variant_index].floats0.x;
 }}
 
-float ignite_temperature_for_variant(int variant_index) {{
+float reaction_min_temperature_for_variant(int variant_index) {{
     return variant_table[variant_index].floats2.x;
 }}
 
-float melt_temperature_for_variant(int variant_index) {{
+float reaction_max_temperature_for_variant(int variant_index) {{
     return variant_table[variant_index].floats2.y;
 }}
 
-float freeze_temperature_for_variant(int variant_index) {{
+float melt_temperature_for_variant(int variant_index) {{
     return variant_table[variant_index].floats2.z;
 }}
 
-float decompose_temperature_for_variant(int variant_index) {{
+float freeze_temperature_for_variant(int variant_index) {{
+    return variant_table[variant_index].floats2.w;
+}}
+
+float boil_temperature_for_variant(int variant_index) {{
     return variant_table[variant_index].floats3.x;
 }}
 
@@ -2106,47 +2121,6 @@ void main() {
 """
 
 
-def _reaction_plan_shader_source(tables: GpuMaterialTables) -> str:
-    return _build_common_glsl(tables) + """
-layout(local_size_x = 8, local_size_y = 8) in;
-
-layout(rgba32i, binding = 3) uniform readonly iimage2D state_int_src;
-layout(rgba32f, binding = 5) uniform readonly image2D state_misc_src;
-layout(r32i, binding = 9) uniform coherent iimage2D reaction_claim_tex;
-
-void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
-    if (!in_bounds(coord)) {
-        return;
-    }
-
-    ivec4 cell_int = imageLoad(state_int_src, coord);
-    vec4 cell_misc = imageLoad(state_misc_src, coord);
-    int variant_index = cell_int.x;
-    int family_index = family_index_for_variant(variant_index);
-
-    if (family_index != %d) {
-        return;
-    }
-    if (cell_misc.x < decompose_temperature_for_variant(variant_index)) {
-        return;
-    }
-
-    for (int index = 0; index < 8; index += 1) {
-        ivec2 target_coord = coord + NEIGHBORS_8[index];
-        if (!in_bounds(target_coord)) {
-            continue;
-        }
-        if (imageLoad(state_int_src, target_coord).x != EMPTY_VARIANT_INDEX) {
-            continue;
-        }
-        imageAtomicMin(reaction_claim_tex, target_coord, linear_index(coord));
-        break;
-    }
-}
-""" % tables.family_index_by_id["poison"]
-
-
 def _reaction_resolve_shader_source(tables: GpuMaterialTables) -> str:
     return _build_common_glsl(tables) + """
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -2158,6 +2132,13 @@ layout(rgba32i, binding = 6) uniform writeonly iimage2D state_int_dst;
 layout(rgba32f, binding = 7) uniform writeonly image2D state_vec_dst;
 layout(rgba32f, binding = 8) uniform writeonly image2D state_misc_dst;
 layout(r32i, binding = 9) uniform readonly iimage2D reaction_claim_tex;
+
+uniform float grow_interval;
+uniform float grow_min_integrity;
+
+float max_generation_for_family(int family_index) {
+    return family_table[family_index].floats0.y;
+}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -2176,8 +2157,9 @@ void main() {
     int family_index = family_index_for_variant(variant_index);
 
     float gathered_corrosion = 0.0;
-    bool adjacent_fire = false;
-    bool caused_corrosion = false;
+    bool adjacent_heat_source = false;
+    bool caused_terrain_damage = false;
+    bool caused_living_damage = false;
     for (int index = 0; index < 8; index += 1) {
         ivec2 neighbor_coord = coord + NEIGHBORS_8[index];
         if (!in_bounds(neighbor_coord)) {
@@ -2185,37 +2167,63 @@ void main() {
         }
         ivec4 neighbor_int = imageLoad(state_int_src, neighbor_coord);
         int neighbor_variant = neighbor_int.x;
-        int neighbor_reaction = reaction_kind_for_variant(neighbor_variant);
-        if (reaction_kind_for_variant(variant_index) == REACTION_CORROSIVE && support_bearing_for_variant(neighbor_variant)) {
-            caused_corrosion = true;
+
+        // Track adjacent heat sources (reaction_energy > 0) for ignition
+        if (reaction_energy_for_variant(neighbor_variant) > 0.0) {
+            adjacent_heat_source = true;
         }
-        if (neighbor_reaction == REACTION_HEAT_SOURCE) {
-            adjacent_fire = adjacent_fire || family_index_for_variant(neighbor_variant) == %d;
+
+        // This cell damages terrain neighbors if it has strength > 0 and damage_mask includes terrain
+        int cell_mask = damage_mask_for_variant(variant_index);
+        float cell_strength = reaction_strength_for_variant(variant_index);
+        if (cell_strength > 0.0 && damage_mask_has_terrain(cell_mask) && support_bearing_for_variant(neighbor_variant)) {
+            caused_terrain_damage = true;
         }
-        if (neighbor_reaction == REACTION_CORROSIVE && support_bearing_for_variant(variant_index)) {
-            float hardness = max(variant_table[variant_index].floats0.y, 0.05);
-            gathered_corrosion += reaction_strength_for_variant(neighbor_variant) * dt / hardness;
+        if (cell_strength > 0.0 && damage_mask_has_living(cell_mask) && family_index_for_variant(neighbor_variant) == %d) {
+            caused_living_damage = true;
+        }
+
+        // Neighbor damages this cell based on neighbor's strength and damage_mask
+        int neighbor_mask = damage_mask_for_variant(neighbor_variant);
+        float neighbor_strength = reaction_strength_for_variant(neighbor_variant);
+        if (neighbor_strength > 0.0) {
+            // Corrosion onto support-bearing terrain
+            if (damage_mask_has_terrain(neighbor_mask) && support_bearing_for_variant(variant_index)) {
+                float hardness = max(variant_table[variant_index].floats0.y, 0.05);
+                gathered_corrosion += neighbor_strength * dt / hardness;
+            }
+            // Damage onto entity placeholders (living mask)
+            if (damage_mask_has_living(neighbor_mask) && family_index_for_variant(variant_index) == %d) {
+                gathered_corrosion += neighbor_strength * dt;
+            }
         }
     }
 
-    if (reaction_kind_for_variant(variant_index) == REACTION_HEAT_SOURCE) {
-        out_misc.x += reaction_energy_for_variant(variant_index) * dt / max(heat_capacity_for_variant(variant_index), 0.001);
+    // ── Self-heating (reaction_energy > 0) ──
+    float energy = reaction_energy_for_variant(variant_index);
+    if (energy > 0.0) {
+        out_misc.x += energy * dt / max(heat_capacity_for_variant(variant_index), 0.001);
         out_misc.w = cell_misc.w + dt;
-        float max_age = family_table[family_index].floats0.x;
-        if (out_misc.w >= max_age) {
-            vec4 empty_misc = empty_cell_misc_for_coord(coord);
-            empty_misc.x = out_misc.x;
-            imageStore(state_int_dst, coord, empty_cell_int());
-            imageStore(state_vec_dst, coord, empty_cell_vec());
-            imageStore(state_misc_dst, coord, empty_misc);
-            return;
+        if (lifetime_mode_for_variant(variant_index) == 1) {
+            float max_age = family_table[family_index].floats0.x;
+            if (out_misc.w >= max_age) {
+                vec4 empty_misc = empty_cell_misc_for_coord(coord);
+                empty_misc.x = out_misc.x;
+                imageStore(state_int_dst, coord, empty_cell_int());
+                imageStore(state_vec_dst, coord, empty_cell_vec());
+                imageStore(state_misc_dst, coord, empty_misc);
+                return;
+            }
         }
     }
 
-    if (family_index == %d) {
-        bool ignited = cell_misc.x >= ignite_temperature_for_variant(variant_index) || adjacent_fire;
+    // ── Ignition (reaction_min_temperature > 0) ──
+    float ignite_threshold = reaction_min_temperature_for_variant(variant_index);
+    if (ignite_threshold > 0.0) {
+        bool ignited = cell_misc.x >= ignite_threshold || adjacent_heat_source;
         if (ignited) {
-            out_int = ivec4(%d, cell_int.y + 1, 0, 0);
+            int target_variant = int(ignite_target_variant_for_variant(variant_index));
+            out_int = ivec4(target_variant, cell_int.y + 1, 0, 0);
             out_vec = vec4(0.0);
             out_misc = vec4(600.0, 0.0, 1.0, 0.0);
             imageStore(state_int_dst, coord, out_int);
@@ -2223,20 +2231,30 @@ void main() {
             imageStore(state_misc_dst, coord, out_misc);
             return;
         }
-        if (cell_misc.x >= 140.0) {
-            out_int.x = %d;
+    }
+
+    // ── Growth (max_generation > 0) ──
+    float max_gen = max_generation_for_family(family_index);
+    if (max_gen > 0.0 && cell_misc.z >= grow_min_integrity && cell_misc.w >= grow_interval && cell_int.y < int(max_gen)) {
+        if (coord.y > 0) {
+            ivec2 above_coord = coord + ivec2(0, -1);
+            int above_variant = imageLoad(state_int_src, above_coord).x;
+            if (above_variant == EMPTY_VARIANT_INDEX) {
+                ivec4 above_int = ivec4(variant_index, cell_int.y + 1, cell_int.z, 0);
+                vec4 above_misc = vec4(cell_misc.x, 0.0, 1.0, 0.0);
+                imageStore(state_int_dst, above_coord, above_int);
+                imageStore(state_vec_dst, above_coord, vec4(0.0));
+                imageStore(state_misc_dst, above_coord, above_misc);
+            }
         }
     }
 
-    if (family_index == %d && cell_misc.x >= decompose_temperature_for_variant(variant_index)) {
-        out_int.x = %d;
-    }
-
+    // ── Heat integrity decay ──
     if (support_bearing_for_variant(variant_index) && integrity_decay_from_heat_for_variant(variant_index) > 0.0) {
         float heat_start = base_temperature_for_variant(variant_index) + 60.0;
-        float melt_temperature = melt_temperature_for_variant(variant_index);
-        if (melt_temperature > 0.0) {
-            heat_start = min(heat_start, melt_temperature * 0.7);
+        float melt_temp = melt_temperature_for_variant(variant_index);
+        if (melt_temp > 0.0) {
+            heat_start = min(heat_start, melt_temp * 0.7);
         }
         if (cell_misc.x > heat_start) {
             out_misc.z = max(
@@ -2246,10 +2264,12 @@ void main() {
         }
     }
 
+    // ── Corrosion / damage ──
     if (gathered_corrosion > 0.0) {
         out_misc.z = max(0.0, out_misc.z - gathered_corrosion);
     }
-    if (caused_corrosion && !reaction_preserves_self_for_variant(variant_index)) {
+    bool caused_any_damage = caused_terrain_damage || caused_living_damage;
+    if (caused_any_damage && !reaction_preserves_self_for_variant(variant_index)) {
         vec4 empty_misc = empty_cell_misc_for_coord(coord);
         empty_misc.x = out_misc.x;
         imageStore(state_int_dst, coord, empty_cell_int());
@@ -2258,14 +2278,23 @@ void main() {
         return;
     }
 
+    // ── Fire claim spread ──
+    // When a cell with reaction_energy > 0 claims an empty neighbor, spawn its ignite_target there.
     int winner_index = imageLoad(reaction_claim_tex, coord).x;
     if (winner_index != INT_MAX_VALUE && cell_int.x == EMPTY_VARIANT_INDEX) {
         ivec2 source_coord = ivec2(winner_index %% grid_size.x, winner_index / grid_size.x);
         ivec4 source_int = imageLoad(state_int_src, source_coord);
-        imageStore(state_int_dst, coord, ivec4(%d, source_int.y + 1, 0, 0));
-        imageStore(state_vec_dst, coord, vec4(0.0));
-        imageStore(state_misc_dst, coord, vec4(600.0, 0.0, 1.0, 0.0));
-        return;
+        // Only cells with reaction_energy (fire-like) spread via claims
+        if (reaction_energy_for_variant(source_int.x) > 0.0) {
+            int spread_variant = int(ignite_target_variant_for_variant(source_int.x));
+            if (spread_variant == EMPTY_VARIANT_INDEX) {
+                spread_variant = source_int.x;
+            }
+            imageStore(state_int_dst, coord, ivec4(spread_variant, source_int.y + 1, 0, 0));
+            imageStore(state_vec_dst, coord, vec4(0.0));
+            imageStore(state_misc_dst, coord, vec4(600.0, 0.0, 1.0, 0.0));
+            return;
+        }
     }
 
     imageStore(state_int_dst, coord, out_int);
@@ -2273,13 +2302,8 @@ void main() {
     imageStore(state_misc_dst, coord, out_misc);
 }
 """ % (
-        tables.family_index_by_id["fire"],
-        tables.family_index_by_id["tar"],
-        tables.variant_index_by_key[("fire", "fire")],
-        tables.variant_index_by_key[("tar", "tar_smoke")],
-        tables.family_index_by_id["poison"],
-        tables.variant_index_by_key[("poison", "poison_gas")],
-        tables.variant_index_by_key[("fire", "fire")],
+        tables.family_index_by_id["entity_placeholder"],
+        tables.family_index_by_id["entity_placeholder"],
     )
 
 
@@ -2507,7 +2531,6 @@ class GpuSimulator:
         self.motion_resolve_shader = self.ctx.compute_shader(_motion_resolve_shader_source(self.tables))
         self.thermal_shader = self.ctx.compute_shader(_thermal_shader_source(self.tables))
         self.phase_shader = self.ctx.compute_shader(_phase_shader_source(self.tables))
-        self.reaction_plan_shader = self.ctx.compute_shader(_reaction_plan_shader_source(self.tables))
         self.reaction_resolve_shader = self.ctx.compute_shader(_reaction_resolve_shader_source(self.tables))
         self.collapse_shader = self.ctx.compute_shader(_collapse_shader_source(self.tables))
         self.render_shader = self.ctx.compute_shader(_render_shader_source(self.tables))
@@ -2526,7 +2549,6 @@ class GpuSimulator:
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
-            self.reaction_plan_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2572,7 +2594,6 @@ class GpuSimulator:
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
-            self.reaction_plan_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2593,7 +2614,6 @@ class GpuSimulator:
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
-            self.reaction_plan_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2618,7 +2638,6 @@ class GpuSimulator:
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
-            self.reaction_plan_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2639,7 +2658,6 @@ class GpuSimulator:
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
-            self.reaction_plan_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2853,19 +2871,12 @@ class GpuSimulator:
 
     def _run_reactions(self, dt: float) -> None:
         self._clear_r32i_texture(self.reaction_claim, INT_MAX_VALUE)
-
-        self.state_int[self.front_index].bind_to_image(3, read=True, write=False)
-        self.state_misc[self.front_index].bind_to_image(5, read=True, write=False)
-        self.reaction_claim.bind_to_image(9, read=True, write=True)
-        _set_uniform_if_present(self.reaction_plan_shader, "dt", dt)
-        _set_uniform_if_present(self.reaction_plan_shader, "step_index", self.step_index)
-        self.reaction_plan_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
-        self.ctx.memory_barrier()
-
         self._bind_state(self.front_index, 1 - self.front_index)
         self.reaction_claim.bind_to_image(9, read=True, write=False)
         _set_uniform_if_present(self.reaction_resolve_shader, "dt", dt)
         _set_uniform_if_present(self.reaction_resolve_shader, "step_index", self.step_index)
+        _set_uniform_if_present(self.reaction_resolve_shader, "grow_interval", 5.0)
+        _set_uniform_if_present(self.reaction_resolve_shader, "grow_min_integrity", 0.5)
         self.reaction_resolve_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
         self.ctx.memory_barrier()
         self.front_index = 1 - self.front_index

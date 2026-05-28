@@ -11,14 +11,6 @@ class MatterState(str, Enum):
     GAS = "gas"
 
 
-class ReactionKind(str, Enum):
-    NONE = "none"
-    HEAT_SOURCE = "heat_source"
-    CORROSIVE = "corrosive"
-    TOXIC = "toxic"
-    FLAMMABLE = "flammable"
-
-
 class LifetimeMode(str, Enum):
     NONE = "none"
     DECAY_WITH_AGE = "decay_with_age"
@@ -27,6 +19,12 @@ class LifetimeMode(str, Enum):
 class CellFlag(IntFlag):
     NONE = 0
     FIXPOINT = 1 << 0
+
+
+# Bitmask values for damage_mask — determines what targets a reaction can affect.
+DAMAGE_MASK_TERRAIN = 1   # affects support-bearing cells
+DAMAGE_MASK_LIVING = 2    # affects entity placeholders
+DAMAGE_MASK_WATER = 4     # affects water-family cells
 
 
 @dataclass(frozen=True)
@@ -60,17 +58,19 @@ class VariantDef:
     support_bearing: bool
     support_transmission: bool
     base_temperature: float
-    ignite_temperature: float | None = None
+    reaction_min_temperature: float = 0.0
+    reaction_max_temperature: float = 0.0
     melt_temperature: float | None = None
     freeze_temperature: float | None = None
     boil_temperature: float | None = None
-    decompose_temperature: float | None = None
     integrity_decay_from_heat: float = 0.0
-    reaction_kind: ReactionKind = ReactionKind.NONE
     reaction_strength: float = 0.0
     reaction_energy: float = 0.0
     reaction_preserves_self: bool = True
     lifetime_mode: LifetimeMode = LifetimeMode.NONE
+    ignite_target_family_id: str | None = None
+    ignite_target_variant_id: str | None = None
+    damage_mask: tuple[str, ...] = ()
     mobility: float = 1.0
     pressure_response: float = 1.0
     gravity_scale: float = 0.0
@@ -83,6 +83,18 @@ class VariantDef:
     liquid_contact_heat_exchange_multiplier: float = 1.0
     same_variant_heat_exchange_multiplier: float = 1.0
     render_color: tuple[int, int, int] = (255, 255, 255)
+
+    @property
+    def damage_mask_bitmask(self) -> int:
+        result = 0
+        for target in self.damage_mask:
+            if target == "terrain":
+                result |= DAMAGE_MASK_TERRAIN
+            elif target == "living":
+                result |= DAMAGE_MASK_LIVING
+            elif target == "water":
+                result |= DAMAGE_MASK_WATER
+        return result
 
 
 @dataclass(frozen=True)
@@ -123,6 +135,10 @@ class CellState:
     generation: int = 0
     age: float = 0.0
     flags: CellFlag = CellFlag.NONE
+    # Per-cell spell overrides (empty = use variant defaults)
+    spell_damage_mask: tuple[str, ...] = ()
+    spell_convert_mode: str = ""
+    spell_generation_limit: int = -1
 
     def copy(self) -> CellState:
         return replace(self)

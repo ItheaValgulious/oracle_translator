@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
+
+log = logging.getLogger(__name__)
 
 from .atmosphere import default_ambient_air_temperature_for_row
 from .grid import Grid, create_grid
 from .render import DebugViewMode, build_rgba_frame
 from .sim import inject_cells, step
-from .types import CellFlag, CellState, MaterialRegistry
+from .types import CellFlag, CellState, MaterialRegistry, empty_cell
 
 if TYPE_CHECKING:
     import moderngl
@@ -183,9 +186,12 @@ def _capture_grid_region(grid: Grid, x: int, y: int, width: int, height: int) ->
 
 
 def _write_grid_region(grid: Grid, x: int, y: int, region: GridSlice) -> None:
+    set_cell = grid.set_cell
     for local_y in range(region.height):
+        row_offset = local_y * region.width
+        gy = y + local_y
         for local_x in range(region.width):
-            grid.set_cell(x + local_x, y + local_y, region.get_cell(local_x, local_y).copy())
+            set_cell(x + local_x, gy, region.cells[row_offset + local_x])
 
 
 def _slice_grid_region(region: GridSlice, x: int, y: int, width: int, height: int) -> GridSlice:
@@ -219,13 +225,24 @@ def _rect_difference(rect: WorldRect, overlap: WorldRect | None) -> list[WorldRe
 
 
 class WorldChunkStore:
-    def __init__(self, width: int, height: int, *, chunk_size: int = DEFAULT_WORLD_CHUNK_SIZE) -> None:
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        chunk_size: int = DEFAULT_WORLD_CHUNK_SIZE,
+        seed: int = 0,
+        chunk_generator: Callable[[WorldChunkStore, int, int, int, int], None] | None = None,
+    ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError("World dimensions must be positive.")
         self.width = int(width)
         self.height = int(height)
         self.chunk_size = int(chunk_size)
+        self.seed = seed
+        self.chunk_generator = chunk_generator
         self._chunks: dict[tuple[int, int], _WorldChunk] = {}
+        self._generated_chunks: set[tuple[int, int]] = set()
 
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height
@@ -244,6 +261,17 @@ class WorldChunkStore:
             self._chunks[key] = chunk
         return chunk
 
+    def _ensure_chunk_generated(self, chunk_x: int, chunk_y: int) -> None:
+        key = (chunk_x, chunk_y)
+        if key in self._generated_chunks:
+            return
+        self._generated_chunks.add(key)
+        if self.chunk_generator is not None:
+            log.info("[world] generating chunk (%d,%d) for the first time", chunk_x, chunk_y)
+            self.chunk_generator(self, chunk_x, chunk_y, self.chunk_size, self.seed)
+            log.info("[world] chunk (%d,%d) generation complete, total_generated=%d",
+                     chunk_x, chunk_y, len(self._generated_chunks))
+
     def _cell_ref(self, x: int, y: int) -> CellState | None:
         if not self.in_bounds(x, y):
             return None
@@ -255,7 +283,11 @@ class WorldChunkStore:
     def get_cell(self, x: int, y: int) -> CellState:
         if not self.in_bounds(x, y):
             raise IndexError("World coordinate is out of bounds.")
-        chunk = self._chunk(*self._chunk_coord(x, y), create=False)
+        chunk_x, chunk_y = self._chunk_coord(x, y)
+        chunk = self._chunk(chunk_x, chunk_y, create=False)
+        if chunk is None:
+            self._ensure_chunk_generated(chunk_x, chunk_y)
+            chunk = self._chunk(chunk_x, chunk_y, create=False)
         if chunk is None:
             return _default_world_cell(self.height, y)
         cell = chunk.cells.get(self._chunk_local_index(x, y))
@@ -303,6 +335,10 @@ class WorldChunkStore:
         chunk_max_x = (clipped.right - 1) // self.chunk_size
         chunk_min_y = clipped.y // self.chunk_size
         chunk_max_y = (clipped.bottom - 1) // self.chunk_size
+        # Ensure chunks are generated before checking for stored cells
+        for chunk_y in range(chunk_min_y, chunk_max_y + 1):
+            for chunk_x in range(chunk_min_x, chunk_max_x + 1):
+                self._ensure_chunk_generated(chunk_x, chunk_y)
         for chunk_y in range(chunk_min_y, chunk_max_y + 1):
             for chunk_x in range(chunk_min_x, chunk_max_x + 1):
                 chunk = self._chunk(chunk_x, chunk_y, create=False)
@@ -320,18 +356,11 @@ class WorldChunkStore:
         return False
 
     def read_rect(self, world_x: int, world_y: int, width: int, height: int) -> GridSlice:
-        cells: list[CellState] = []
-        anchors = [False for _ in range(width * height)]
+        total = width * height
+        cells: list[CellState | None] = [None] * total
+        anchors = [False for _ in range(total)]
         rect = WorldRect(world_x, world_y, width, height)
         clipped = rect.intersection(WorldRect(0, 0, self.width, self.height))
-
-        for local_y in range(height):
-            cell_y = world_y + local_y
-            if 0 <= cell_y < self.height:
-                ambient = default_ambient_air_temperature_for_row(self.height, cell_y)
-                cells.extend(CellState(temperature=ambient) for _ in range(width))
-            else:
-                cells.extend(CellState() for _ in range(width))
 
         if clipped is None:
             return GridSlice(width=width, height=height, cells=cells, anchored_support_mask=anchors)
@@ -340,6 +369,9 @@ class WorldChunkStore:
         chunk_max_x = (clipped.right - 1) // self.chunk_size
         chunk_min_y = clipped.y // self.chunk_size
         chunk_max_y = (clipped.bottom - 1) // self.chunk_size
+        for chunk_y in range(chunk_min_y, chunk_max_y + 1):
+            for chunk_x in range(chunk_min_x, chunk_max_x + 1):
+                self._ensure_chunk_generated(chunk_x, chunk_y)
         for chunk_y in range(chunk_min_y, chunk_max_y + 1):
             for chunk_x in range(chunk_min_x, chunk_max_x + 1):
                 chunk = self._chunk(chunk_x, chunk_y, create=False)
@@ -371,6 +403,19 @@ class WorldChunkStore:
                         rect_local_x = chunk_world_x + cell_local_x - world_x
                         rect_local_y = chunk_world_y + cell_local_y - world_y
                         anchors[rect_local_y * width + rect_local_x] = True
+
+        # Fill in default cells for empty (None) entries
+        for local_y in range(height):
+            cell_y = world_y + local_y
+            base = local_y * width
+            if 0 <= cell_y < self.height:
+                ambient = default_ambient_air_temperature_for_row(self.height, cell_y)
+                default = CellState(temperature=ambient)
+            else:
+                default = CellState()
+            for i in range(base, base + width):
+                if cells[i] is None:
+                    cells[i] = default
 
         return GridSlice(width=width, height=height, cells=cells, anchored_support_mask=anchors)
 
@@ -497,6 +542,8 @@ class ActiveWorldWindow:
         blocked_impulse_enabled: bool = True,
         directional_fallback_enabled: bool = True,
         directional_fallback_angle_limit_degrees: float = 45.0,
+        initial_camera_x: int | None = None,
+        initial_camera_y: int | None = None,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -517,8 +564,14 @@ class ActiveWorldWindow:
         self.pending_writeback_slice_cell_budget = max(64, int(DEFAULT_GPU_WRITEBACK_SLICE_CELL_BUDGET))
         self.active_width = min(store.width, self.viewport_width + self.halo_cells * 2)
         self.active_height = min(store.height, self.viewport_height + self.halo_cells * 2)
-        self.camera_x = max(0, (store.width - self.viewport_width) // 2)
-        self.camera_y = max(0, (store.height - self.viewport_height) // 2)
+        if initial_camera_x is not None:
+            self.camera_x = _clamp(int(initial_camera_x), 0, max(0, store.width - self.viewport_width))
+        else:
+            self.camera_x = max(0, (store.width - self.viewport_width) // 2)
+        if initial_camera_y is not None:
+            self.camera_y = _clamp(int(initial_camera_y), 0, max(0, store.height - self.viewport_height))
+        else:
+            self.camera_y = max(0, (store.height - self.viewport_height) // 2)
         self.active_origin_x = _clamp(self.camera_x - self.halo_cells, 0, max(0, store.width - self.active_width))
         self.active_origin_y = _clamp(self.camera_y - self.halo_cells, 0, max(0, store.height - self.active_height))
         self.active_grid = create_grid(self.active_width, self.active_height)
@@ -533,12 +586,20 @@ class ActiveWorldWindow:
         self._last_background_io_flush_idle_seconds = 0.0
         self._camera_recently_moved = False
         self.paging_stats = PagingStats()
+        log.info("[world] ActiveWorldWindow init: store=%dx%d viewport=%dx%d active=%dx%d halo=%d",
+                 store.width, store.height, self.viewport_width, self.viewport_height,
+                 self.active_width, self.active_height, self.halo_cells)
+        log.info("[world] camera=(%d,%d) active_origin=(%d,%d)",
+                 self.camera_x, self.camera_y, self.active_origin_x, self.active_origin_y)
         self._materialize_active_grid_from_store()
         if ctx is not None:
             from .gpu_backend import GpuSimulator
 
             self.gpu_simulator = GpuSimulator(ctx, self.active_grid, self.registry)
             self.gpu_simulator.set_external_support_anchors(self.active_grid.external_support_anchors)
+            log.info("[world] GPU simulator created")
+        else:
+            log.info("[world] CPU-only mode (no ctx)")
 
     @property
     def world_width(self) -> int:
@@ -564,15 +625,91 @@ class ActiveWorldWindow:
     def pending_writeback_pressure_count(self) -> int:
         return max(0, len(self._pending_gpu_writebacks) - self.pending_writeback_limit)
 
-    def _materialize_active_grid_from_store(self) -> None:
-        loaded = self.store.read_rect(self.active_origin_x, self.active_origin_y, self.active_width, self.active_height)
-        grid = create_grid(self.active_width, self.active_height)
-        _copy_runtime_flags(grid, self.active_grid)
-        _write_grid_region(grid, 0, 0, loaded)
+    def _rematerialize_cpu_grid_for_shift(
+        self,
+        old_rect: WorldRect,
+        new_rect: WorldRect,
+        overlap: WorldRect | None,
+        incoming_rects: list[WorldRect],
+    ) -> None:
+        """Incrementally rebuild CPU grid after a GPU window shift.
+
+        Reuse the old grid's cell list to avoid creating 312K new CellState
+        objects.  Shift the overlap region in-place, then fill incoming
+        regions from the store.
+        """
+        t0 = perf_counter()
+        grid = self.active_grid
+        old_cells = grid.cells
+        w = grid.width
+
+        # Shift overlap region in-place within the same cell list.
+        # Copy direction must avoid overwriting source cells.
+        if overlap is not None:
+            src_x = overlap.x - old_rect.x
+            src_y = overlap.y - old_rect.y
+            dst_x = overlap.x - new_rect.x
+            dst_y = overlap.y - new_rect.y
+            if dst_y <= src_y:
+                for row in range(overlap.height):
+                    src_off = (src_y + row) * w + src_x
+                    dst_off = (dst_y + row) * w + dst_x
+                    old_cells[dst_off:dst_off + overlap.width] = old_cells[src_off:src_off + overlap.width]
+            else:
+                for row in range(overlap.height - 1, -1, -1):
+                    src_off = (src_y + row) * w + src_x
+                    dst_off = (dst_y + row) * w + dst_x
+                    old_cells[dst_off:dst_off + overlap.width] = old_cells[src_off:src_off + overlap.width]
+
+        t_overlap = perf_counter()
+
+        # Clear evicted regions and fill incoming from store
+        evicted_rects = _rect_difference(old_rect, overlap if overlap else old_rect)
+        _empty = empty_cell()
+        for ev in evicted_rects:
+            lx = ev.x - new_rect.x
+            ly = ev.y - new_rect.y
+            for row in range(ev.height):
+                off = (ly + row) * w + lx
+                old_cells[off:off + ev.width] = [_empty] * ev.width
+
+        for incoming_rect in incoming_rects:
+            incoming = self.store.read_rect(incoming_rect.x, incoming_rect.y, incoming_rect.width, incoming_rect.height)
+            _write_grid_region(grid, incoming_rect.x - new_rect.x, incoming_rect.y - new_rect.y, incoming)
+
+        t_incoming = perf_counter()
+
         grid.external_support_anchors = self._build_external_support_anchor_mask(
             WorldRect(self.active_origin_x, self.active_origin_y, self.active_width, self.active_height)
         )
+        t_anchors = perf_counter()
+        log.info("[world] shift-materialized in %.1fms "
+                 "(overlap=%.1f incoming=%.1f anchors=%.1f) incoming=%s",
+                 (t_anchors - t0) * 1000,
+                 (t_overlap - t0) * 1000,
+                 (t_incoming - t_overlap) * 1000,
+                 (t_anchors - t_incoming) * 1000,
+                 [(r.width, r.height) for r in incoming_rects])
+
+    def _materialize_active_grid_from_store(self) -> None:
+        t0 = perf_counter()
+        log.info("[world] materializing active grid: origin=(%d,%d) size=%dx%d",
+                 self.active_origin_x, self.active_origin_y, self.active_width, self.active_height)
+        loaded = self.store.read_rect(self.active_origin_x, self.active_origin_y, self.active_width, self.active_height)
+        t1 = perf_counter()
+        grid = create_grid(self.active_width, self.active_height)
+        _copy_runtime_flags(grid, self.active_grid)
+        _write_grid_region(grid, 0, 0, loaded)
+        t2 = perf_counter()
+        grid.external_support_anchors = self._build_external_support_anchor_mask(
+            WorldRect(self.active_origin_x, self.active_origin_y, self.active_width, self.active_height)
+        )
+        t3 = perf_counter()
         self.active_grid = grid
+        non_empty = sum(1 for c in loaded.cells if c.family_id != "empty")
+        elapsed = (perf_counter() - t0) * 1000
+        log.info("[world] materialized in %.1fms (read=%.1fms write=%.1fms anchors=%.1fms), non_empty_cells=%d / %d total",
+                 elapsed, (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000, non_empty, len(loaded.cells))
 
     def _border_has_external_support_anchor(self, rect: WorldRect, local_x: int, local_y: int) -> bool:
         world_x = rect.x + local_x
@@ -929,6 +1066,9 @@ class ActiveWorldWindow:
         return _capture_grid_region(self.active_grid, local_x, local_y, rect.width, rect.height)
 
     def _shift_active_window(self, new_origin_x: int, new_origin_y: int) -> None:
+        log.info("[world] shifting active window: (%d,%d) -> (%d,%d), camera=(%d,%d)",
+                 self.active_origin_x, self.active_origin_y, new_origin_x, new_origin_y,
+                 self.camera_x, self.camera_y)
         shift_started_at = perf_counter()
         self.paging_stats.last_evict_stage_seconds = 0.0
         self.paging_stats.last_overlap_copy_seconds = 0.0
@@ -1036,6 +1176,9 @@ class ActiveWorldWindow:
 
         self.active_origin_x = new_origin_x
         self.active_origin_y = new_origin_y
+        # Re-materialize CPU grid from store so collision detection sees correct terrain
+        if self.gpu_simulator is not None:
+            self._rematerialize_cpu_grid_for_shift(old_rect, new_rect, overlap, incoming_rects)
         self._set_external_support_anchors()
         self._record_shift_stats(perf_counter() - shift_started_at)
 
@@ -1057,6 +1200,9 @@ class ActiveWorldWindow:
             self._camera_recently_moved = False
 
     def ensure_resident_for_camera(self) -> None:
+        log.debug("[world] ensure_resident: camera=(%d,%d) active_origin=(%d,%d) active_size=%dx%d",
+                  self.camera_x, self.camera_y, self.active_origin_x, self.active_origin_y,
+                  self.active_width, self.active_height)
         new_origin_x = self.active_origin_x
         new_origin_y = self.active_origin_y
         max_origin_x = max(0, self.store.width - self.active_width)
@@ -1081,8 +1227,20 @@ class ActiveWorldWindow:
         moved = next_camera_x != self.camera_x or next_camera_y != self.camera_y
         self.camera_x = next_camera_x
         self.camera_y = next_camera_y
+        if moved:
+            log.info("[world] pan_camera: new camera=(%d,%d) (dx=%d, dy=%d)",
+                     self.camera_x, self.camera_y, dx, dy)
         self.mark_camera_activity(moved)
         self.ensure_resident_for_camera()
+
+    def read_cell(self, world_x: int, world_y: int) -> CellState | None:
+        """Read a cell at world coordinates. Returns None if outside active window."""
+        if not (self.active_rect.x <= world_x < self.active_rect.right and
+                self.active_rect.y <= world_y < self.active_rect.bottom):
+            return None
+        local_x = world_x - self.active_origin_x
+        local_y = world_y - self.active_origin_y
+        return self.active_grid.get_cell(local_x, local_y)
 
     def screen_to_world(self, sx: int, sy: int, *, screen_width: int, screen_height: int) -> tuple[int, int]:
         viewport_x = max(0, min(self.viewport_width - 1, int(float(sx) * self.viewport_width / max(1, screen_width))))

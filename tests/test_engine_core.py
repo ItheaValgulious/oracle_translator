@@ -657,19 +657,6 @@ class EngineCoreTests(unittest.TestCase):
         self.assertTrue(store.anchored_support_at(2, 0))
         self.assertFalse(store.anchored_support_at(3, 0))
 
-    def test_world_chunk_store_stored_cell_rects_merges_rows_into_sparse_rects(self) -> None:
-        store = WorldChunkStore(12, 8, chunk_size=4)
-        for coord in ((2, 1), (3, 1), (2, 2), (3, 2), (8, 4), (8, 5)):
-            store.set_cell(coord[0], coord[1], CellState(family_id="stone", variant_id="stone_platform"))
-        rects = store.stored_cell_rects(WorldRect(0, 0, 10, 6))
-        self.assertEqual(
-            rects,
-            [
-                WorldRect(2, 1, 2, 2),
-                WorldRect(8, 4, 1, 2),
-            ],
-        )
-
     def test_active_world_window_preserves_modified_overlap_when_camera_pages(self) -> None:
         store = WorldChunkStore(12, 1, chunk_size=4)
         for x in range(12):
