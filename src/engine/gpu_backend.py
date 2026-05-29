@@ -205,6 +205,25 @@ class _GpuStageAtlas:
     free_slots: list[int]
 
 
+@dataclass
+class GpuFeedbackToken:
+    result_texture: moderngl.Texture
+    issued_step: int
+    world_width: float
+
+
+FeedbackQueryPoint = tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class PackedStateRegion:
+    width: int
+    height: int
+    state_int: bytes
+    state_vec: bytes
+    state_misc: bytes
+
+
 def _pack_cells_state(cells: list[CellState], tables: GpuMaterialTables) -> tuple[bytes, bytes, bytes]:
     state_int = array("i")
     state_vec = array("f")
@@ -225,6 +244,17 @@ def _pack_cells_state(cells: list[CellState], tables: GpuMaterialTables) -> tupl
 
 def pack_grid_state(grid: Grid, tables: GpuMaterialTables) -> tuple[bytes, bytes, bytes]:
     return _pack_cells_state(grid.cells, tables)
+
+
+def pack_cells_state(cells: list[CellState], tables: GpuMaterialTables) -> PackedStateRegion:
+    state_int, state_vec, state_misc = _pack_cells_state(cells, tables)
+    return PackedStateRegion(
+        width=len(cells),
+        height=1,
+        state_int=state_int,
+        state_vec=state_vec,
+        state_misc=state_misc,
+    )
 
 
 def _unpack_cells_state(
@@ -1183,6 +1213,11 @@ layout(rgba32f, binding = 4) uniform readonly image2D state_vec_src;
 layout(rgba32f, binding = 5) uniform readonly image2D state_misc_src;
 layout(rg32f, binding = 15) uniform readonly image2D force_wave_tex;
 layout(rgba32i, binding = 9) uniform writeonly iimage2D motion_plan_tex;
+layout(r32i, binding = 18) uniform readonly iimage2D entity_mask_tex;
+
+bool entity_occupied_local(ivec2 coord) {
+    return in_bounds(coord) && imageLoad(entity_mask_tex, coord).x != 0;
+}
 
 int liquid_neighbor_count_local(ivec2 coord) {
     int count = 0;
@@ -1208,6 +1243,9 @@ bool motion_target_can_exchange(
     ivec2 target_coord,
     ivec2 direction
 ) {
+    if (entity_occupied_local(target_coord)) {
+        return false;
+    }
     if (
         matter_state_for_variant(current_variant) == MATTER_STATE_LIQUID
         && matter_state_for_variant(target_variant) == MATTER_STATE_GAS
@@ -1256,6 +1294,9 @@ bool motion_target_can_exchange(
 bool downward_exchange_available_local(ivec2 coord, int variant_index) {
     ivec2 below_coord = coord + ivec2(0, 1);
     if (!in_bounds(below_coord)) {
+        return false;
+    }
+    if (entity_occupied_local(below_coord)) {
         return false;
     }
     int below_variant = imageLoad(state_int_src, below_coord).x;
@@ -1340,8 +1381,8 @@ int surface_outflow_direction_local(ivec2 coord, int variant_index) {
     if (!above_is_empty && !downward_blocked) {
         return 0;
     }
-    bool left_is_empty = coord.x > 0 && imageLoad(state_int_src, coord + ivec2(-1, 0)).x == EMPTY_VARIANT_INDEX;
-    bool right_is_empty = coord.x < grid_size.x - 1 && imageLoad(state_int_src, coord + ivec2(1, 0)).x == EMPTY_VARIANT_INDEX;
+    bool left_is_empty = coord.x > 0 && !entity_occupied_local(coord + ivec2(-1, 0)) && imageLoad(state_int_src, coord + ivec2(-1, 0)).x == EMPTY_VARIANT_INDEX;
+    bool right_is_empty = coord.x < grid_size.x - 1 && !entity_occupied_local(coord + ivec2(1, 0)) && imageLoad(state_int_src, coord + ivec2(1, 0)).x == EMPTY_VARIANT_INDEX;
     if (right_is_empty && !left_is_empty) {
         return 1;
     }
@@ -1557,8 +1598,8 @@ def _copy_rgba32i_shader_source(tables: GpuMaterialTables) -> str:
     return _build_common_glsl(tables) + """
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(rgba32i, binding = 18) uniform readonly iimage2D src_tex;
-layout(rgba32i, binding = 19) uniform writeonly iimage2D dst_tex;
+layout(rgba32i, binding = 3) uniform readonly iimage2D src_tex;
+layout(rgba32i, binding = 6) uniform writeonly iimage2D dst_tex;
 
 uniform ivec2 copy_src_origin;
 uniform ivec2 copy_dst_origin;
@@ -1580,8 +1621,8 @@ def _copy_rgba32f_shader_source(tables: GpuMaterialTables) -> str:
     return _build_common_glsl(tables) + """
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(rgba32f, binding = 18) uniform readonly image2D src_tex;
-layout(rgba32f, binding = 19) uniform writeonly image2D dst_tex;
+layout(rgba32f, binding = 4) uniform readonly image2D src_tex;
+layout(rgba32f, binding = 7) uniform writeonly image2D dst_tex;
 
 uniform ivec2 copy_src_origin;
 uniform ivec2 copy_dst_origin;
@@ -1603,8 +1644,8 @@ def _copy_r32f_shader_source(tables: GpuMaterialTables) -> str:
     return _build_common_glsl(tables) + """
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(r32f, binding = 18) uniform readonly image2D src_tex;
-layout(r32f, binding = 19) uniform writeonly image2D dst_tex;
+layout(r32f, binding = 3) uniform readonly image2D src_tex;
+layout(r32f, binding = 6) uniform writeonly image2D dst_tex;
 
 uniform ivec2 copy_src_origin;
 uniform ivec2 copy_dst_origin;
@@ -1626,8 +1667,8 @@ def _copy_rg32f_shader_source(tables: GpuMaterialTables) -> str:
     return _build_common_glsl(tables) + """
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(rg32f, binding = 18) uniform readonly image2D src_tex;
-layout(rg32f, binding = 19) uniform writeonly image2D dst_tex;
+layout(rg32f, binding = 3) uniform readonly image2D src_tex;
+layout(rg32f, binding = 6) uniform writeonly image2D dst_tex;
 
 uniform ivec2 copy_src_origin;
 uniform ivec2 copy_dst_origin;
@@ -1641,6 +1682,65 @@ void main() {
     ivec2 src_coord = copy_src_origin + local_coord;
     ivec2 dst_coord = copy_dst_origin + local_coord;
     imageStore(dst_tex, dst_coord, imageLoad(src_tex, src_coord));
+}
+"""
+
+
+def _copy_state_region_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32i, binding = 3) uniform readonly iimage2D state_int_src_tex;
+layout(rgba32f, binding = 4) uniform readonly image2D state_vec_src_tex;
+layout(rgba32f, binding = 5) uniform readonly image2D state_misc_src_tex;
+layout(rgba32i, binding = 6) uniform writeonly iimage2D state_int_dst_tex;
+layout(rgba32f, binding = 7) uniform writeonly image2D state_vec_dst_tex;
+layout(rgba32f, binding = 8) uniform writeonly image2D state_misc_dst_tex;
+
+uniform ivec2 copy_src_origin;
+uniform ivec2 copy_dst_origin;
+uniform ivec2 copy_size;
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= copy_size.x || local_coord.y >= copy_size.y) {
+        return;
+    }
+    ivec2 src_coord = copy_src_origin + local_coord;
+    ivec2 dst_coord = copy_dst_origin + local_coord;
+    imageStore(state_int_dst_tex, dst_coord, imageLoad(state_int_src_tex, src_coord));
+    imageStore(state_vec_dst_tex, dst_coord, imageLoad(state_vec_src_tex, src_coord));
+    imageStore(state_misc_dst_tex, dst_coord, imageLoad(state_misc_src_tex, src_coord));
+}
+"""
+
+
+def _copy_transient_region_shader_source() -> str:
+    return """
+#version 430
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f, binding = 12) uniform readonly image2D pressure_src_tex;
+layout(r32f, binding = 13) uniform writeonly image2D pressure_dst_tex;
+layout(rg32f, binding = 14) uniform readonly image2D source_force_src_tex;
+layout(rg32f, binding = 15) uniform writeonly image2D source_force_dst_tex;
+layout(rg32f, binding = 16) uniform readonly image2D wave_force_src_tex;
+layout(rg32f, binding = 17) uniform writeonly image2D wave_force_dst_tex;
+
+uniform ivec2 copy_src_origin;
+uniform ivec2 copy_dst_origin;
+uniform ivec2 copy_size;
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= copy_size.x || local_coord.y >= copy_size.y) {
+        return;
+    }
+    ivec2 src_coord = copy_src_origin + local_coord;
+    ivec2 dst_coord = copy_dst_origin + local_coord;
+    imageStore(pressure_dst_tex, dst_coord, imageLoad(pressure_src_tex, src_coord));
+    imageStore(source_force_dst_tex, dst_coord, imageLoad(source_force_src_tex, src_coord));
+    imageStore(wave_force_dst_tex, dst_coord, imageLoad(wave_force_src_tex, src_coord));
 }
 """
 
@@ -1749,10 +1849,18 @@ layout(rgba32f, binding = 8) uniform writeonly image2D state_misc_dst;
 layout(rgba32i, binding = 9) uniform readonly iimage2D motion_plan_tex;
 layout(r32i, binding = 10) uniform readonly iimage2D motion_claim_tex;
 layout(rg32f, binding = 15) uniform readonly image2D force_wave_tex;
+layout(r32i, binding = 18) uniform readonly iimage2D entity_mask_tex;
+
+bool entity_occupied_local(ivec2 coord) {
+    return in_bounds(coord) && imageLoad(entity_mask_tex, coord).x != 0;
+}
 
 bool downward_exchange_available_local(ivec2 coord, int variant_index) {
     ivec2 below_coord = coord + ivec2(0, 1);
     if (!in_bounds(below_coord)) {
+        return false;
+    }
+    if (entity_occupied_local(below_coord)) {
         return false;
     }
     int below_variant = imageLoad(state_int_src, below_coord).x;
@@ -2121,6 +2229,191 @@ void main() {
     imageStore(state_int_dst, coord, out_int);
     imageStore(state_vec_dst, coord, cell_vec);
     imageStore(state_misc_dst, coord, out_misc);
+}
+"""
+
+
+def _thermal_phase_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32i, binding = 3) uniform readonly iimage2D state_int_src;
+layout(rgba32f, binding = 4) uniform readonly image2D state_vec_src;
+layout(rgba32f, binding = 5) uniform readonly image2D state_misc_src;
+layout(rgba32i, binding = 6) uniform writeonly iimage2D state_int_dst;
+layout(rgba32f, binding = 7) uniform writeonly image2D state_vec_dst;
+layout(rgba32f, binding = 8) uniform writeonly image2D state_misc_dst;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (!in_bounds(coord)) {
+        return;
+    }
+
+    ivec4 cell_int = imageLoad(state_int_src, coord);
+    vec4 cell_vec = imageLoad(state_vec_src, coord);
+    vec4 cell_misc = imageLoad(state_misc_src, coord);
+    int variant_index = cell_int.x;
+
+    float next_temperature = cell_misc.x;
+    for (int index = 0; index < 4; index += 1) {
+        ivec2 neighbor_coord = coord + HEAT_NEIGHBORS[index];
+        if (!in_bounds(neighbor_coord)) {
+            continue;
+        }
+        ivec4 neighbor_int = imageLoad(state_int_src, neighbor_coord);
+        vec4 neighbor_misc = imageLoad(state_misc_src, neighbor_coord);
+        float conductivity = (thermal_conductivity_for_variant(variant_index) + thermal_conductivity_for_variant(neighbor_int.x)) * 0.5;
+        conductivity *= thermal_conduction_multiplier_between(variant_index, neighbor_int.x);
+        float capacity = max((heat_capacity_for_variant(variant_index) + heat_capacity_for_variant(neighbor_int.x)) * 0.5, 0.001);
+        float delta = (neighbor_misc.x - cell_misc.x) * conductivity * THERMAL_CONDUCTION_RATE * dt / capacity;
+        next_temperature += clamp(delta, -MAX_HEAT_EXCHANGE, MAX_HEAT_EXCHANGE);
+    }
+
+    ivec4 out_int = cell_int;
+    vec4 out_misc = cell_misc;
+    out_misc.x = next_temperature;
+    if (variant_index == EMPTY_VARIANT_INDEX) {
+        float ambient_temperature_value = ambient_temperature_at_coord(coord);
+        out_misc.x += (ambient_temperature_value - out_misc.x) * AMBIENT_AIR_RESTORE_RATE * dt;
+    }
+
+    int family_index = family_index_for_variant(out_int.x);
+    FamilyData family = family_table[family_index];
+    for (int offset = 0; offset < family.ints0.w; offset += 1) {
+        PhaseRuleData rule = phase_table[family.ints0.z + offset];
+        if (rule.ints0.x != out_int.x) {
+            continue;
+        }
+        if ((rule.ints0.z & PHASE_FLAG_ABOVE) != 0 && out_misc.x < rule.floats0.x) {
+            continue;
+        }
+        if ((rule.ints0.z & PHASE_FLAG_BELOW) != 0 && out_misc.x > rule.floats0.y) {
+            continue;
+        }
+
+        int target_variant = rule.ints0.y;
+        if ((rule.ints0.z & PHASE_FLAG_COOL_TO_SOLID) != 0) {
+            target_variant = out_misc.y > SUPPORT_FAILURE_THRESHOLD
+                ? family.ints0.x
+                : (family.ints0.y >= 0 ? family.ints0.y : family.ints0.x);
+        }
+
+        out_int.x = target_variant;
+        out_misc.w = 0.0;
+        if (!support_bearing_for_variant(target_variant)) {
+            out_int.z &= ~CELL_FLAG_FIXPOINT;
+            out_int.y = 0;
+            out_misc.y = 0.0;
+        }
+        break;
+    }
+
+    imageStore(state_int_dst, coord, out_int);
+    imageStore(state_vec_dst, coord, cell_vec);
+    imageStore(state_misc_dst, coord, out_misc);
+}
+"""
+
+
+def _feedback_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 1, local_size_y = 1) in;
+
+layout(rgba32i, binding = 3) uniform readonly iimage2D state_int_src;
+layout(rgba32f, binding = 17) uniform writeonly image2D feedback_tex;
+layout(std430, binding = 4) readonly buffer EntityQueryPointBuffer {
+    ivec4 query_points[];
+};
+
+uniform int query_point_count;
+
+bool solid_for_feedback(int variant_index) {
+    if (variant_index == EMPTY_VARIANT_INDEX) {
+        return false;
+    }
+    return matter_state_for_variant(variant_index) == MATTER_STATE_SOLID;
+}
+
+bool liquid_for_feedback(int variant_index) {
+    if (variant_index == EMPTY_VARIANT_INDEX) {
+        return false;
+    }
+    return matter_state_for_variant(variant_index) == MATTER_STATE_LIQUID;
+}
+
+void main() {
+    float blocked_below = 0.0;
+    float blocked_left = 0.0;
+    float blocked_right = 0.0;
+    float blocked_up = 0.0;
+
+    float in_liquid = 0.0;
+    int capped_count = min(query_point_count, 64);
+    for (int index = 0; index < capped_count; index += 1) {
+        ivec4 point = query_points[index];
+        ivec2 coord = point.xy;
+        if (coord.x < 0 || coord.y < 0 || coord.x >= grid_size.x || coord.y >= grid_size.y) {
+            continue;
+        }
+        int variant_index = imageLoad(state_int_src, coord).x;
+        if (point.z == 4) {
+            if (liquid_for_feedback(variant_index)) {
+                in_liquid = 1.0;
+            }
+        } else if (solid_for_feedback(variant_index)) {
+            if (point.z == 0) {
+                blocked_below = 1.0;
+            } else if (point.z == 1) {
+                blocked_left = 1.0;
+            } else if (point.z == 2) {
+                blocked_right = 1.0;
+            } else if (point.z == 3) {
+                blocked_up = 1.0;
+            }
+        }
+    }
+
+    imageStore(feedback_tex, ivec2(0, 0), vec4(blocked_below, blocked_left, blocked_right, blocked_up * 2.0 + in_liquid));
+}
+"""
+
+
+def _entity_mask_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32i, binding = 18) uniform writeonly iimage2D entity_mask_tex;
+
+uniform ivec4 entity_clip;
+uniform ivec2 entity_dispatch_origin;
+uniform ivec2 entity_dispatch_size;
+uniform int entity_tag;
+uniform int clear_mask;
+
+void main() {
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= entity_dispatch_size.x || local_coord.y >= entity_dispatch_size.y) {
+        return;
+    }
+    ivec2 coord = entity_dispatch_origin + local_coord;
+    if (!in_bounds(coord)) {
+        return;
+    }
+
+    int value = 0;
+    if (clear_mask == 0) {
+        int lx0 = clamp(entity_clip.x, 0, grid_size.x);
+        int ly0 = clamp(entity_clip.y, 0, grid_size.y);
+        int lx1 = clamp(entity_clip.z, 0, grid_size.x);
+        int ly1 = clamp(entity_clip.w, 0, grid_size.y);
+        if (coord.x >= lx0 && coord.x < lx1 && coord.y >= ly0 && coord.y < ly1) {
+            value = max(1, entity_tag);
+        } else {
+            return;
+        }
+    }
+    imageStore(entity_mask_tex, coord, ivec4(value, 0, 0, 0));
 }
 """
 
@@ -2502,13 +2795,24 @@ void main() {
 
 
 class GpuSimulator:
-    def __init__(self, ctx: moderngl.Context, grid: Grid, registry: MaterialRegistry) -> None:
+    def __init__(
+        self,
+        ctx: moderngl.Context,
+        width: int,
+        height: int,
+        registry: MaterialRegistry,
+        *,
+        liquid_brownian_enabled: bool = True,
+        blocked_impulse_enabled: bool = True,
+        directional_fallback_enabled: bool = True,
+        directional_fallback_angle_limit_degrees: float = 45.0,
+    ) -> None:
         if getattr(ctx, "version_code", 0) < 430:
             raise ComputeBackendUnavailable("OpenGL 4.3 or newer is required for compute shaders.")
 
         self.ctx = ctx
-        self.width = grid.width
-        self.height = grid.height
+        self.width = int(width)
+        self.height = int(height)
         self.registry = registry
         self.tables = GpuMaterialTables.from_registry(registry)
         self.group_x, self.group_y = _dispatch_groups(self.width, self.height)
@@ -2517,11 +2821,11 @@ class GpuSimulator:
         self.pressure_front_index = 0
         self.source_force_front_index = 0
         self.wave_force_front_index = 0
-        self.step_index = grid.step_id
-        self.liquid_brownian_enabled = bool(grid.liquid_brownian_enabled)
-        self.blocked_impulse_enabled = bool(grid.blocked_impulse_enabled)
-        self.directional_fallback_enabled = bool(grid.directional_fallback_enabled)
-        self.directional_fallback_angle_limit_degrees = float(grid.directional_fallback_angle_limit_degrees)
+        self.step_index = 0
+        self.liquid_brownian_enabled = bool(liquid_brownian_enabled)
+        self.blocked_impulse_enabled = bool(blocked_impulse_enabled)
+        self.directional_fallback_enabled = bool(directional_fallback_enabled)
+        self.directional_fallback_angle_limit_degrees = float(directional_fallback_angle_limit_degrees)
         self._staged_region_pool: dict[tuple[int, int], list[GpuStagedRegion]] = {}
         self._stage_atlases: dict[str, _GpuStageAtlas] = {}
 
@@ -2547,6 +2851,11 @@ class GpuSimulator:
         self.motion_plan = self._make_texture(4, "i4")
         self.motion_claim = self._make_texture(1, "i4")
         self.reaction_claim = self._make_texture(1, "i4")
+        self.entity_mask = self._make_texture(1, "i4")
+        self._entity_mask_rects: list[tuple[int, int, int, int]] = []
+        self._feedback_textures = [self._make_texture_for_size(1, 1, 4, "f4") for _ in range(3)]
+        self._feedback_buffer_index = 0
+        self._entity_query_buffer = self.ctx.buffer(reserve=64 * 16)
         self.frame_texture = self._make_texture(4, "f1")
         self.frame_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.frame_texture.repeat_x = False
@@ -2560,12 +2869,15 @@ class GpuSimulator:
         self.clear_r32i_shader = self.ctx.compute_shader(_clear_r32i_shader_source(self.tables))
         self.copy_rgba32i_shader = self.ctx.compute_shader(_copy_rgba32i_shader_source(self.tables))
         self.copy_rgba32f_shader = self.ctx.compute_shader(_copy_rgba32f_shader_source(self.tables))
-        self.copy_r32f_shader = self.ctx.compute_shader(_copy_r32f_shader_source(self.tables))
-        self.copy_rg32f_shader = self.ctx.compute_shader(_copy_rg32f_shader_source(self.tables))
+        self.copy_state_region_shader = self.ctx.compute_shader(_copy_state_region_shader_source(self.tables))
+        self.copy_transient_region_shader = self.ctx.compute_shader(_copy_transient_region_shader_source())
         self.motion_claim_shader = self.ctx.compute_shader(_motion_claim_shader_source(self.tables))
         self.motion_resolve_shader = self.ctx.compute_shader(_motion_resolve_shader_source(self.tables))
         self.thermal_shader = self.ctx.compute_shader(_thermal_shader_source(self.tables))
         self.phase_shader = self.ctx.compute_shader(_phase_shader_source(self.tables))
+        self.thermal_phase_shader = self.ctx.compute_shader(_thermal_phase_shader_source(self.tables))
+        self.feedback_shader = self.ctx.compute_shader(_feedback_shader_source(self.tables))
+        self.entity_mask_shader = self.ctx.compute_shader(_entity_mask_shader_source(self.tables))
         self.reaction_resolve_shader = self.ctx.compute_shader(_reaction_resolve_shader_source(self.tables))
         self.collapse_shader = self.ctx.compute_shader(_collapse_shader_source(self.tables))
         self.render_shader = self.ctx.compute_shader(_render_shader_source(self.tables))
@@ -2580,10 +2892,14 @@ class GpuSimulator:
             self.support_shader,
             self.motion_plan_shader,
             self.clear_r32i_shader,
+            self.copy_state_region_shader,
             self.motion_claim_shader,
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
+            self.thermal_phase_shader,
+            self.feedback_shader,
+            self.entity_mask_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2592,7 +2908,8 @@ class GpuSimulator:
         )
         _set_uniform_if_present(self.clear_transient_region_shader, "grid_size", (self.width, self.height))
 
-        self.load_grid(grid)
+        self.initialize_empty()
+        self._prewarm_stage_atlases()
         self.render()
 
     def _make_texture(self, components: int, dtype: str) -> moderngl.Texture:
@@ -2625,10 +2942,14 @@ class GpuSimulator:
             self.support_shader,
             self.motion_plan_shader,
             self.clear_r32i_shader,
+            self.copy_state_region_shader,
             self.motion_claim_shader,
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
+            self.thermal_phase_shader,
+            self.feedback_shader,
+            self.entity_mask_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2645,10 +2966,14 @@ class GpuSimulator:
             self.support_shader,
             self.motion_plan_shader,
             self.clear_r32i_shader,
+            self.copy_state_region_shader,
             self.motion_claim_shader,
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
+            self.thermal_phase_shader,
+            self.feedback_shader,
+            self.entity_mask_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2665,14 +2990,14 @@ class GpuSimulator:
             self.support_shader,
             self.motion_plan_shader,
             self.clear_r32i_shader,
-            self.copy_rgba32i_shader,
-            self.copy_rgba32f_shader,
-            self.copy_r32f_shader,
-            self.copy_rg32f_shader,
+            self.copy_state_region_shader,
             self.motion_claim_shader,
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
+            self.thermal_phase_shader,
+            self.feedback_shader,
+            self.entity_mask_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2689,10 +3014,14 @@ class GpuSimulator:
             self.support_shader,
             self.motion_plan_shader,
             self.clear_r32i_shader,
+            self.copy_state_region_shader,
             self.motion_claim_shader,
             self.motion_resolve_shader,
             self.thermal_shader,
             self.phase_shader,
+            self.thermal_phase_shader,
+            self.feedback_shader,
+            self.entity_mask_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
@@ -2740,16 +3069,30 @@ class GpuSimulator:
         components: int,
         dtype: str,
     ) -> bytes:
-        framebuffer = self.ctx.framebuffer(color_attachments=[texture])
         try:
-            return framebuffer.read(
-                viewport=(x, y, width, height),
-                components=components,
-                dtype=dtype,
-                alignment=1,
-            )
-        finally:
-            framebuffer.release()
+            framebuffer = self.ctx.framebuffer(color_attachments=[texture])
+            try:
+                return framebuffer.read(
+                    viewport=(x, y, width, height),
+                    components=components,
+                    dtype=dtype,
+                    alignment=1,
+                )
+            finally:
+                framebuffer.release()
+        except moderngl.Error:
+            texture_width, _texture_height = texture.size
+            bytes_per_component = 4 if dtype in {"i4", "f4"} else 1
+            pixel_size = components * bytes_per_component
+            row_size = width * pixel_size
+            full_row_size = texture_width * pixel_size
+            full_data = texture.read(alignment=1)
+            rows = []
+            row_start = y * full_row_size + x * pixel_size
+            for row in range(height):
+                start = row_start + row * full_row_size
+                rows.append(full_data[start : start + row_size])
+            return b"".join(rows)
 
     def _acquire_stage_atlas(self, kind: str, *, slot_width: int, slot_height: int, slot_count: int = 16) -> _GpuStageAtlas:
         atlas = self._stage_atlases.get(kind)
@@ -2767,6 +3110,14 @@ class GpuSimulator:
             self._stage_atlases[kind] = atlas
         return atlas
 
+    def _prewarm_stage_atlases(self) -> None:
+        for width in (16, 32, 64):
+            if width <= self.width:
+                self._acquire_stage_atlas(f"vertical_strip:{width}x{self.height}", slot_width=width, slot_height=self.height)
+        for height in (16, 32, 64):
+            if height <= self.height:
+                self._acquire_stage_atlas(f"horizontal_strip:{self.width}x{height}", slot_width=self.width, slot_height=height)
+
     def _run_copy_shader(
         self,
         shader: moderngl.ComputeShader,
@@ -2780,14 +3131,73 @@ class GpuSimulator:
         dst_x: int,
         dst_y: int,
     ) -> None:
-        src_texture.bind_to_image(18, read=True, write=False)
-        dst_texture.bind_to_image(19, read=False, write=True)
+        if shader is self.copy_rgba32f_shader:
+            src_texture.bind_to_image(4, read=True, write=False)
+            dst_texture.bind_to_image(7, read=False, write=True)
+        else:
+            src_texture.bind_to_image(3, read=True, write=False)
+            dst_texture.bind_to_image(6, read=False, write=True)
         shader["copy_src_origin"].value = (src_x, src_y)
         shader["copy_dst_origin"].value = (dst_x, dst_y)
         shader["copy_size"].value = (width, height)
         group_x, group_y = _dispatch_groups(width, height)
         shader.run(group_x=group_x, group_y=group_y, group_z=1)
         self.ctx.memory_barrier()
+
+    def _run_state_copy_shader(
+        self,
+        *,
+        src_state_int: moderngl.Texture,
+        src_state_vec: moderngl.Texture,
+        src_state_misc: moderngl.Texture,
+        dst_state_int: moderngl.Texture,
+        dst_state_vec: moderngl.Texture,
+        dst_state_misc: moderngl.Texture,
+        src_x: int,
+        src_y: int,
+        width: int,
+        height: int,
+        dst_x: int,
+        dst_y: int,
+    ) -> None:
+        src_state_int.bind_to_image(3, read=True, write=False)
+        src_state_vec.bind_to_image(4, read=True, write=False)
+        src_state_misc.bind_to_image(5, read=True, write=False)
+        dst_state_int.bind_to_image(6, read=False, write=True)
+        dst_state_vec.bind_to_image(7, read=False, write=True)
+        dst_state_misc.bind_to_image(8, read=False, write=True)
+        self.copy_state_region_shader["copy_src_origin"].value = (src_x, src_y)
+        self.copy_state_region_shader["copy_dst_origin"].value = (dst_x, dst_y)
+        self.copy_state_region_shader["copy_size"].value = (width, height)
+        group_x, group_y = _dispatch_groups(width, height)
+        self.copy_state_region_shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
+
+    def _run_transient_copy_shader(
+        self,
+        *,
+        src_x: int,
+        src_y: int,
+        width: int,
+        height: int,
+        dst_x: int,
+        dst_y: int,
+    ) -> None:
+        self.pressure_tex[self.pressure_front_index].bind_to_image(12, read=True, write=False)
+        self.pressure_tex[1 - self.pressure_front_index].bind_to_image(13, read=False, write=True)
+        self.source_force_tex[self.source_force_front_index].bind_to_image(14, read=True, write=False)
+        self.source_force_tex[1 - self.source_force_front_index].bind_to_image(15, read=False, write=True)
+        self.wave_force_tex[self.wave_force_front_index].bind_to_image(16, read=True, write=False)
+        self.wave_force_tex[1 - self.wave_force_front_index].bind_to_image(17, read=False, write=True)
+        self.copy_transient_region_shader["copy_src_origin"].value = (src_x, src_y)
+        self.copy_transient_region_shader["copy_dst_origin"].value = (dst_x, dst_y)
+        self.copy_transient_region_shader["copy_size"].value = (width, height)
+        group_x, group_y = _dispatch_groups(width, height)
+        self.copy_transient_region_shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
+        self.pressure_front_index = 1 - self.pressure_front_index
+        self.source_force_front_index = 1 - self.source_force_front_index
+        self.wave_force_front_index = 1 - self.wave_force_front_index
 
     def _bind_state(self, src_index: int, dst_index: int) -> None:
         self.state_int[src_index].bind_to_image(3, read=True, write=False)
@@ -2819,6 +3229,51 @@ class GpuSimulator:
         self.clear_r32i_shader["clear_value"].value = clear_value
         self.clear_r32i_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
         self.ctx.memory_barrier()
+
+    def _run_entity_mask_rect(
+        self,
+        *,
+        clip: tuple[int, int, int, int],
+        entity_tag: int,
+        clear_mask: bool,
+    ) -> bool:
+        lx0, ly0, lx1, ly1 = clip
+        lx0 = max(0, min(self.width, int(lx0)))
+        ly0 = max(0, min(self.height, int(ly0)))
+        lx1 = max(0, min(self.width, int(lx1)))
+        ly1 = max(0, min(self.height, int(ly1)))
+        if lx0 >= lx1 or ly0 >= ly1:
+            return False
+        self.entity_mask.bind_to_image(18, read=False, write=True)
+        _set_uniform_if_present(self.entity_mask_shader, "dt", 0.0)
+        _set_uniform_if_present(self.entity_mask_shader, "step_index", self.step_index)
+        self.entity_mask_shader["clear_mask"].value = int(clear_mask)
+        self.entity_mask_shader["entity_clip"].value = (lx0, ly0, lx1, ly1)
+        self.entity_mask_shader["entity_dispatch_origin"].value = (lx0, ly0)
+        self.entity_mask_shader["entity_dispatch_size"].value = (lx1 - lx0, ly1 - ly0)
+        self.entity_mask_shader["entity_tag"].value = int(entity_tag)
+        group_x, group_y = _dispatch_groups(lx1 - lx0, ly1 - ly0)
+        self.entity_mask_shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
+        return True
+
+    def update_entity_mask(self, rects: list[tuple[int, int, int, int, int]]) -> None:
+        for lx0, ly0, lx1, ly1 in self._entity_mask_rects:
+            self._run_entity_mask_rect(clip=(lx0, ly0, lx1, ly1), entity_tag=0, clear_mask=True)
+        next_rects: list[tuple[int, int, int, int]] = []
+        for lx0, ly0, lx1, ly1, entity_tag in rects:
+            if self._run_entity_mask_rect(clip=(lx0, ly0, lx1, ly1), entity_tag=entity_tag, clear_mask=False):
+                next_rects.append((
+                    max(0, min(self.width, int(lx0))),
+                    max(0, min(self.height, int(ly0))),
+                    max(0, min(self.width, int(lx1))),
+                    max(0, min(self.height, int(ly1))),
+                ))
+        self._entity_mask_rects = next_rects
+
+    def clear_entity_mask(self) -> None:
+        self._run_entity_mask_rect(clip=(0, 0, self.width, self.height), entity_tag=0, clear_mask=True)
+        self._entity_mask_rects.clear()
 
     def _run_pressure(self, *, step_seed: int | None = None) -> None:
         self.state_int[self.front_index].bind_to_image(3, read=True, write=False)
@@ -2870,6 +3325,7 @@ class GpuSimulator:
         self.pressure_tex[self.pressure_front_index].bind_to_image(12, read=True, write=False)
         self.wave_force_tex[self.wave_force_front_index].bind_to_image(15, read=True, write=False)
         self.motion_plan.bind_to_image(9, read=False, write=True)
+        self.entity_mask.bind_to_image(18, read=True, write=False)
         _set_uniform_if_present(self.motion_plan_shader, "dt", dt)
         _set_uniform_if_present(self.motion_plan_shader, "step_index", self.step_index if step_seed is None else step_seed)
         _set_uniform_if_present(self.motion_plan_shader, "liquids_only", int(liquids_only))
@@ -2895,6 +3351,7 @@ class GpuSimulator:
         self.motion_claim.bind_to_image(10, read=True, write=False)
         self.pressure_tex[self.pressure_front_index].bind_to_image(12, read=True, write=False)
         self.wave_force_tex[self.wave_force_front_index].bind_to_image(15, read=True, write=False)
+        self.entity_mask.bind_to_image(18, read=True, write=False)
         _set_uniform_if_present(self.motion_resolve_shader, "dt", dt)
         _set_uniform_if_present(self.motion_resolve_shader, "step_index", self.step_index if step_seed is None else step_seed)
         _set_uniform_if_present(self.motion_resolve_shader, "liquids_only", int(liquids_only))
@@ -2915,6 +3372,33 @@ class GpuSimulator:
         self.reaction_resolve_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
         self.ctx.memory_barrier()
         self.front_index = 1 - self.front_index
+
+    def initialize_empty(self) -> None:
+        for buffer_index in range(2):
+            self.fill_empty_region(
+                0,
+                0,
+                self.width,
+                self.height,
+                world_row_offset=0,
+                world_height=self.height,
+                buffer_index=buffer_index,
+            )
+        pressure_bytes = self._pressure_bytes()
+        for texture in self.pressure_tex:
+            texture.write(pressure_bytes)
+        force_bytes = self._force_bytes()
+        for texture in self.source_force_tex:
+            texture.write(force_bytes)
+        for texture in self.wave_force_tex:
+            texture.write(force_bytes)
+        self.clear_entity_mask()
+        self.clear_external_support_anchors()
+        self.front_index = 0
+        self.pressure_front_index = 0
+        self.source_force_front_index = 0
+        self.wave_force_front_index = 0
+        self.step_index = 0
 
     def load_grid(self, grid: Grid) -> None:
         if grid.width != self.width or grid.height != self.height:
@@ -2938,6 +3422,7 @@ class GpuSimulator:
             texture.write(force_bytes)
         for texture in self.wave_force_tex:
             texture.write(force_bytes)
+        self.clear_entity_mask()
         self.set_external_support_anchors(grid.external_support_anchors)
         self.front_index = 0
         self.pressure_front_index = 0
@@ -2985,7 +3470,7 @@ class GpuSimulator:
     def clear_region_transients(self, x: int, y: int, width: int, height: int) -> None:
         if width <= 0 or height <= 0:
             return
-        self.pressure_tex[1 - self.pressure_front_index].bind_to_image(12, read=False, write=True)
+        self.pressure_tex[self.pressure_front_index].bind_to_image(12, read=False, write=True)
         self.source_force_tex[self.source_force_front_index].bind_to_image(13, read=False, write=True)
         self.wave_force_tex[self.wave_force_front_index].bind_to_image(14, read=False, write=True)
         self.clear_transient_region_shader["clear_dst_origin"].value = (x, y)
@@ -3027,6 +3512,58 @@ class GpuSimulator:
         self.state_int[target_index].write(state_int_data, viewport=viewport)
         self.state_vec[target_index].write(state_vec_data, viewport=viewport)
         self.state_misc[target_index].write(state_misc_data, viewport=viewport)
+
+    def read_region_bytes(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        buffer_index: int | None = None,
+    ) -> PackedStateRegion:
+        if width <= 0 or height <= 0:
+            return PackedStateRegion(width=0, height=0, state_int=b"", state_vec=b"", state_misc=b"")
+        source_index = self.front_index if buffer_index is None else buffer_index
+        x0 = max(0, int(x))
+        y0 = max(0, int(y))
+        x1 = min(self.width, x0 + int(width))
+        y1 = min(self.height, y0 + int(height))
+        if x0 >= x1 or y0 >= y1:
+            return PackedStateRegion(width=0, height=0, state_int=b"", state_vec=b"", state_misc=b"")
+        read_width = x1 - x0
+        read_height = y1 - y0
+        return PackedStateRegion(
+            width=read_width,
+            height=read_height,
+            state_int=self._read_texture_region(
+                self.state_int[source_index],
+                x0,
+                y0,
+                read_width,
+                read_height,
+                components=4,
+                dtype="i4",
+            ),
+            state_vec=self._read_texture_region(
+                self.state_vec[source_index],
+                x0,
+                y0,
+                read_width,
+                read_height,
+                components=4,
+                dtype="f4",
+            ),
+            state_misc=self._read_texture_region(
+                self.state_misc[source_index],
+                x0,
+                y0,
+                read_width,
+                read_height,
+                components=4,
+                dtype="f4",
+            ),
+        )
 
     def write_store_rect(
         self,
@@ -3114,32 +3651,13 @@ class GpuSimulator:
     ) -> None:
         source_index = self.front_index if src_buffer_index is None else src_buffer_index
         target_index = self.front_index if dst_buffer_index is None else dst_buffer_index
-        self._run_copy_shader(
-            self.copy_rgba32i_shader,
-            self.state_int[source_index],
-            self.state_int[target_index],
-            src_x=src_x,
-            src_y=src_y,
-            width=width,
-            height=height,
-            dst_x=dst_x,
-            dst_y=dst_y,
-        )
-        self._run_copy_shader(
-            self.copy_rgba32f_shader,
-            self.state_vec[source_index],
-            self.state_vec[target_index],
-            src_x=src_x,
-            src_y=src_y,
-            width=width,
-            height=height,
-            dst_x=dst_x,
-            dst_y=dst_y,
-        )
-        self._run_copy_shader(
-            self.copy_rgba32f_shader,
-            self.state_misc[source_index],
-            self.state_misc[target_index],
+        self._run_state_copy_shader(
+            src_state_int=self.state_int[source_index],
+            src_state_vec=self.state_vec[source_index],
+            src_state_misc=self.state_misc[source_index],
+            dst_state_int=self.state_int[target_index],
+            dst_state_vec=self.state_vec[target_index],
+            dst_state_misc=self.state_misc[target_index],
             src_x=src_x,
             src_y=src_y,
             width=width,
@@ -3157,10 +3675,7 @@ class GpuSimulator:
         dst_x: int,
         dst_y: int,
     ) -> None:
-        self._run_copy_shader(
-            self.copy_r32f_shader,
-            self.pressure_tex[self.pressure_front_index],
-            self.pressure_tex[1 - self.pressure_front_index],
+        self._run_transient_copy_shader(
             src_x=src_x,
             src_y=src_y,
             width=width,
@@ -3168,31 +3683,6 @@ class GpuSimulator:
             dst_x=dst_x,
             dst_y=dst_y,
         )
-        self._run_copy_shader(
-            self.copy_rg32f_shader,
-            self.source_force_tex[self.source_force_front_index],
-            self.source_force_tex[1 - self.source_force_front_index],
-            src_x=src_x,
-            src_y=src_y,
-            width=width,
-            height=height,
-            dst_x=dst_x,
-            dst_y=dst_y,
-        )
-        self._run_copy_shader(
-            self.copy_rg32f_shader,
-            self.wave_force_tex[self.wave_force_front_index],
-            self.wave_force_tex[1 - self.wave_force_front_index],
-            src_x=src_x,
-            src_y=src_y,
-            width=width,
-            height=height,
-            dst_x=dst_x,
-            dst_y=dst_y,
-        )
-        self.pressure_front_index = 1 - self.pressure_front_index
-        self.source_force_front_index = 1 - self.source_force_front_index
-        self.wave_force_front_index = 1 - self.wave_force_front_index
 
     def stage_region(self, x: int, y: int, width: int, height: int) -> GpuStagedRegion:
         stage_kind: str | None = None
@@ -3359,6 +3849,53 @@ class GpuSimulator:
         cells = _unpack_cells_state(self.tables, state_int_data, state_vec_data, state_misc_data)
         return GridSlice(width=read_width, height=read_height, cells=cells)
 
+    def read_staged_region_bytes(
+        self,
+        staged: GpuStagedRegion,
+        *,
+        x: int = 0,
+        y: int = 0,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> PackedStateRegion:
+        read_width = staged.width - x if width is None else width
+        read_height = staged.height - y if height is None else height
+        if x < 0 or y < 0 or read_width <= 0 or read_height <= 0:
+            raise ValueError("Staged region read must be within bounds.")
+        if x + read_width > staged.width or y + read_height > staged.height:
+            raise ValueError("Staged region read exceeds staged bounds.")
+        return PackedStateRegion(
+            width=read_width,
+            height=read_height,
+            state_int=self._read_texture_region(
+                staged.state_int,
+                staged.src_origin_x + x,
+                staged.src_origin_y + y,
+                read_width,
+                read_height,
+                components=4,
+                dtype="i4",
+            ),
+            state_vec=self._read_texture_region(
+                staged.state_vec,
+                staged.src_origin_x + x,
+                staged.src_origin_y + y,
+                read_width,
+                read_height,
+                components=4,
+                dtype="f4",
+            ),
+            state_misc=self._read_texture_region(
+                staged.state_misc,
+                staged.src_origin_x + x,
+                staged.src_origin_y + y,
+                read_width,
+                read_height,
+                components=4,
+                dtype="f4",
+            ),
+        )
+
     def release_staged_region(self, staged: GpuStagedRegion) -> None:
         if staged.atlas_kind is not None:
             atlas = self._stage_atlases.get(staged.atlas_kind)
@@ -3370,8 +3907,7 @@ class GpuSimulator:
     def step(self, dt: float) -> None:
         self._run_support(dt)
         self._run_reactions(dt)
-        self._run_stage(self.thermal_shader, dt)
-        self._run_stage(self.phase_shader, dt)
+        self._run_stage(self.thermal_phase_shader, dt)
         self._run_pressure(step_seed=self.step_index)
         self._run_source_force(step_seed=self.step_index)
         next_wave_index = self._run_force_wave(step_seed=self.step_index)
@@ -3403,6 +3939,75 @@ class GpuSimulator:
         self.render_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
         self.ctx.memory_barrier()
         return self.frame_texture
+
+    def request_entity_feedback(
+        self,
+        *,
+        clip: tuple[int, int, int, int],
+        query_points: list[FeedbackQueryPoint] | None = None,
+        entity_tag: int = 0,
+        world_width: float,
+    ) -> GpuFeedbackToken:
+        self.state_int[self.front_index].bind_to_image(3, read=True, write=False)
+        texture = self._feedback_textures[self._feedback_buffer_index]
+        self._feedback_buffer_index = (self._feedback_buffer_index + 1) % len(self._feedback_textures)
+        texture.bind_to_image(17, read=False, write=True)
+        _set_uniform_if_present(self.feedback_shader, "dt", 0.0)
+        _set_uniform_if_present(self.feedback_shader, "step_index", self.step_index)
+        points = list(query_points or self._default_entity_feedback_points(clip))
+        if len(points) > 64:
+            points = points[:64]
+        point_data = array("i")
+        for x, y, kind in points:
+            point_data.extend((int(x), int(y), int(kind), 0))
+        if point_data:
+            self._entity_query_buffer.write(point_data.tobytes())
+        self._entity_query_buffer.bind_to_storage_buffer(4)
+        self.feedback_shader["query_point_count"].value = len(points)
+        self.feedback_shader.run(group_x=1, group_y=1, group_z=1)
+        self.ctx.memory_barrier()
+
+        return GpuFeedbackToken(result_texture=texture, issued_step=self.step_index, world_width=float(world_width))
+
+    def _default_entity_feedback_points(self, clip: tuple[int, int, int, int]) -> list[FeedbackQueryPoint]:
+        lx0, ly0, lx1, ly1 = (int(v) for v in clip)
+        points: list[FeedbackQueryPoint] = []
+        for x in range(lx0, min(lx1, lx0 + 16)):
+            points.append((x, ly1, 0))
+            points.append((x, ly0 - 1, 3))
+        for y in range(ly0, min(ly1, ly0 + 16)):
+            points.append((lx0 - 1, y, 1))
+            points.append((lx1, y, 2))
+        return points
+
+    def poll_entity_feedback(self, token: GpuFeedbackToken):
+        from src.game.hero import GridFeedback
+
+        if self.step_index <= token.issued_step:
+            return None
+        values = array("f")
+        values.frombytes(token.result_texture.read(alignment=1))
+        if len(values) < 4:
+            return None
+        packed_flags_damage = float(values[3])
+        blocked_up = packed_flags_damage >= 1.5
+        if blocked_up:
+            packed_flags_damage -= 2.0
+        in_liquid = packed_flags_damage >= 0.5
+        if in_liquid:
+            packed_flags_damage -= 1.0
+        damage = max(0.0, packed_flags_damage * 1000.0)
+        if damage < 0.001:
+            damage = 0.0
+        return GridFeedback(
+            world_width=token.world_width,
+            blocked_below=values[0] >= 0.5,
+            blocked_left=values[1] >= 0.5,
+            blocked_right=values[2] >= 0.5,
+            blocked_up=blocked_up,
+            in_liquid=in_liquid,
+            damage=damage,
+        )
 
     def paint_circle(
         self,
