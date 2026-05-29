@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
+_debug_logging = os.environ.get("ORACLE_TRANSLATOR_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
 # Configure logging to file + stderr
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.DEBUG if _debug_logging else logging.WARNING,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler("game_debug.log", mode="w"),
+        logging.FileHandler("game_debug.log", mode="a"),
         logging.StreamHandler(sys.stderr),
     ],
 )

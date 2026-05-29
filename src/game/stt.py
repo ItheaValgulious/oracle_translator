@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from threading import Thread, Event
 
 import numpy as np
 
 from src.game import config as cfg
+
+log = logging.getLogger(__name__)
 
 
 class SpeechToText:
@@ -38,7 +41,7 @@ class SpeechToText:
         tokens = resolved / "tokens.txt"
 
         if not all(f.exists() for f in [encoder, decoder, joiner, tokens]):
-            print(f"[STT] Model files not found in {resolved}. STT disabled.")
+            log.debug("[STT] Model files not found in %s. STT disabled.", resolved)
             return
 
         try:
@@ -51,9 +54,9 @@ class SpeechToText:
                 num_threads=cfg.STT_NUM_THREADS,
             )
             self._available = True
-            print("[STT] sherpa-onnx model loaded successfully.")
+            log.debug("[STT] sherpa-onnx model loaded successfully.")
         except Exception as e:
-            print(f"[STT] Failed to load model: {e}")
+            log.debug("[STT] Failed to load model: %s", e)
 
     @property
     def available(self) -> bool:

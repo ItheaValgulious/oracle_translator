@@ -237,7 +237,7 @@ class TerrainGenerator:
         x_end = x_start + chunk_size
         y_end = y_start + chunk_size
         biome_sample = _biome_for_x(x_start)
-        log.info("[terrain] generate_chunk cx=%d cy=%d range=[%d..%d) x [%d..%d) biome_sample=%s",
+        log.debug("[terrain] generate_chunk cx=%d cy=%d range=[%d..%d) x [%d..%d) biome_sample=%s",
                  chunk_x, chunk_y, x_start, x_end, y_start, y_end, biome_sample)
 
         # Precompute heightmap for all x columns in this chunk
@@ -343,7 +343,7 @@ class TerrainGenerator:
         # Chunk-level skip: pure alpine chunk with no features = all empty air
         only_alpine = has_alpine and not any(b != "alpine" for b in biomes.values())
         if only_alpine and not alpine_feature_xs:
-            log.info("[terrain] chunk (%d,%d) skipped: pure alpine, no features, %.1fms",
+            log.debug("[terrain] chunk (%d,%d) skipped: pure alpine, no features, %.1fms",
                      chunk_x, chunk_y, (perf_counter() - t0) * 1000)
             return  # entire chunk is empty air
 
@@ -515,7 +515,7 @@ class TerrainGenerator:
                     store.set_cell(lx, ly, cell)
 
         elapsed = (perf_counter() - t0) * 1000
-        log.info("[terrain] chunk (%d,%d) done in %.1fms", chunk_x, chunk_y, elapsed)
+        log.debug("[terrain] chunk (%d,%d) done in %.1fms", chunk_x, chunk_y, elapsed)
 
     # ── Surface height queries ──
 
