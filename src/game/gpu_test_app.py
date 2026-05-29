@@ -27,7 +27,7 @@ from pyglet.window import key, mouse
 from src.engine.gpu_backend import ComputeBackendUnavailable
 from src.engine.materials import build_material_registry
 from src.engine.render import DebugViewMode
-from src.engine.sim import inject_cells
+from src.engine.grid import inject_cells
 from src.engine.types import CellFlag, CellState
 from src.engine.world import DEFAULT_HALO_CELLS, DEFAULT_PAGE_SHIFT_CELLS, ActiveWorldWindow, WorldChunkStore
 from src.game import config as cfg
@@ -245,24 +245,14 @@ class GpuTestWindow(pyglet.window.Window):
         populate_test_scene(store, self.registry)
         store.recompute_anchored_support(self.registry)
 
-        try:
-            self.world = ActiveWorldWindow(
-                store, self.registry,
-                viewport_width=vp_w, viewport_height=vp_h,
-                halo_cells=DEFAULT_HALO_CELLS,
-                page_shift_cells=DEFAULT_PAGE_SHIFT_CELLS,
-                ctx=self.ctx,
-            )
-            self.backend_label = "GPU Compute"
-        except (ComputeBackendUnavailable, Exception):
-            self.world = ActiveWorldWindow(
-                store, self.registry,
-                viewport_width=vp_w, viewport_height=vp_h,
-                halo_cells=DEFAULT_HALO_CELLS,
-                page_shift_cells=DEFAULT_PAGE_SHIFT_CELLS,
-                ctx=None,
-            )
-            self.backend_label = "CPU Fallback"
+        self.world = ActiveWorldWindow(
+            store, self.registry,
+            viewport_width=vp_w, viewport_height=vp_h,
+            halo_cells=DEFAULT_HALO_CELLS,
+            page_shift_cells=DEFAULT_PAGE_SHIFT_CELLS,
+            ctx=self.ctx,
+        )
+        self.backend_label = "GPU Compute"
 
         # Hero + entity manager
         self.hero = Hero()

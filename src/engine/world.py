@@ -9,9 +9,8 @@ from typing import TYPE_CHECKING, Callable
 log = logging.getLogger(__name__)
 
 from .atmosphere import default_ambient_air_temperature_for_row
-from .grid import Grid, create_grid
+from .grid import Grid, create_grid, inject_cells
 from .render import DebugViewMode, build_rgba_frame
-from .sim import inject_cells, step
 from .types import CellFlag, CellState, MaterialRegistry, empty_cell
 
 if TYPE_CHECKING:
@@ -19,7 +18,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_WORLD_CHUNK_SIZE = 320
-DEFAULT_HALO_CELLS = 32
+DEFAULT_HALO_CELLS = 16
 DEFAULT_PAGE_SHIFT_CELLS = 16
 DEFAULT_SAFETY_MARGIN_CELLS = 16
 DEFAULT_IDLE_FLUSH_COOLDOWN_SECONDS = 0.2
@@ -592,14 +591,12 @@ class ActiveWorldWindow:
         log.info("[world] camera=(%d,%d) active_origin=(%d,%d)",
                  self.camera_x, self.camera_y, self.active_origin_x, self.active_origin_y)
         self._materialize_active_grid_from_store()
-        if ctx is not None:
-            from .gpu_backend import GpuSimulator
-
-            self.gpu_simulator = GpuSimulator(ctx, self.active_grid, self.registry)
-            self.gpu_simulator.set_external_support_anchors(self.active_grid.external_support_anchors)
-            log.info("[world] GPU simulator created")
-        else:
-            log.info("[world] CPU-only mode (no ctx)")
+        if ctx is None:
+            raise RuntimeError("GPU context required — CPU backend removed")
+        from .gpu_backend import GpuSimulator
+        self.gpu_simulator = GpuSimulator(ctx, self.active_grid, self.registry)
+        self.gpu_simulator.set_external_support_anchors(self.active_grid.external_support_anchors)
+        log.info("[world] GPU simulator created")
 
     @property
     def world_width(self) -> int:
@@ -1061,8 +1058,6 @@ class ActiveWorldWindow:
     def _capture_active_region(self, rect: WorldRect) -> GridSlice:
         local_x = rect.x - self.active_origin_x
         local_y = rect.y - self.active_origin_y
-        if self.gpu_simulator is not None:
-            return self.gpu_simulator.read_region(local_x, local_y, rect.width, rect.height)
         return _capture_grid_region(self.active_grid, local_x, local_y, rect.width, rect.height)
 
     def _shift_active_window(self, new_origin_x: int, new_origin_y: int) -> None:
@@ -1315,10 +1310,27 @@ class ActiveWorldWindow:
                 self._last_background_io_flush_idle_seconds = self._camera_idle_elapsed_seconds
 
     def step(self, dt: float) -> None:
-        if self.gpu_simulator is not None:
-            self.gpu_simulator.step(dt)
+        if self.gpu_simulator is None:
+            raise RuntimeError("GPU simulator required — CPU backend removed")
+        self.gpu_simulator.step(dt)
+
+    def sync_cpu_region_from_gpu(self, gx: int, gy: int, gw: int, gh: int) -> None:
+        """Sync a sub-region of GPU grid back to CPU active_grid."""
+        if self.gpu_simulator is None:
             return
-        step(self.active_grid, self.registry, dt)
+        cells_2d = self.gpu_simulator.readback_cells_region(gx, gy, gw, gh)
+        synced = 0
+        for row_idx, row_cells in enumerate(cells_2d):
+            cy = gy + row_idx
+            if cy < 0 or cy >= self.active_height:
+                continue
+            for col_idx, cell in enumerate(row_cells):
+                cx = gx + col_idx
+                if cx < 0 or cx >= self.active_width:
+                    continue
+                self.active_grid.set_cell(cx, cy, cell)
+                synced += 1
+        log.debug("[sync] gpu->cpu region=(%d,%d,%d,%d) rows=%d synced=%d", gx, gy, gw, gh, len(cells_2d), synced)
 
     def render(self, view_mode: DebugViewMode = DebugViewMode.MATERIAL):
         if self.gpu_simulator is not None:

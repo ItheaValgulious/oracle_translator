@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from .atmosphere import default_ambient_air_temperature_for_row
-from .types import CellState
+from .types import CellFlag, CellState, MaterialRegistry, SUPPORT_SOURCE_VALUE
 
 
 @dataclass
@@ -90,3 +91,46 @@ class Grid:
 
 def create_grid(width: int, height: int) -> Grid:
     return Grid(width=width, height=height)
+
+
+def inject_cells(
+    grid: Grid,
+    brush_or_cells: dict[str, int] | Iterable[tuple[int, int]],
+    family_id: str,
+    variant_id: str,
+    overrides: dict[str, object] | None = None,
+    registry: MaterialRegistry | None = None,
+) -> None:
+    from .materials import build_material_registry
+    registry = registry or build_material_registry()
+    variant = registry.variant(family_id, variant_id)
+    base = CellState(
+        family_id=family_id,
+        variant_id=variant_id,
+        temperature=variant.base_temperature,
+    )
+    overrides = overrides or {}
+    for key, value in overrides.items():
+        setattr(base, key, value)
+
+    targets: list[tuple[int, int]] = []
+    if isinstance(brush_or_cells, dict):
+        center_x = int(brush_or_cells["x"])
+        center_y = int(brush_or_cells["y"])
+        radius = int(brush_or_cells.get("radius", 0))
+        for y in range(center_y - radius, center_y + radius + 1):
+            for x in range(center_x - radius, center_x + radius + 1):
+                if grid.in_bounds(x, y) and (x - center_x) ** 2 + (y - center_y) ** 2 <= radius ** 2:
+                    targets.append((x, y))
+    else:
+        targets.extend(brush_or_cells)
+
+    for x, y in targets:
+        if not grid.in_bounds(x, y):
+            continue
+        cell = base.copy()
+        if family_id == "empty" and variant_id == "empty" and "temperature" not in overrides:
+            cell.temperature = default_ambient_air_temperature_for_row(grid.height, y)
+        if cell.flags & CellFlag.FIXPOINT:
+            cell.support_value = SUPPORT_SOURCE_VALUE
+        grid.set_cell(x, y, cell)

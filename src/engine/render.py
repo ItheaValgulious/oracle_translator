@@ -4,7 +4,7 @@ from enum import Enum
 from math import log1p
 
 from .grid import Grid
-from .support import SUPPORT_SOURCE_VALUE
+from .types import SUPPORT_SOURCE_VALUE
 from .types import CellFlag, MaterialRegistry
 
 

@@ -13,6 +13,7 @@ import pyglet
 from src.engine.render import DebugViewMode
 from src.game import config as cfg
 from src.game.animation import AnimationManager, SimpleSpriteBatch
+from src.game.entity_manager import DebugCollisionInfo
 from src.game.health_bar import HealthBar
 from src.game.hero import Hero
 
@@ -27,6 +28,13 @@ class GameRenderer:
         self.health_bar = HealthBar(x=10, y=10)
         self.anim_mgr = AnimationManager()
         self.sprite_batch = SimpleSpriteBatch()
+
+        # FPS tracking
+        self._fps_history: list[float] = []
+        self._fps_label = pyglet.text.Label(
+            "", font_size=10, x=10, y=window_height - 15,
+            color=(255, 255, 0, 200),
+        )
 
         # Shader for grid rendering (full-screen quad)
         vertex_shader = """
@@ -92,46 +100,90 @@ class GameRenderer:
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
     def draw_hero(self, hero: Hero, camera_x: int, camera_y: int, dt: float) -> None:
-        """Draw the hero using animation FrameData vertices."""
-        screen_x = (hero.x - camera_x) * cfg.CELL_SCALE
-        screen_y = (hero.y - camera_y) * cfg.CELL_SCALE
+        """Draw the hero rectangle matching the debug overlay coordinate system."""
+        cs = cfg.CELL_SCALE
+        # Same coords as debug overlay: world cell (wx, wy) → screen (sx, sy)
+        # hero.top = y + height (head), highest world y = lowest screen y
+        # Use float coords for smooth sub-pixel movement
+        sx = (hero.left - camera_x) * cs
+        sy = self.window_height - (hero.top - camera_y) * cs - cs
 
-        # Determine animation state
+        w = hero.width * cs
+        h = hero.height * cs
+        color = (200, 60, 40)
+
         state = hero.state
-        valid_states = ("idle", "walk", "jump", "chant", "cast")
-        if state not in valid_states:
+        if state not in ("idle", "walk", "jump", "chant", "cast"):
             state = "idle"
         frame = self.anim_mgr.update(dt, state)
-        if frame is None:
-            w = hero.width * cfg.CELL_SCALE
-            h = hero.height * cfg.CELL_SCALE
-            color = (200, 60, 40)
-        else:
+        if frame is not None:
             color = frame.color[:3]
-            verts = frame.vertices
-            min_vx = min(v[0] for v in verts)
-            max_vx = max(v[0] for v in verts)
-            min_vy = min(v[1] for v in verts)
-            max_vy = max(v[1] for v in verts)
-            screen_x += min_vx
-            screen_y += min_vy
-            w = max_vx - min_vx
-            h = max_vy - min_vy
-
-        if not hero.facing_right and w > 0:
-            screen_x += w
 
         r = self._hero_rect
-        r.x = screen_x
-        r.y = screen_y
+        r.x = sx
+        r.y = sy
         r.width = w
         r.height = h
         r.color = color
+        # Flip: for a solid-color rect this has no visual effect, but
+        # store the flag so sprite rendering can use texture UV flipping.
+        # Position stays the same — no sx shift.
+        self._hero_flipped = not hero.facing_right
         r.draw()
+
+    def draw_debug_collision(self, camera_x: int, camera_y: int, debug: DebugCollisionInfo) -> None:
+        """Draw debug overlay showing collision-checked cells."""
+        cs = cfg.CELL_SCALE
+        h = self.window_height
+        # Ground cells: yellow
+        for wx, wy in debug.ground_cells:
+            sy = h - (wy - camera_y) * cs - cs
+            r = pyglet.shapes.Rectangle(
+                (wx - camera_x) * cs, sy, cs, cs,
+                color=(255, 255, 0),
+            )
+            r.opacity = 120
+            r.draw()
+        # Left wall cells: red
+        for wx, wy in debug.left_wall_cells:
+            sy = h - (wy - camera_y) * cs - cs
+            r = pyglet.shapes.Rectangle(
+                (wx - camera_x) * cs, sy, cs, cs,
+                color=(255, 0, 0),
+            )
+            r.opacity = 120
+            r.draw()
+        # Right wall cells: blue
+        for wx, wy in debug.right_wall_cells:
+            sy = h - (wy - camera_y) * cs - cs
+            r = pyglet.shapes.Rectangle(
+                (wx - camera_x) * cs, sy, cs, cs,
+                color=(0, 100, 255),
+            )
+            r.opacity = 120
+            r.draw()
+        # Hero AABB cells: green outline (draw border lines)
+        for wx, wy in debug.hero_cells:
+            x0 = (wx - camera_x) * cs
+            y0 = h - (wy - camera_y) * cs - cs
+            border = pyglet.shapes.Rectangle(x0, y0, cs, cs, color=(0, 255, 0))
+            border.opacity = 60
+            border.draw()
 
     def draw_ui(self, hero: Hero) -> None:
         """Draw HP/MP bars and any other UI."""
         self.health_bar.draw(hero.hp, cfg.HERO_MAX_HP, hero.mp, cfg.HERO_MAX_MP)
+
+    def draw_fps(self, dt: float) -> None:
+        """Draw FPS counter (call when F3 debug mode is active)."""
+        if dt > 0:
+            self._fps_history.append(1.0 / dt)
+            if len(self._fps_history) > 60:
+                self._fps_history.pop(0)
+        if self._fps_history:
+            avg_fps = sum(self._fps_history) / len(self._fps_history)
+            self._fps_label.text = f"FPS: {avg_fps:.0f}  dt: {dt*1000:.1f}ms"
+        self._fps_label.draw()
 
     def draw(self, world, hero: Hero, camera_x: int, camera_y: int, view_mode: DebugViewMode, dt: float = 1.0 / 60.0) -> None:
         """Full render pass."""

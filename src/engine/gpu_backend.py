@@ -9,12 +9,12 @@ import moderngl
 from .atmosphere import default_ambient_air_temperature_for_row
 from .grid import Grid
 from .render import DebugViewMode
-from .support import SUPPORT_FAILURE_THRESHOLD, SUPPORT_SOURCE_VALUE
+from .types import SUPPORT_FAILURE_THRESHOLD, SUPPORT_SOURCE_VALUE
 from .types import DAMAGE_MASK_LIVING, DAMAGE_MASK_TERRAIN, CellFlag, CellState, LifetimeMode, MaterialRegistry, MatterState
 
 
 WORKGROUP_SIZE = 8
-LIQUID_RELAXATION_PASSES = 2
+LIQUID_RELAXATION_PASSES = 1
 FORCE_WAVE_DECAY = 0.82
 INT_MAX_VALUE = 2_147_483_647
 PHASE_FLAG_ABOVE = 1
@@ -162,7 +162,7 @@ class GpuMaterialTables:
                         (variant.ignite_target_family_id or "", variant.ignite_target_variant_id or ""),
                         variant_index_by_key.get(("fire", "fire"), empty_variant_index),
                     ) if variant.ignite_target_family_id is not None else empty_variant_index),
-                    0.0,
+                    float(variant.convert_mode_code),
                     0.0,
                     0.0,
                 )
@@ -328,7 +328,7 @@ def _build_common_glsl(tables: GpuMaterialTables) -> str:
 #define LIQUID_VERTICAL_PRESSURE_SCALE 0.8
 #define GAS_PRESSURE_FORCE_SCALE 0.65
 #define MAX_HEAT_EXCHANGE 120.0
-#define THERMAL_CONDUCTION_RATE 8.0
+#define THERMAL_CONDUCTION_RATE 2.0
 
 #define GRAVITY_ACCELERATION 1.2
 #define GAS_BUOYANCY_SCALE 10.0
@@ -475,6 +475,10 @@ int lifetime_mode_for_variant(int variant_index) {{
 
 float ignite_target_variant_for_variant(int variant_index) {{
     return variant_table[variant_index].floats7.x;
+}}
+
+int convert_mode_for_variant(int variant_index) {{
+    return int(variant_table[variant_index].floats7.y);
 }}
 
 bool damage_mask_has_terrain(int mask) {{
@@ -2157,6 +2161,8 @@ void main() {
     int family_index = family_index_for_variant(variant_index);
 
     float gathered_corrosion = 0.0;
+    float strongest_neighbor_corrosion = 0.0;
+    int strongest_neighbor_variant = 0;
     bool adjacent_heat_source = false;
     bool caused_terrain_damage = false;
     bool caused_living_damage = false;
@@ -2187,14 +2193,20 @@ void main() {
         int neighbor_mask = damage_mask_for_variant(neighbor_variant);
         float neighbor_strength = reaction_strength_for_variant(neighbor_variant);
         if (neighbor_strength > 0.0) {
+            float neighbor_corrosion = 0.0;
             // Corrosion onto support-bearing terrain
             if (damage_mask_has_terrain(neighbor_mask) && support_bearing_for_variant(variant_index)) {
                 float hardness = max(variant_table[variant_index].floats0.y, 0.05);
-                gathered_corrosion += neighbor_strength * dt / hardness;
+                neighbor_corrosion = neighbor_strength * dt / hardness;
             }
             // Damage onto entity placeholders (living mask)
             if (damage_mask_has_living(neighbor_mask) && family_index_for_variant(variant_index) == %d) {
-                gathered_corrosion += neighbor_strength * dt;
+                neighbor_corrosion = neighbor_strength * dt;
+            }
+            gathered_corrosion += neighbor_corrosion;
+            if (neighbor_corrosion > strongest_neighbor_corrosion) {
+                strongest_neighbor_corrosion = neighbor_corrosion;
+                strongest_neighbor_variant = neighbor_variant;
             }
         }
     }
@@ -2266,7 +2278,30 @@ void main() {
 
     // ── Corrosion / damage ──
     if (gathered_corrosion > 0.0) {
-        out_misc.z = max(0.0, out_misc.z - gathered_corrosion);
+        float new_integrity = max(0.0, out_misc.z - gathered_corrosion);
+        // Apply convert_mode when integrity hits zero
+        if (new_integrity <= 0.0 && out_misc.z > 0.0 && strongest_neighbor_variant > 0) {
+            int cm = convert_mode_for_variant(strongest_neighbor_variant);
+            if (cm == 1) {
+                // "empty" — convert to empty
+                vec4 empty_misc = empty_cell_misc_for_coord(coord);
+                empty_misc.x = out_misc.x;
+                imageStore(state_int_dst, coord, empty_cell_int());
+                imageStore(state_vec_dst, coord, empty_cell_vec());
+                imageStore(state_misc_dst, coord, empty_misc);
+                return;
+            } else if (cm == 2) {
+                // "self" — convert to the strongest neighbor's variant
+                ivec4 new_int = ivec4(strongest_neighbor_variant, 0, 0, 0);
+                vec4 new_misc = vec4(out_misc.x, 0.0, 1.0, 0.0);
+                imageStore(state_int_dst, coord, new_int);
+                imageStore(state_vec_dst, coord, vec4(0.0));
+                imageStore(state_misc_dst, coord, new_misc);
+                return;
+            }
+            // cm == 0 ("none"): just reduce integrity, no conversion
+        }
+        out_misc.z = new_integrity;
     }
     bool caused_any_damage = caused_terrain_damage || caused_living_damage;
     if (caused_any_damage && !reaction_preserves_self_for_variant(variant_index)) {
@@ -2920,48 +2955,6 @@ class GpuSimulator:
             array("i", [0 for _ in range(self.width * 2 + max(0, self.height - 2) * 2)]).tobytes()
         )
 
-    def write_external_support_anchor_region(
-        self,
-        x: int,
-        y: int,
-        width: int,
-        height: int,
-        values: list[bool],
-    ) -> None:
-        if width <= 0 or height <= 0:
-            return
-        if len(values) != width * height:
-            raise ValueError("External support anchor region size does not match provided values.")
-        current = array("i")
-        current.frombytes(self.external_support_edge_buffer.read())
-        if x == 0 and y == 0 and width == self.width and height == 1:
-            for index, value in enumerate(values):
-                current[index] = 1 if value else 0
-            self.external_support_edge_buffer.write(current.tobytes())
-            return
-        if x == 0 and y == self.height - 1 and width == self.width and height == 1:
-            base = self.width
-            for index, value in enumerate(values):
-                current[base + index] = 1 if value else 0
-            self.external_support_edge_buffer.write(current.tobytes())
-            return
-        if width == 1 and x == 0 and y >= 1 and y + height <= self.height - 1:
-            base = self.width * 2 + (y - 1)
-            for index, value in enumerate(values):
-                current[base + index] = 1 if value else 0
-            self.external_support_edge_buffer.write(current.tobytes())
-            return
-        if width == 1 and x == self.width - 1 and y >= 1 and y + height <= self.height - 1:
-            base = self.width * 2 + max(0, self.height - 2) + (y - 1)
-            for index, value in enumerate(values):
-                current[base + index] = 1 if value else 0
-            self.external_support_edge_buffer.write(current.tobytes())
-            return
-        raise ValueError("External support anchor region updates must target a single outer edge.")
-
-    def update_external_support_anchor_regions(self, updates) -> None:
-        del updates
-
     def fill_empty_region(
         self,
         x: int,
@@ -3002,39 +2995,6 @@ class GpuSimulator:
         group_x, group_y = _dispatch_groups(width, height)
         self.clear_transient_region_shader.run(group_x=group_x, group_y=group_y, group_z=1)
         self.ctx.memory_barrier()
-
-    def read_region(self, x: int, y: int, width: int, height: int):
-        from .world import GridSlice
-
-        state_int_data = self._read_texture_region(
-            self.state_int[self.front_index],
-            x,
-            y,
-            width,
-            height,
-            components=4,
-            dtype="i4",
-        )
-        state_vec_data = self._read_texture_region(
-            self.state_vec[self.front_index],
-            x,
-            y,
-            width,
-            height,
-            components=4,
-            dtype="f4",
-        )
-        state_misc_data = self._read_texture_region(
-            self.state_misc[self.front_index],
-            x,
-            y,
-            width,
-            height,
-            components=4,
-            dtype="f4",
-        )
-        cells = _unpack_cells_state(self.tables, state_int_data, state_vec_data, state_misc_data)
-        return GridSlice(width=width, height=height, cells=cells)
 
     def write_region(self, x: int, y: int, region, *, buffer_index: int | None = None) -> None:
         target_index = self.front_index if buffer_index is None else buffer_index
@@ -3500,3 +3460,91 @@ class GpuSimulator:
         grid.directional_fallback_enabled = self.directional_fallback_enabled
         grid.directional_fallback_angle_limit_degrees = self.directional_fallback_angle_limit_degrees
         return grid
+
+    def upload_cells_region(self, gx: int, gy: int, grid: Grid) -> None:
+        """Upload a region of CPU grid cells to GPU textures.
+
+        Reads cells from grid at local coordinates (gx, gy) with the same dimensions
+        as the GPU grid, and writes them to the GPU textures.
+        Only the rows/columns that overlap with the grid are uploaded.
+        """
+        # Upload the full grid width, but only the rows that exist in the grid
+        upload_w = min(grid.width, self.width - gx)
+        upload_h = min(grid.height, self.height - gy)
+        if upload_w <= 0 or upload_h <= 0:
+            return
+
+        # Pack cells from CPU grid
+        cells: list[CellState] = []
+        for row in range(upload_h):
+            for col in range(upload_w):
+                cells.append(grid.get_cell(gx + col, gy + row))
+
+        state_int_data, state_vec_data, state_misc_data = _pack_cells_state(cells, self.tables)
+
+        # Write to GPU textures (Y-flip: grid y=0 is top, texture y=0 is bottom)
+        tex_y0 = self.height - (gy + upload_h)
+        self._write_state_region(gx, tex_y0, upload_w, upload_h,
+                                 state_int_data, state_vec_data, state_misc_data)
+
+    def readback_cells_region(self, gx: int, gy: int, gw: int, gh: int) -> list[list[CellState]]:
+        """Read a sub-region of cells from GPU textures.
+
+        Returns a 2D list [gy_local][gx_local] of CellState for the requested region.
+        Coordinates are in grid space (y=0 at top).
+        """
+        # Clamp to grid bounds
+        gx0 = max(0, gx)
+        gy0 = max(0, gy)
+        gx1 = min(self.width, gx + gw)
+        gy1 = min(self.height, gy + gh)
+        if gx0 >= gx1 or gy0 >= gy1:
+            return []
+        read_w = gx1 - gx0
+        read_h = gy1 - gy0
+
+        state_int_data = self._read_texture_region(
+            self.state_int[self.front_index], gx0, gy0, read_w, read_h,
+            components=4, dtype="i4",
+        )
+        state_vec_data = self._read_texture_region(
+            self.state_vec[self.front_index], gx0, gy0, read_w, read_h,
+            components=4, dtype="f4",
+        )
+        state_misc_data = self._read_texture_region(
+            self.state_misc[self.front_index], gx0, gy0, read_w, read_h,
+            components=4, dtype="f4",
+        )
+
+        # Unpack cells into 2D grid
+        state_int = array("i")
+        state_vec = array("f")
+        state_misc = array("f")
+        state_int.frombytes(state_int_data)
+        state_vec.frombytes(state_vec_data)
+        state_misc.frombytes(state_misc_data)
+
+        cells_2d: list[list[CellState]] = []
+        for row in range(read_h):
+            row_cells: list[CellState] = []
+            for col in range(read_w):
+                idx = row * read_w + col
+                int_offset = idx * 4
+                vec_offset = idx * 4
+                family_id, variant_id = self.tables.variant_keys[state_int[int_offset]]
+                row_cells.append(CellState(
+                    family_id=family_id,
+                    variant_id=variant_id,
+                    generation=state_int[int_offset + 1],
+                    flags=CellFlag(state_int[int_offset + 2]),
+                    vel_x=state_vec[vec_offset],
+                    vel_y=state_vec[vec_offset + 1],
+                    blocked_x=state_vec[vec_offset + 2],
+                    blocked_y=state_vec[vec_offset + 3],
+                    temperature=state_misc[vec_offset],
+                    support_value=state_misc[vec_offset + 1],
+                    integrity=state_misc[vec_offset + 2],
+                    age=state_misc[vec_offset + 3],
+                ))
+            cells_2d.append(row_cells)
+        return cells_2d

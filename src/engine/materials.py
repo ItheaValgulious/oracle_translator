@@ -85,6 +85,7 @@ def _variant(
     ignite_target_family_id: str | None = None,
     ignite_target_variant_id: str | None = None,
     damage_mask: tuple[str, ...] = (),
+    convert_mode: str = "none",
     mobility: float | None = None,
     pressure_response: float | None = None,
     gravity_scale: float | None = None,
@@ -127,6 +128,7 @@ def _variant(
         ignite_target_family_id=ignite_target_family_id,
         ignite_target_variant_id=ignite_target_variant_id,
         damage_mask=damage_mask,
+        convert_mode=convert_mode,
         mobility=float(motion_profile["mobility"] if mobility is None else mobility),
         pressure_response=float(motion_profile["pressure_response"] if pressure_response is None else pressure_response),
         gravity_scale=float(motion_profile["gravity_scale"] if gravity_scale is None else gravity_scale),
@@ -473,6 +475,7 @@ def build_material_registry() -> MaterialRegistry:
                 reaction_strength=0.35,
                 reaction_preserves_self=False,
                 damage_mask=("terrain",),
+                convert_mode="self",
                 render_color=(140, 255, 90),
             ),
             "acid_gas": _variant(
@@ -491,6 +494,7 @@ def build_material_registry() -> MaterialRegistry:
                 reaction_strength=0.18,
                 reaction_preserves_self=False,
                 damage_mask=("terrain",),
+                convert_mode="self",
                 render_color=(200, 255, 150),
             ),
         },
@@ -571,6 +575,7 @@ def build_material_registry() -> MaterialRegistry:
                 ignite_target_variant_id="fire",
                 reaction_strength=0.45,
                 damage_mask=("terrain",),
+                convert_mode="empty",
                 render_color=(40, 30, 25),
             ),
             "tar_smoke": _variant(
@@ -617,6 +622,7 @@ def build_material_registry() -> MaterialRegistry:
                 reaction_strength=0.5,
                 lifetime_mode=LifetimeMode.DECAY_WITH_AGE,
                 damage_mask=("terrain", "living"),
+                convert_mode="empty",
                 render_color=(255, 120, 30),
             ),
         },
@@ -649,6 +655,7 @@ def build_material_registry() -> MaterialRegistry:
                 boil_temperature=250.0,
                 reaction_strength=0.5,
                 damage_mask=("terrain",),
+                convert_mode="empty",
                 render_color=(60, 50, 20),
             ),
             "oil_smoke": _variant(
@@ -697,6 +704,7 @@ def build_material_registry() -> MaterialRegistry:
                 reaction_strength=0.6,
                 reaction_preserves_self=True,
                 damage_mask=("terrain", "living"),
+                convert_mode="self",
                 render_color=(200, 255, 40),
             ),
             "magic_acid_gas": _variant(
@@ -715,6 +723,7 @@ def build_material_registry() -> MaterialRegistry:
                 reaction_strength=0.3,
                 reaction_preserves_self=True,
                 damage_mask=("terrain", "living"),
+                convert_mode="self",
                 render_color=(240, 255, 120),
             ),
         },
@@ -838,8 +847,6 @@ def build_material_registry() -> MaterialRegistry:
                 integrity_decay_from_heat=0.0008,
                 ignite_target_family_id="fire",
                 ignite_target_variant_id="fire",
-                reaction_strength=0.3,
-                damage_mask=("terrain",),
                 render_color=(140, 100, 50),
             ),
             "wood_powder": _variant(
@@ -884,8 +891,6 @@ def build_material_registry() -> MaterialRegistry:
                 integrity_decay_from_heat=0.001,
                 ignite_target_family_id="fire",
                 ignite_target_variant_id="fire",
-                reaction_strength=0.25,
-                damage_mask=("terrain",),
                 render_color=(80, 160, 50),
             ),
             "grass_powder": _variant(
@@ -930,8 +935,6 @@ def build_material_registry() -> MaterialRegistry:
                 ignite_target_family_id="fire",
                 ignite_target_variant_id="fire",
                 integrity_decay_from_heat=0.0008,
-                reaction_strength=0.5,
-                damage_mask=("terrain",),
                 render_color=(170, 140, 80),
             ),
             "wood_plank_powder": _variant(

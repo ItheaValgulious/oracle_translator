@@ -84,14 +84,22 @@ class GameScreen(BaseScreen):
     def on_draw(self) -> None:
         if self.app.world is None:
             return
+        cam_x = self.app.world.camera_x
+        cam_y = self.app.world.camera_y
         self.app.renderer.draw(
             self.app.world,
             self.app.hero,
-            self.app.world.camera_x,
-            self.app.world.camera_y,
+            cam_x,
+            cam_y,
             self.app.view_mode,
             dt=self.app._last_dt,
         )
+        # Debug collision overlay + FPS
+        if self.app.entity_manager.debug_collision:
+            debug = self.app.entity_manager.last_debug
+            if debug is not None:
+                self.app.renderer.draw_debug_collision(cam_x, cam_y, debug)
+            self.app.renderer.draw_fps(self.app._last_dt)
         if self.show_console:
             self.console.draw()
 

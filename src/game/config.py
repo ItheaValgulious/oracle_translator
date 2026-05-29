@@ -20,8 +20,8 @@ HERO_MAX_HP = 100.0
 HERO_MAX_MP = 50.0
 MP_REGEN_PER_SEC = 3.0
 HERO_GRAVITY = 20.0         # cells/sec²
-HERO_WALK_SPEED = 6.0       # cells/sec
-HERO_JUMP_VELOCITY = 12.0   # cells/sec upward
+HERO_WALK_SPEED = 18.0      # cells/sec (3x)
+HERO_JUMP_VELOCITY = 18.44  # cells/sec → jump height ≈ 8.5 cells (½ hero height)
 
 # ── Enemy A (archer) ──
 ENEMY_A_WIDTH = 3.0

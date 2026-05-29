@@ -232,21 +232,7 @@ class VoxelDemoWindow(pyglet.window.Window):
             self.backend_label = "GPU Compute"
             self.backend_detail = ""
         except (ComputeBackendUnavailable, Exception) as exc:  # noqa: BLE001
-            self.world = ActiveWorldWindow(
-                store,
-                self.registry,
-                viewport_width=self.viewport_grid_width,
-                viewport_height=self.viewport_grid_height,
-                halo_cells=self.halo_cells,
-                page_shift_cells=self.page_shift_cells,
-                ctx=None,
-                liquid_brownian_enabled=self.liquid_brownian_enabled,
-                blocked_impulse_enabled=self.blocked_impulse_enabled,
-                directional_fallback_enabled=self.directional_fallback_enabled,
-                directional_fallback_angle_limit_degrees=self.directional_fallback_angle_limit_degrees,
-            )
-            self.backend_label = "CPU Reference"
-            self.backend_detail = f"{type(exc).__name__}: {exc}"
+            raise RuntimeError(f"GPU backend required — CPU backend removed: {exc}") from exc
         self._bind_world_texture()
 
     def _bind_world_texture(self) -> None:

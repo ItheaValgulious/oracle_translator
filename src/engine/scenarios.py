@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .grid import Grid
 from .materials import build_material_registry
-from .sim import inject_cells
+from .grid import inject_cells
 from .types import MaterialRegistry
 from .types import CellFlag
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time as _time
 from time import perf_counter
 
 import moderngl
@@ -78,9 +79,14 @@ class GameApp(pyglet.window.Window):
         # Input
         self._keys_pressed: set[int] = set()
         self._last_dt = 1.0 / DEFAULT_TICK_RATE_HZ
+        self._sim_accumulator = 0.0
 
         # Schedule tick
         pyglet.clock.schedule_interval(self._tick, 1.0 / DEFAULT_TICK_RATE_HZ)
+
+        # Debug HTTP server
+        from src.game.debug_server import start_debug_server
+        self._debug_server = start_debug_server(self, port=9123)
 
     def change_screen(self, name: str) -> None:
         self.current_screen = name
@@ -173,7 +179,7 @@ class GameApp(pyglet.window.Window):
         if self.world is None:
             return
 
-        self._handle_hero_input(dt)
+        # Input is handled in _tick() before calling this method
 
         # Detect chant entry: start STT recording
         if self.hero.state == "chant" and not self._chant_started:
@@ -183,9 +189,31 @@ class GameApp(pyglet.window.Window):
 
         # Detect chant→cast transition: hero just entered cast state
         was_chanting = self.hero.state == "chant"
+        log.debug("[update] PRE-tick: hero y=%.2f vel_y=%.3f on_ground=%s state=%s",
+                 self.hero.y, self.hero.vel_y, self.hero.on_ground, self.hero.state)
+        t0 = _time.perf_counter()
         self.entity_manager.tick(self.world, dt)
+        t1 = _time.perf_counter()
         self.world.step(dt)
-        self.entity_manager.post_step(self.world, dt)
+        t2 = _time.perf_counter()
+        # Sync GPU→CPU for hero surroundings so collision sees dynamic terrain changes
+        margin = 8
+        hx = int(self.hero.x)
+        hy = int(self.hero.y + self.hero.height / 2)
+        ax = self.world.active_origin_x
+        ay = self.world.active_origin_y
+        gx = max(0, hx - ax - margin)
+        gy = max(0, hy - ay - margin)
+        gw = min(self.world.active_width - gx, int(self.hero.width) + margin * 2 + 4)
+        gh = min(self.world.active_height - gy, int(self.hero.height) + margin * 2 + 4)
+        self.world.sync_cpu_region_from_gpu(gx, gy, gw, gh)
+        t3 = _time.perf_counter()
+        self.entity_manager.read_feedback_and_update(self.world, dt)
+        t4 = _time.perf_counter()
+        self.entity_manager.clear_placeholder(self.world)
+        t5 = _time.perf_counter()
+        log.info("[perf] placeholder=%.1f gpu_sim=%.1f readback=%.1f feedback=%.1f clear=%.1f total=%.1f ms",
+                 (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000, (t4-t3)*1000, (t5-t4)*1000, (t5-t0)*1000)
 
         # If hero transitioned from chant to cast, execute the spell
         if was_chanting and self.hero.state == "cast":
@@ -210,19 +238,33 @@ class GameApp(pyglet.window.Window):
                 remaining.append(stream)
         self.active_streams = remaining
 
-        # Camera follows hero
-        target_x = int(self.hero.x) - cfg.VIEWPORT_WIDTH // 2
-        target_y = int(self.hero.y) - cfg.VIEWPORT_HEIGHT // 2
-        self.world.pan_camera(target_x - self.world.camera_x, target_y - self.world.camera_y)
-
-    _MAX_DT = 1.0 / 30.0  # cap to 33ms to prevent huge physics jumps after long init
+    _MAX_DT = 1.0 / 20.0  # cap to 50ms to prevent huge physics jumps after long init
+    _SIM_DT = 1.0 / 20.0  # simulation fixed step (20Hz)
 
     def _tick(self, dt: float) -> None:
-        """Main tick loop."""
+        """Main tick loop. Simulation runs at fixed _SIM_DT rate."""
         dt = min(dt, self._MAX_DT)
         self._last_dt = dt
-        if self.current_screen == "game":
+        if self.current_screen != "game":
+            return
+        if self.world is None:
             self._game_screen.update(dt)
+            return
+        # Always handle input every frame for responsiveness
+        self._handle_hero_input(dt)
+        # Run at most one sim step per frame to avoid spiral-of-death
+        self._sim_accumulator += dt
+        stepped = False
+        if self._sim_accumulator >= self._SIM_DT:
+            step_dt = min(self._sim_accumulator, self._MAX_DT)
+            self._sim_accumulator = 0.0
+            self._game_screen.update(step_dt)
+            stepped = True
+        # Camera follows hero every frame (smooth even between sim steps)
+        if stepped and self.world is not None:
+            target_x = int(self.hero.x) - cfg.VIEWPORT_WIDTH // 2
+            target_y = int(self.hero.y) - cfg.VIEWPORT_HEIGHT // 2
+            self.world.pan_camera(target_x - self.world.camera_x, target_y - self.world.camera_y)
 
     def on_draw(self) -> None:
         screen = self.screens.get(self.current_screen)
@@ -236,9 +278,20 @@ class GameApp(pyglet.window.Window):
         # Global: ENTER on title -> init world + switch to game
         if self.current_screen == "title" and symbol == key.ENTER:
             log.info("[app] ENTER pressed on title, initializing game world...")
-            self._init_game_world()
-            self.change_screen("game")
-            log.info("[app] switched to game screen")
+            try:
+                self._init_game_world()
+                self.change_screen("game")
+                log.info("[app] switched to game screen")
+            except Exception:
+                import traceback
+                log.error("[app] _init_game_world failed:\n%s", traceback.format_exc())
+            return
+
+        # F3: toggle debug collision overlay
+        if symbol == key.F3:
+            self.entity_manager.debug_collision = not self.entity_manager.debug_collision
+            if not self.entity_manager.debug_collision:
+                self.entity_manager.last_debug = None
             return
 
         # Spell hotkeys 1-8 set selected spell (don't cast immediately)

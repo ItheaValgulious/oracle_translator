@@ -26,6 +26,11 @@ DAMAGE_MASK_TERRAIN = 1   # affects support-bearing cells
 DAMAGE_MASK_LIVING = 2    # affects entity placeholders
 DAMAGE_MASK_WATER = 4     # affects water-family cells
 
+# Support system constants
+SUPPORT_TIMEOUT_SECONDS = 10.0
+SUPPORT_SOURCE_VALUE = SUPPORT_TIMEOUT_SECONDS
+SUPPORT_FAILURE_THRESHOLD = 0.0
+
 
 @dataclass(frozen=True)
 class PhaseRule:
@@ -71,6 +76,7 @@ class VariantDef:
     ignite_target_family_id: str | None = None
     ignite_target_variant_id: str | None = None
     damage_mask: tuple[str, ...] = ()
+    convert_mode: str = "none"  # "none", "empty", "self"
     mobility: float = 1.0
     pressure_response: float = 1.0
     gravity_scale: float = 0.0
@@ -95,6 +101,14 @@ class VariantDef:
             elif target == "water":
                 result |= DAMAGE_MASK_WATER
         return result
+
+    @property
+    def convert_mode_code(self) -> int:
+        if self.convert_mode == "empty":
+            return 1
+        if self.convert_mode == "self":
+            return 2
+        return 0
 
 
 @dataclass(frozen=True)

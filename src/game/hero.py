@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 from src.game import config as cfg
 
@@ -159,7 +162,10 @@ class Hero:
 
         # ── Gravity ── (positive vel_y = downward, y increases toward ground)
         if not self.on_ground and self.state not in ("chant"):
+            old_vy = self.vel_y
             self.vel_y += cfg.HERO_GRAVITY * dt
+            log.debug("[hero] gravity: vel_y %.3f -> %.3f (dt=%.4f on_ground=%s state=%s)",
+                     old_vy, self.vel_y, dt, self.on_ground, self.state)
 
         # ── Integrate position ──
         self.x += self.vel_x * dt
@@ -169,9 +175,19 @@ class Hero:
         if grid_feedback:
             self.x = max(0.0, min(grid_feedback.world_width - self.width / 2.0 - 1.0, self.x))
             if grid_feedback.blocked_below:
-                self.vel_y = 0.0
-                self.on_ground = True
+                # Only land when moving downward or stationary (vel_y >= 0).
+                # An upward-moving hero (jumping) should not be re-grounded.
+                if self.vel_y >= 0:
+                    self.vel_y = 0.0
+                    if not self.on_ground:
+                        log.info("[hero] LANDING: y=%.2f vel_y=%.2f -> on_ground=True", self.y, self.vel_y)
+                    self.on_ground = True
+                else:
+                    # Moving upward but ground detected below — don't re-ground
+                    log.debug("[hero] blocked_below while rising (vel_y=%.2f), not landing", self.vel_y)
             else:
+                if self.on_ground:
+                    log.info("[hero] LIFT_OFF: y=%.2f vel_y=%.2f -> on_ground=False (blocked_below=False)", self.y, self.vel_y)
                 self.on_ground = False
 
             if grid_feedback.in_liquid and self.vel_y > 0:
@@ -179,6 +195,9 @@ class Hero:
 
             if grid_feedback.damage > 0:
                 self.take_damage(grid_feedback.damage * dt)
+
+            log.debug("[hero] feedback: state=%s y=%.2f vel_y=%.3f on_ground=%s blocked_below=%s",
+                     self.state, self.y, self.vel_y, self.on_ground, grid_feedback.blocked_below)
 
         # ── State transitions (landing, walk/idle) ──
         if self.state == "jump" and self.on_ground:

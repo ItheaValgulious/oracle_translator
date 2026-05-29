@@ -8,13 +8,16 @@ from pathlib import Path
 
 # Configure logging to file + stderr
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     handlers=[
         logging.FileHandler("game_debug.log", mode="w"),
         logging.StreamHandler(sys.stderr),
     ],
 )
+# Suppress noisy external loggers
+logging.getLogger("pyglet").setLevel(logging.WARNING)
+logging.getLogger("moderngl").setLevel(logging.WARNING)
 
 # Ensure src/ is on the path when running as a module
 _script_dir = Path(__file__).resolve().parent
