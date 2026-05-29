@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,15 +14,14 @@ if str(SRC) not in sys.path:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from engine.grid import create_grid
 from engine.materials import build_material_registry
-from engine.grid import inject_cells
 from engine.types import CellFlag, CellState
 from engine.world import ActiveWorldWindow, WorldChunkStore
+from engine.gpu_backend import GpuMaterialTables, pack_cells_state
 
 from game import config as cfg
 from game.animation import AnimationManager, FrameData, HERO_ANIMATIONS
-from game.entity_manager import Entity, EntityManager, PLACEHOLDER_FAMILY
+from game.entity_manager import Entity, EntityManager
 from game.hero import Hero, GridFeedback
 from game.spell_system import (
     SPELL_CATALOG,
@@ -159,6 +159,24 @@ class HeroTests(unittest.TestCase):
         hero.update(0.1, grid_feedback=feedback)
         self.assertEqual(hero.vel_x, 0.0)
 
+    def test_hero_can_move_horizontally_while_airborne(self) -> None:
+        hero = Hero()
+        hero.state = "jump"
+        hero.on_ground = False
+        hero.input_right = True
+        feedback = GridFeedback(world_width=100.0, blocked_below=False)
+        hero.update(0.1, grid_feedback=feedback)
+        self.assertGreater(hero.vel_x, 0.0)
+
+    def test_hero_blocked_up_stops_jump_motion(self) -> None:
+        hero = Hero()
+        hero.state = "jump"
+        hero.on_ground = False
+        hero.vel_y = -10.0
+        feedback = GridFeedback(world_width=100.0, blocked_up=True)
+        hero.update(0.1, grid_feedback=feedback)
+        self.assertEqual(hero.vel_y, 0.0)
+
     def test_hero_placeholder_cells(self) -> None:
         hero = Hero(x=20.0, y=10.0)
         cells = hero.get_placeholder_cells()
@@ -171,10 +189,7 @@ class HeroTests(unittest.TestCase):
 
 
 class EntityManagerTests(unittest.TestCase):
-    """Tests for Entity-Grid Hybrid tick cycle.
-
-    All entity_manager operations target active_grid (local coords).
-    """
+    """Tests for GPU entity mask and GPU collision query runtime."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -189,141 +204,222 @@ class EntityManagerTests(unittest.TestCase):
         if self.ctx is None:
             self.skipTest("GPU context not available")
         store = WorldChunkStore(w, h, chunk_size=4)
-        world = ActiveWorldWindow(
-            store, self.registry, viewport_width=w, viewport_height=h, ctx=self.ctx)
+        world = ActiveWorldWindow(store, self.registry, viewport_width=w, viewport_height=h, ctx=self.ctx)
         return world
 
-    def test_write_placeholder_creates_cells(self) -> None:
-        hero = Hero(x=20.0, y=10.0)
+    def _make_manager_with_hero(self, x: float = 20.0, y: float = 10.0) -> tuple[Hero, EntityManager, Entity]:
+        hero = Hero(x=x, y=y)
         mgr = EntityManager(hero=hero)
-        entity = Entity(entity_id="hero", x=hero.x, y=hero.y,
-                        width=cfg.HERO_WIDTH, height=cfg.HERO_HEIGHT)
+        entity = Entity(
+            entity_id="hero",
+            x=hero.x,
+            y=hero.y,
+            width=cfg.HERO_WIDTH,
+            height=cfg.HERO_HEIGHT,
+        )
         mgr.register_entity(entity)
+        return hero, mgr, entity
+
+    def _write_and_upload_cell(self, world: ActiveWorldWindow, wx: int, wy: int, cell: CellState) -> None:
+        lx, ly = _world_to_local(world, wx, wy)
+        tables = GpuMaterialTables.from_registry(self.registry)
+        packed = pack_cells_state([cell], tables)
+        world.gpu_simulator.write_region_bytes(lx, ly, 1, 1, packed.state_int, packed.state_vec, packed.state_misc)
+
+    def _read_gpu_feedback(self, mgr: EntityManager, world: ActiveWorldWindow) -> GridFeedback:
+        mgr.schedule_feedback(world)
+        world.step(0.0)
+        feedback = mgr.poll_scheduled_feedback(world)
+        self.assertIsNotNone(feedback)
+        return feedback
+
+    def test_tick_does_not_modify_gpu_cells_under_hero(self) -> None:
+        _hero, mgr, entity = self._make_manager_with_hero()
         world = self._make_world()
-        mgr.write_placeholder(world)
-
-        for lx, ly in mgr._entity_local_cells(entity, world):
-            cell = world.active_grid.get_cell(lx, ly)
-            self.assertEqual(cell.family_id, PLACEHOLDER_FAMILY)
-
-    def test_clear_placeholder_restores_originals(self) -> None:
-        """clear_placeholder should restore saved original cells, not just empty."""
-        hero = Hero(x=20.0, y=10.0)
-        mgr = EntityManager(hero=hero)
-        entity = Entity(entity_id="hero", x=hero.x, y=hero.y,
-                        width=cfg.HERO_WIDTH, height=cfg.HERO_HEIGHT)
-        mgr.register_entity(entity)
-        world = self._make_world()
-
-        # Pre-fill active_grid with stone at hero's local positions
-        local_cells = mgr._entity_local_cells(entity, world)
-        for lx, ly in local_cells:
-            world.active_grid.set_cell(lx, ly, CellState(
-                family_id="stone", variant_id="stone_platform", integrity=1.0))
-
-        mgr.write_placeholder(world)
-        for lx, ly in local_cells:
-            cell = world.active_grid.get_cell(lx, ly)
-            self.assertEqual(cell.family_id, PLACEHOLDER_FAMILY)
-
-        mgr.clear_placeholder(world)
-        for lx, ly in local_cells:
-            cell = world.active_grid.get_cell(lx, ly)
-            self.assertEqual(cell.family_id, "stone")
-
-    def test_tick_order_is_correct(self) -> None:
-        hero = Hero(x=20.0, y=10.0)
-        mgr = EntityManager(hero=hero)
-        entity = Entity(entity_id="hero", x=hero.x, y=hero.y,
-                        width=cfg.HERO_WIDTH, height=cfg.HERO_HEIGHT)
-        mgr.register_entity(entity)
-        world = self._make_world()
-
-        mgr.write_placeholder(world)
+        wx0 = int(entity.left)
+        wx1 = int(entity.right) + 1
+        wy0 = int(entity.bottom)
+        wy1 = int(entity.top) + 1
+        before: list[tuple[int, int, CellState]] = []
+        for wy in range(wy0, wy1):
+            for wx in range(wx0, wx1):
+                lx, ly = _world_to_local(world, wx, wy)
+                before.append((lx, ly, world.gpu_simulator.readback_cells_region(lx, ly, 1, 1)[0][0]))
         mgr.tick(world, 0.1)
-
-        local_cells = mgr._entity_local_cells(entity, world)
-        for lx, ly in local_cells:
-            cell = world.active_grid.get_cell(lx, ly)
-            self.assertEqual(cell.family_id, PLACEHOLDER_FAMILY)
-
-        world.step(0.1)
-        mgr.post_step(world, 0.1)
-
-        # post_step no longer clears placeholders — they persist until the
-        # next tick() clears them. This is intentional: clearing here would
-        # restore destroyed terrain before the hero reads feedback, preventing
-        # the hero from falling through burned ground.
-        for lx, ly in local_cells:
-            cell = world.active_grid.get_cell(lx, ly)
-            self.assertEqual(cell.family_id, PLACEHOLDER_FAMILY)
+        for lx, ly, expected in before:
+            cell = world.gpu_simulator.readback_cells_region(lx, ly, 1, 1)[0][0]
+            self.assertEqual(cell.family_id, expected.family_id)
+            self.assertEqual(cell.variant_id, expected.variant_id)
+            self.assertEqual(cell.generation, expected.generation)
 
     def test_grid_feedback_detects_ground(self) -> None:
-        hero = Hero(x=20.0, y=10.0)
-        mgr = EntityManager(hero=hero)
-        entity = Entity(entity_id="hero", x=hero.x, y=hero.y,
-                        width=cfg.HERO_WIDTH, height=cfg.HERO_HEIGHT)
-        mgr.register_entity(entity)
+        hero, mgr, _entity = self._make_manager_with_hero()
         world = self._make_world()
-
-        # Place stone just below hero's feet (y-down: ent_wy1 = int(top)+1)
+        mgr.tick(world, 0.0)
         ground_wy = int(hero.top) + 1
         for wx in range(int(hero.left), int(hero.right) + 1):
-            if 0 <= wx < world.active_width and 0 <= ground_wy < world.active_height:
-                lx, ly = _world_to_local(world, wx, ground_wy)
-                world.active_grid.set_cell(lx, ly, CellState(
-                    family_id="stone", variant_id="stone_platform", integrity=1.0))
+            self._write_and_upload_cell(world, wx, ground_wy, CellState(
+                family_id="stone", variant_id="stone_platform", integrity=1.0))
+        feedback = self._read_gpu_feedback(mgr, world)
+        self.assertTrue(feedback.blocked_below)
 
-        mgr.write_placeholder(world)
-        feedback = mgr.read_entity_feedback(entity, world)
+    def test_grid_feedback_detects_single_edge_ground_cell(self) -> None:
+        hero, mgr, _entity = self._make_manager_with_hero()
+        world = self._make_world()
+        mgr.tick(world, 0.0)
+        self._write_and_upload_cell(world, int(hero.left), int(hero.top) + 1, CellState(
+            family_id="stone", variant_id="stone_platform", integrity=1.0))
+        feedback = self._read_gpu_feedback(mgr, world)
         self.assertTrue(feedback.blocked_below)
 
     def test_grid_feedback_detects_horizontal_walls(self) -> None:
-        hero = Hero(x=20.0, y=10.0)
-        mgr = EntityManager(hero=hero)
-        entity = Entity(entity_id="hero", x=hero.x, y=hero.y,
-                        width=cfg.HERO_WIDTH, height=cfg.HERO_HEIGHT)
-        mgr.register_entity(entity)
+        hero, mgr, _entity = self._make_manager_with_hero()
         world = self._make_world()
-
-        # Place stone left of hero in active_grid
+        mgr.tick(world, 0.0)
         for wy in range(int(hero.bottom), int(hero.top) + 1):
-            wx = int(hero.left) - 1
-            if 0 <= wx < world.active_width and 0 <= wy < world.active_height:
-                lx, ly = _world_to_local(world, wx, wy)
-                world.active_grid.set_cell(lx, ly, CellState(
-                    family_id="stone", variant_id="stone_platform", integrity=1.0))
-
-        mgr.write_placeholder(world)
-        feedback = mgr.read_entity_feedback(entity, world)
+            self._write_and_upload_cell(world, int(hero.left) - 1, wy, CellState(
+                family_id="stone", variant_id="stone_platform", integrity=1.0))
+        feedback = self._read_gpu_feedback(mgr, world)
         self.assertTrue(feedback.blocked_left)
 
-    def test_grid_feedback_detects_liquid(self) -> None:
-        hero = Hero(x=20.0, y=10.0)
-        mgr = EntityManager(hero=hero)
-        entity = Entity(entity_id="hero", x=hero.x, y=hero.y,
-                        width=cfg.HERO_WIDTH, height=cfg.HERO_HEIGHT)
-        mgr.register_entity(entity)
+    def test_grid_feedback_detects_ceiling(self) -> None:
+        hero, mgr, _entity = self._make_manager_with_hero()
         world = self._make_world()
+        mgr.tick(world, 0.0)
+        for wx in range(int(hero.left), int(hero.right) + 1):
+            self._write_and_upload_cell(world, wx, int(hero.bottom) - 1, CellState(
+                family_id="stone", variant_id="stone_platform", integrity=1.0))
+        feedback = self._read_gpu_feedback(mgr, world)
+        self.assertTrue(feedback.blocked_up)
 
-        # Pre-fill hero area with water so write_placeholder saves them as originals
-        local_cells = mgr._entity_local_cells(entity, world)
-        for lx, ly in local_cells:
-            world.active_grid.set_cell(lx, ly, CellState(
-                family_id="water", variant_id="water"))
+    def test_grid_feedback_detects_full_height_side_wall(self) -> None:
+        hero, mgr, _entity = self._make_manager_with_hero()
+        world = self._make_world()
+        mgr.tick(world, 0.0)
+        for wy in range(int(hero.bottom), int(hero.top) + 1):
+            self._write_and_upload_cell(world, int(hero.right) + 1, wy, CellState(
+                family_id="stone", variant_id="stone_platform", integrity=1.0))
+        feedback = self._read_gpu_feedback(mgr, world)
+        self.assertTrue(feedback.blocked_right)
 
-        mgr.write_placeholder(world)
-        feedback = mgr.read_entity_feedback(entity, world)
+    def test_grid_feedback_detects_liquid(self) -> None:
+        hero, mgr, _entity = self._make_manager_with_hero()
+        world = self._make_world()
+        mgr.tick(world, 0.0)
+        for wy in range(int(hero.bottom), int(hero.top) + 1):
+            for wx in range(int(hero.left), int(hero.right) + 1):
+                self._write_and_upload_cell(world, wx, wy, CellState(
+                    family_id="water", variant_id="water"))
+        feedback = self._read_gpu_feedback(mgr, world)
         self.assertTrue(feedback.in_liquid)
 
-    def test_grid_feedback_detects_damage_via_integrity(self) -> None:
-        """Damage is read from placeholder integrity loss (reaction system pathway).
+    def test_gpu_entity_mask_blocks_sand_from_falling_into_hero(self) -> None:
+        hero, mgr, _entity = self._make_manager_with_hero()
+        world = self._make_world()
+        mgr.tick(world, 0.0)
+        sand_wx = int(hero.x)
+        sand_wy = int(hero.bottom) - 1
+        self._write_and_upload_cell(world, sand_wx, sand_wy, CellState(
+            family_id="sand", variant_id="sand_powder", integrity=1.0))
+        world.step(0.1)
+        cell_x, cell_y = _world_to_local(world, sand_wx, int(hero.bottom))
+        hero_cell = world.gpu_simulator.readback_cells_region(cell_x, cell_y, 1, 1)[0][0]
+        above_cell = world.gpu_simulator.readback_cells_region(cell_x, cell_y - 1, 1, 1)[0][0]
+        self.assertTrue(hero_cell.is_empty)
+        self.assertEqual(above_cell.family_id, "sand")
 
-        Fire adjacent to placeholder → reaction system reduces placeholder
-        integrity → entity_manager detects integrity loss → damage > 0.
-        Requires GPU paint API — skipped in CPU-only test mode.
-        """
-        self.skipTest("Requires GPU paint API to inject fire cells")
+
+class GpuChunkCacheTests(unittest.TestCase):
+    """Tests for GPU packed chunk cache and paging persistence."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.registry = build_material_registry()
+        try:
+            import moderngl
+            cls.ctx = moderngl.create_standalone_context()
+        except Exception:
+            cls.ctx = None
+
+    def test_missing_chunk_generates_once_and_writes_disk(self) -> None:
+        calls: list[tuple[int, int]] = []
+
+        def generate(store: WorldChunkStore, chunk_x: int, chunk_y: int, chunk_size: int, seed: int) -> None:
+            calls.append((chunk_x, chunk_y))
+            store.set_cell(chunk_x * chunk_size, chunk_y * chunk_size, CellState(
+                family_id="stone", variant_id="stone_platform", integrity=1.0))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorldChunkStore(16, 16, chunk_size=4, seed=7, chunk_generator=generate)
+            if self.ctx is None:
+                self.skipTest("GPU context not available")
+            world = ActiveWorldWindow(
+                store,
+                self.registry,
+                viewport_width=4,
+                viewport_height=4,
+                halo_cells=0,
+                ctx=self.ctx,
+                initial_camera_x=0,
+                initial_camera_y=0,
+                chunk_save_dir=tmp,
+                chunk_cache_prefetch_x=0,
+                chunk_cache_prefetch_y=0,
+            )
+            self.assertIn((0, 0), calls)
+            world.chunk_cache.flush_dirty()
+            self.assertTrue(any(Path(tmp).rglob("0_0.ogchunk")))
+
+            calls.clear()
+            store2 = WorldChunkStore(16, 16, chunk_size=4, seed=7, chunk_generator=generate)
+            ActiveWorldWindow(
+                store2,
+                self.registry,
+                viewport_width=4,
+                viewport_height=4,
+                halo_cells=0,
+                ctx=self.ctx,
+                initial_camera_x=0,
+                initial_camera_y=0,
+                chunk_save_dir=tmp,
+                chunk_cache_prefetch_x=0,
+                chunk_cache_prefetch_y=0,
+            )
+            self.assertEqual(calls, [])
+            self.assertIsNotNone(world)
+
+    def test_paged_out_gpu_cell_restores_from_binary_chunk(self) -> None:
+        if self.ctx is None:
+            self.skipTest("GPU context not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorldChunkStore(16, 8, chunk_size=4, seed=11)
+            world = ActiveWorldWindow(
+                store,
+                self.registry,
+                viewport_width=4,
+                viewport_height=4,
+                halo_cells=0,
+                page_shift_cells=4,
+                safety_margin_cells=0,
+                idle_flush_service_interval_seconds=0.0,
+                ctx=self.ctx,
+                chunk_save_dir=tmp,
+                chunk_cache_prefetch_x=0,
+                chunk_cache_prefetch_y=0,
+            )
+            tables = GpuMaterialTables.from_registry(self.registry)
+            packed = pack_cells_state([CellState(family_id="stone", variant_id="stone_platform", integrity=1.0)], tables)
+            world.gpu_simulator.write_region_bytes(1, 1, 1, 1, packed.state_int, packed.state_vec, packed.state_misc)
+
+            world.pan_camera(4, 0)
+            while world.pending_writeback_count:
+                world.mark_camera_activity(False, dt=1.0)
+                world.service_background_io()
+            world.pan_camera(-4, 0)
+
+            cell = world.gpu_simulator.readback_cells_region(1, 1, 1, 1)[0][0]
+            self.assertEqual(cell.family_id, "stone")
+            self.assertEqual(cell.variant_id, "stone_platform")
 
 
 class SpellSystemTests(unittest.TestCase):
@@ -379,17 +475,7 @@ class SpellSystemTests(unittest.TestCase):
 
     def test_execute_burst_injects_cells(self) -> None:
         """Burst-type spells inject cells immediately via paint_world."""
-        self.skipTest("GPU paint API writes to GPU textures, not CPU grid")
-        # Use Water Wall (burst) for immediate injection
-        socket = SPELL_CATALOG[1]  # Water Wall
-        magic = expand_model_socket(socket, hero_x=20.0, hero_y=10.0, facing_right=True)
-        result = execute_magic_socket(magic, world, self.registry)
-        self.assertIsNone(result)
-
-        water_cells = [(x, y) for y in range(world.active_grid.height)
-                       for x in range(world.active_grid.width)
-                       if world.active_grid.get_cell(x, y).family_id == "water"]
-        self.assertGreater(len(water_cells), 0)
+        self.skipTest("GPU paint verification uses explicit GPU readback tests")
 
     def test_execute_stream_returns_active_stream(self) -> None:
         """Stream-type spells return an ActiveStream for multi-frame injection."""
@@ -406,41 +492,11 @@ class SpellSystemTests(unittest.TestCase):
 
     def test_stream_inject_injects_cells(self) -> None:
         """inject_stream_tick should inject cells each tick."""
-        self.skipTest("GPU paint API writes to GPU textures, not CPU grid")
-        socket = SPELL_CATALOG[0]  # Fireball (stream)
-        magic = expand_model_socket(socket, hero_x=20.0, hero_y=10.0, facing_right=True)
-        stream = execute_magic_socket(magic, world, self.registry)
-        self.assertIsInstance(stream, ActiveStream)
-
-        inject_stream_tick(stream, world, self.registry,
-                           hero_x=20.0, hero_y=10.0, facing_right=True)
-        fire_cells = [(x, y) for y in range(world.active_grid.height)
-                      for x in range(world.active_grid.width)
-                      if world.active_grid.get_cell(x, y).family_id == "fire"]
-        self.assertGreater(len(fire_cells), 0)
-        self.assertGreater(stream.ticks_total, stream.remaining_ticks)
+        self.skipTest("GPU paint verification uses explicit GPU readback tests")
 
     def test_execute_attaches_reaction_overrides(self) -> None:
         """execute_magic_socket should attach spell_* reaction overrides to injected cells."""
-        self.skipTest("GPU paint API writes to GPU textures, not CPU grid")
-        # Ice Shield: freeze reaction (burst)
-        socket = SPELL_CATALOG[2]  # Ice Shield
-        magic = expand_model_socket(socket, hero_x=20.0, hero_y=10.0, facing_right=True)
-        result = execute_magic_socket(magic, world, self.registry)
-        self.assertIsNone(result)
-
-        ice_cells = []
-        for y in range(world.active_grid.height):
-            for x in range(world.active_grid.width):
-                cell = world.active_grid.get_cell(x, y)
-                if cell.family_id == "water" and cell.variant_id == "ice":
-                    ice_cells.append((x, y, cell))
-
-        self.assertGreater(len(ice_cells), 0)
-        for x, y, cell in ice_cells:
-            self.assertEqual(cell.spell_convert_mode, "self")
-            self.assertIn("water", cell.spell_damage_mask)
-            self.assertIn("terrain", cell.spell_damage_mask)
+        self.skipTest("GPU paint verification uses explicit GPU readback tests")
 
     def test_no_light_or_lightning_in_expansion_table(self) -> None:
         from game.spell_system import SUBJECT_EXPANSION_TABLE

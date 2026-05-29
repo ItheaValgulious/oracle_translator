@@ -12,12 +12,11 @@ import pyglet
 log = logging.getLogger(__name__)
 from pyglet.window import key
 
-from src.engine.demo_app import DEFAULT_TICK_RATE_HZ
 from src.engine.materials import build_material_registry
 from src.engine.render import DebugViewMode
 from src.engine.world import ActiveWorldWindow, WorldChunkStore
 from src.game import config as cfg
-from src.game.entity_manager import Entity, EntityManager, PLACEHOLDER_FAMILY
+from src.game.entity_manager import Entity, EntityManager
 from src.game.hero import Hero
 from src.game.renderer import GameRenderer
 from src.game.screens import GameScreen, OptionsScreen, TitleScreen
@@ -78,11 +77,14 @@ class GameApp(pyglet.window.Window):
 
         # Input
         self._keys_pressed: set[int] = set()
-        self._last_dt = 1.0 / DEFAULT_TICK_RATE_HZ
+        self._last_dt = 1.0 / 60.0
         self._sim_accumulator = 0.0
+        self._sim_fps = 0.0
+        self._sim_fps_count = 0
+        self._sim_fps_started_at = perf_counter()
 
         # Schedule tick
-        pyglet.clock.schedule_interval(self._tick, 1.0 / DEFAULT_TICK_RATE_HZ)
+        pyglet.clock.schedule_interval(self._tick, 1.0 / 60.0)
 
         # Debug HTTP server
         from src.game.debug_server import start_debug_server
@@ -126,13 +128,19 @@ class GameApp(pyglet.window.Window):
             ctx=self.ctx,
             initial_camera_x=cam_x,
             initial_camera_y=cam_y,
+            chunk_save_dir=cfg.GPU_CHUNK_SAVE_DIR,
+            chunk_cache_prefetch_x=cfg.CHUNK_CACHE_PREFETCH_X,
+            chunk_cache_prefetch_y=cfg.CHUNK_CACHE_PREFETCH_Y,
         )
         log.info("[app] world initialized in %.1fms, camera=(%d,%d) hero=(%.1f,%.1f)",
                  (perf_counter() - t0) * 1000,
                  self.world.camera_x, self.world.camera_y,
                  self.hero.x, self.hero.y)
+        self._sim_fps = 0.0
+        self._sim_fps_count = 0
+        self._sim_fps_started_at = perf_counter()
         self.active_streams.clear()
-        # Register hero entity for placeholder system
+        # Register hero entity for GPU query / GPU occupancy mask.
         self.entity_manager.register_entity(Entity(
             entity_id="hero",
             x=self.hero.x,
@@ -141,7 +149,8 @@ class GameApp(pyglet.window.Window):
             height=cfg.HERO_HEIGHT,
         ))
         if self.world is not None:
-            self.entity_manager.write_placeholder(self.world)
+            self.entity_manager.update_gpu_entity_mask(self.world)
+            self.entity_manager.schedule_feedback(self.world)
 
     def cast_spell_by_index(self, idx: int) -> None:
         """Cast a spell from the catalog by index."""
@@ -189,31 +198,23 @@ class GameApp(pyglet.window.Window):
 
         # Detect chant→cast transition: hero just entered cast state
         was_chanting = self.hero.state == "chant"
-        log.debug("[update] PRE-tick: hero y=%.2f vel_y=%.3f on_ground=%s state=%s",
-                 self.hero.y, self.hero.vel_y, self.hero.on_ground, self.hero.state)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("[update] PRE-tick: hero y=%.2f vel_y=%.3f on_ground=%s state=%s",
+                     self.hero.y, self.hero.vel_y, self.hero.on_ground, self.hero.state)
         t0 = _time.perf_counter()
         self.entity_manager.tick(self.world, dt)
         t1 = _time.perf_counter()
         self.world.step(dt)
         t2 = _time.perf_counter()
-        # Sync GPU→CPU for hero surroundings so collision sees dynamic terrain changes
-        margin = 8
-        hx = int(self.hero.x)
-        hy = int(self.hero.y + self.hero.height / 2)
-        ax = self.world.active_origin_x
-        ay = self.world.active_origin_y
-        gx = max(0, hx - ax - margin)
-        gy = max(0, hy - ay - margin)
-        gw = min(self.world.active_width - gx, int(self.hero.width) + margin * 2 + 4)
-        gh = min(self.world.active_height - gy, int(self.hero.height) + margin * 2 + 4)
-        self.world.sync_cpu_region_from_gpu(gx, gy, gw, gh)
+        feedback = self.entity_manager.poll_scheduled_feedback(self.world)
         t3 = _time.perf_counter()
-        self.entity_manager.read_feedback_and_update(self.world, dt)
+        self.entity_manager.schedule_feedback(self.world)
         t4 = _time.perf_counter()
-        self.entity_manager.clear_placeholder(self.world)
+        self.entity_manager.read_feedback_and_update(self.world, dt, feedback=feedback)
         t5 = _time.perf_counter()
-        log.info("[perf] placeholder=%.1f gpu_sim=%.1f readback=%.1f feedback=%.1f clear=%.1f total=%.1f ms",
-                 (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000, (t4-t3)*1000, (t5-t4)*1000, (t5-t0)*1000)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("[perf] entity_mask=%.1f gpu_sim=%.1f feedback_poll=%.1f feedback_schedule=%.1f hero_update=%.1f total=%.1f ms",
+                     (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000, (t4-t3)*1000, (t5-t4)*1000, (t5-t0)*1000)
 
         # If hero transitioned from chant to cast, execute the spell
         if was_chanting and self.hero.state == "cast":
@@ -237,12 +238,31 @@ class GameApp(pyglet.window.Window):
                 )
                 remaining.append(stream)
         self.active_streams = remaining
+        self._record_sim_fps()
 
-    _MAX_DT = 1.0 / 20.0  # cap to 50ms to prevent huge physics jumps after long init
-    _SIM_DT = 1.0 / 20.0  # simulation fixed step (20Hz)
+    def _record_sim_fps(self) -> None:
+        """Track actual completed simulation ticks for the F3 overlay."""
+        now = perf_counter()
+        self._sim_fps_count += 1
+        elapsed = now - self._sim_fps_started_at
+        if elapsed >= 1.0:
+            self._sim_fps = self._sim_fps_count / elapsed
+            self._sim_fps_count = 0
+            self._sim_fps_started_at = now
+
+    @property
+    def sim_fps(self) -> float:
+        elapsed = perf_counter() - self._sim_fps_started_at
+        if self._sim_fps_count > 0 and elapsed > 0.0:
+            return self._sim_fps_count / elapsed
+        return self._sim_fps
+
+    _MAX_DT = 1.0 / 15.0  # cap large pauses without forcing a long catch-up loop
+    _SIM_DT = 1.0 / 50.0  # GPU simulation fixed step (50Hz)
+    _MAX_STEPS_PER_FRAME = 2
 
     def _tick(self, dt: float) -> None:
-        """Main tick loop. Simulation runs at fixed _SIM_DT rate."""
+        """Main tick loop. Simulation runs at 50Hz; rendering remains 60Hz/vsync."""
         dt = min(dt, self._MAX_DT)
         self._last_dt = dt
         if self.current_screen != "game":
@@ -252,19 +272,20 @@ class GameApp(pyglet.window.Window):
             return
         # Always handle input every frame for responsiveness
         self._handle_hero_input(dt)
-        # Run at most one sim step per frame to avoid spiral-of-death
         self._sim_accumulator += dt
-        stepped = False
-        if self._sim_accumulator >= self._SIM_DT:
-            step_dt = min(self._sim_accumulator, self._MAX_DT)
+        steps = 0
+        while self._sim_accumulator >= self._SIM_DT and steps < self._MAX_STEPS_PER_FRAME:
+            self._sim_accumulator -= self._SIM_DT
+            self._game_screen.update(self._SIM_DT)
+            steps += 1
+        if steps >= self._MAX_STEPS_PER_FRAME and self._sim_accumulator >= self._SIM_DT:
             self._sim_accumulator = 0.0
-            self._game_screen.update(step_dt)
-            stepped = True
-        # Camera follows hero every frame (smooth even between sim steps)
-        if stepped and self.world is not None:
-            target_x = int(self.hero.x) - cfg.VIEWPORT_WIDTH // 2
-            target_y = int(self.hero.y) - cfg.VIEWPORT_HEIGHT // 2
-            self.world.pan_camera(target_x - self.world.camera_x, target_y - self.world.camera_y)
+        # Camera follows hero every render tick, independent of sim cadence.
+        target_x = int(self.hero.x) - cfg.VIEWPORT_WIDTH // 2
+        target_y = int(self.hero.y) - cfg.VIEWPORT_HEIGHT // 2
+        self.world.pan_camera(target_x - self.world.camera_x, target_y - self.world.camera_y)
+        self.world.mark_camera_activity(False, dt=dt)
+        self.world.service_background_io()
 
     def on_draw(self) -> None:
         screen = self.screens.get(self.current_screen)
@@ -309,6 +330,11 @@ class GameApp(pyglet.window.Window):
         screen = self.screens.get(self.current_screen)
         if screen is not None:
             screen.on_mouse_press(x, y, button, modifiers)
+
+    def on_close(self) -> None:
+        if self.world is not None:
+            self.world.close()
+        super().on_close()
 
 
 def run_game(*, seed: int = 42, cell_scale: int = cfg.CELL_SCALE) -> None:

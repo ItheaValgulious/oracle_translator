@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-
-log = logging.getLogger(__name__)
+from dataclasses import dataclass
 
 from src.game import config as cfg
+
+log = logging.getLogger(__name__)
 
 
 CAST_DURATION = 0.3
@@ -29,13 +29,11 @@ class Hero:
     state_timer: float = 0.0
     selected_spell_idx: int = 0
 
-    # Input states (set externally each frame)
     input_left: bool = False
     input_right: bool = False
     input_jump: bool = False
-    input_chant_held: bool = False  # True while SPACE is held
+    input_chant_held: bool = False
 
-    # Animation
     anim_frame: int = 0
     anim_timer: float = 0.0
 
@@ -112,104 +110,114 @@ class Hero:
         return cells
 
     def update(self, dt: float, *, grid_feedback: GridFeedback | None = None) -> None:
-        """Update hero physics and state.
-
-        State machine:
-        - idle/walk: normal movement. Pressing SPACE (input_chant_held) enters chant.
-        - chant: held while SPACE is held. Hero can't move horizontally.
-        - cast: brief animation after SPACE released. Auto-transitions to idle.
-        - jump: can enter chant while airborne (hero freezes horizontal movement).
-        """
+        """Update hero physics and state."""
         self.regen_mp(dt)
         self.state_timer += dt
 
-        # ── Chant entry: SPACE held while not already casting ──
-        if self.input_chant_held and self.state not in ("cast"):
+        feedback = grid_feedback
+        blocked_below = bool(feedback and feedback.blocked_below)
+        blocked_left = bool(feedback and feedback.blocked_left)
+        blocked_right = bool(feedback and feedback.blocked_right)
+        blocked_up = bool(feedback and feedback.blocked_up)
+
+        if self.input_chant_held and self.state != "cast":
             if self.state in ("idle", "walk", "jump"):
                 self.state = "chant"
                 self.state_timer = 0.0
 
-        # ── Chant: freeze horizontal movement, stay until SPACE released ──
         if self.state == "chant":
             self.vel_x = 0.0
             if not self.input_chant_held:
-                # SPACE released → signal for external code to cast spell
                 self.state = "cast"
                 self.state_timer = 0.0
 
-        # ── Cast: brief duration, then idle ──
         if self.state == "cast" and self.state_timer >= CAST_DURATION:
             self.state = "idle"
             self.state_timer = 0.0
 
-        # ── Normal movement (idle/walk, not chanting/casting) ──
-        if self.state in ("idle", "walk"):
-            if self.input_left and not (grid_feedback and grid_feedback.blocked_left):
+        if self.state in ("idle", "walk", "jump"):
+            if self.input_left and not blocked_left:
                 self.vel_x = -cfg.HERO_WALK_SPEED
                 self.facing_right = False
-            elif self.input_right and not (grid_feedback and grid_feedback.blocked_right):
+            elif self.input_right and not blocked_right:
                 self.vel_x = cfg.HERO_WALK_SPEED
                 self.facing_right = True
             else:
                 self.vel_x = 0.0
 
-        # ── Jump ──
-        if self.input_jump and self.on_ground and self.state in ("idle", "walk"):
-            self.vel_y = -cfg.HERO_JUMP_VELOCITY  # negative = upward (y decreases)
+        if self.input_jump and self.on_ground and self.state in ("idle", "walk") and not blocked_up:
+            self.vel_y = -cfg.HERO_JUMP_VELOCITY
             self.on_ground = False
             self.state = "jump"
             self.state_timer = 0.0
 
-        # ── Gravity ── (positive vel_y = downward, y increases toward ground)
-        if not self.on_ground and self.state not in ("chant"):
+        if not self.on_ground and self.state != "chant":
             old_vy = self.vel_y
             self.vel_y += cfg.HERO_GRAVITY * dt
-            log.debug("[hero] gravity: vel_y %.3f -> %.3f (dt=%.4f on_ground=%s state=%s)",
-                     old_vy, self.vel_y, dt, self.on_ground, self.state)
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "[hero] gravity: vel_y %.3f -> %.3f (dt=%.4f on_ground=%s state=%s)",
+                    old_vy,
+                    self.vel_y,
+                    dt,
+                    self.on_ground,
+                    self.state,
+                )
 
-        # ── Integrate position ──
+        if feedback is not None:
+            if self.vel_x < 0.0 and blocked_left:
+                self.vel_x = 0.0
+            elif self.vel_x > 0.0 and blocked_right:
+                self.vel_x = 0.0
+
+            if self.vel_y < 0.0 and blocked_up:
+                self.vel_y = 0.0
+            elif self.vel_y >= 0.0 and blocked_below:
+                self.vel_y = 0.0
+                if not self.on_ground:
+                    log.debug("[hero] LANDING: y=%.2f vel_y=%.2f -> on_ground=True", self.y, self.vel_y)
+                self.on_ground = True
+            elif not blocked_below:
+                if self.on_ground:
+                    log.debug("[hero] LIFT_OFF: y=%.2f vel_y=%.2f -> on_ground=False", self.y, self.vel_y)
+                self.on_ground = False
+
         self.x += self.vel_x * dt
         self.y += self.vel_y * dt
 
-        # ── Grid feedback ──
-        if grid_feedback:
-            self.x = max(0.0, min(grid_feedback.world_width - self.width / 2.0 - 1.0, self.x))
-            if grid_feedback.blocked_below:
-                # Only land when moving downward or stationary (vel_y >= 0).
-                # An upward-moving hero (jumping) should not be re-grounded.
-                if self.vel_y >= 0:
-                    self.vel_y = 0.0
-                    if not self.on_ground:
-                        log.info("[hero] LANDING: y=%.2f vel_y=%.2f -> on_ground=True", self.y, self.vel_y)
-                    self.on_ground = True
-                else:
-                    # Moving upward but ground detected below — don't re-ground
-                    log.debug("[hero] blocked_below while rising (vel_y=%.2f), not landing", self.vel_y)
-            else:
-                if self.on_ground:
-                    log.info("[hero] LIFT_OFF: y=%.2f vel_y=%.2f -> on_ground=False (blocked_below=False)", self.y, self.vel_y)
-                self.on_ground = False
+        if feedback is not None:
+            if feedback.world_width > 0.0:
+                self.x = max(0.0, min(feedback.world_width - self.width / 2.0 - 1.0, self.x))
 
-            if grid_feedback.in_liquid and self.vel_y > 0:
+            if feedback.in_liquid and self.vel_y > 0.0:
                 self.vel_y *= 0.5
 
-            if grid_feedback.damage > 0:
-                self.take_damage(grid_feedback.damage * dt)
+            if feedback.damage > 0.0:
+                self.take_damage(feedback.damage * dt)
 
-            log.debug("[hero] feedback: state=%s y=%.2f vel_y=%.3f on_ground=%s blocked_below=%s",
-                     self.state, self.y, self.vel_y, self.on_ground, grid_feedback.blocked_below)
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "[hero] feedback: state=%s y=%.2f vel_y=%.3f on_ground=%s "
+                    "blocked_below=%s blocked_up=%s blocked_left=%s blocked_right=%s",
+                    self.state,
+                    self.y,
+                    self.vel_y,
+                    self.on_ground,
+                    feedback.blocked_below,
+                    feedback.blocked_up,
+                    feedback.blocked_left,
+                    feedback.blocked_right,
+                )
 
-        # ── State transitions (landing, walk/idle) ──
         if self.state == "jump" and self.on_ground:
             self.state = "idle"
             self.state_timer = 0.0
+        elif feedback is not None and self.state in ("idle", "walk") and not self.on_ground and abs(self.vel_y) > 0.0:
+            self.state = "jump"
+            self.state_timer = 0.0
         elif self.state in ("idle", "walk"):
-            if self.vel_x != 0.0:
-                self.state = "walk"
-            else:
-                self.state = "idle"
+            self.state = "walk" if self.vel_x != 0.0 else "idle"
 
-        # ── Animation ──
         self.anim_timer += dt
         if self.anim_timer >= 1.0 / cfg.ENTITY_ANIM_FPS:
             self.anim_timer = 0.0
@@ -224,5 +232,6 @@ class GridFeedback:
     blocked_below: bool = False
     blocked_left: bool = False
     blocked_right: bool = False
+    blocked_up: bool = False
     in_liquid: bool = False
     damage: float = 0.0

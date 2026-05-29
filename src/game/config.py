@@ -12,6 +12,9 @@ BIOME_WIDTH = 32000          # 50 * VIEWPORT_WIDTH
 WORLD_HEIGHT = 3800          # 10 * VIEWPORT_HEIGHT
 WORLD_WIDTH = BIOME_WIDTH * 4
 CHUNK_SIZE = 320
+CHUNK_CACHE_PREFETCH_X = 3
+CHUNK_CACHE_PREFETCH_Y = 2
+GPU_CHUNK_SAVE_DIR = "artifacts/gpu_chunks"
 
 # ── Hero ── (height=17, width keeps same 5:10 ratio → width=8.5)
 HERO_WIDTH = 8.5             # 17 * (5/10) = 8.5
@@ -19,9 +22,9 @@ HERO_HEIGHT = 17.0           # cells
 HERO_MAX_HP = 100.0
 HERO_MAX_MP = 50.0
 MP_REGEN_PER_SEC = 3.0
-HERO_GRAVITY = 20.0         # cells/sec²
-HERO_WALK_SPEED = 18.0      # cells/sec (3x)
-HERO_JUMP_VELOCITY = 18.44  # cells/sec → jump height ≈ 8.5 cells (½ hero height)
+HERO_GRAVITY = 40.0
+HERO_WALK_SPEED = 36.0
+HERO_JUMP_VELOCITY = 36.88
 
 # ── Enemy A (archer) ──
 ENEMY_A_WIDTH = 3.0

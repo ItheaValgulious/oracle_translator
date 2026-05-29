@@ -31,7 +31,7 @@ from src.engine.grid import inject_cells
 from src.engine.types import CellFlag, CellState
 from src.engine.world import DEFAULT_HALO_CELLS, DEFAULT_PAGE_SHIFT_CELLS, ActiveWorldWindow, WorldChunkStore
 from src.game import config as cfg
-from src.game.entity_manager import EntityManager, PLACEHOLDER_FAMILY
+from src.game.entity_manager import Entity, EntityManager
 from src.game.hero import Hero, GridFeedback
 from src.game.spell_system import SPELL_CATALOG, expand_model_socket, execute_magic_socket
 
@@ -250,6 +250,9 @@ class GpuTestWindow(pyglet.window.Window):
             viewport_width=vp_w, viewport_height=vp_h,
             halo_cells=DEFAULT_HALO_CELLS,
             page_shift_cells=DEFAULT_PAGE_SHIFT_CELLS,
+            chunk_save_dir=cfg.GPU_CHUNK_SAVE_DIR,
+            chunk_cache_prefetch_x=cfg.CHUNK_CACHE_PREFETCH_X,
+            chunk_cache_prefetch_y=cfg.CHUNK_CACHE_PREFETCH_Y,
             ctx=self.ctx,
         )
         self.backend_label = "GPU Compute"
@@ -260,8 +263,15 @@ class GpuTestWindow(pyglet.window.Window):
         self.hero.reset(80.0, float(ground_y))
         self.entity_mgr = EntityManager(hero=self.hero)
 
-        # Write initial placeholder
-        self.entity_mgr.write_placeholder(self.world)
+        self.entity_mgr.register_entity(Entity(
+            entity_id="hero",
+            x=self.hero.x,
+            y=self.hero.y,
+            width=cfg.HERO_WIDTH,
+            height=cfg.HERO_HEIGHT,
+        ))
+        self.entity_mgr.update_gpu_entity_mask(self.world)
+        self.entity_mgr.schedule_feedback(self.world)
 
         # Texture
         self.texture: moderngl.Texture | None = None
@@ -331,7 +341,7 @@ class GpuTestWindow(pyglet.window.Window):
         self.hero.input_left = key.A in self._keys_pressed or key.LEFT in self._keys_pressed
         self.hero.input_right = key.D in self._keys_pressed or key.RIGHT in self._keys_pressed
         self.hero.input_jump = key.W in self._keys_pressed or key.UP in self._keys_pressed
-        self.hero.input_chant = key.SPACE in self._keys_pressed
+        self.hero.input_chant_held = key.SPACE in self._keys_pressed
 
         # ── Entity-Grid Hybrid cycle ──
         self.entity_mgr.tick(self.world, dt)
