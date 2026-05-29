@@ -58,7 +58,7 @@ class TitleScreen(BaseScreen):
         if not hasattr(self, '_draw_count'):
             self._draw_count = 0
         self._draw_count += 1
-        if self._draw_count <= 3:
+        if self._draw_count <= 3 and log.isEnabledFor(logging.DEBUG):
             log.info("[TitleScreen] on_draw #%d", self._draw_count)
         self.app.ctx.clear(0.04, 0.05, 0.07, 1.0)
         self.title_label.draw()
@@ -99,7 +99,7 @@ class GameScreen(BaseScreen):
             debug = self.app.entity_manager.last_debug
             if debug is not None:
                 self.app.renderer.draw_debug_collision(cam_x, cam_y, debug)
-            self.app.renderer.draw_fps(self.app._last_dt)
+            self.app.renderer.draw_fps(self.app.sim_fps)
         if self.show_console:
             self.console.draw()
 
