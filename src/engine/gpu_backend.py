@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import struct
 
 import moderngl
+from pyglet import gl
 
 from .atmosphere import default_ambient_air_temperature_for_row
 from .grid import Grid
@@ -43,9 +44,25 @@ class ComputeBackendUnavailable(RuntimeError):
 
 
 @dataclass(frozen=True)
+class LocalCellsSnapshot:
+    entity_id: str
+    world_x: int
+    world_y: int
+    width: int
+    height: int
+    variant_indices: tuple[tuple[int, ...], ...]
+    velocities: tuple[tuple[tuple[float, float], ...], ...]
+    temperatures: tuple[tuple[float, ...], ...]
+    variant_families: tuple[str, ...]
+    empty_variant_index: int
+    issued_step: int
+
+
+@dataclass(frozen=True)
 class GpuMaterialTables:
     family_ids: tuple[str, ...]
     variant_keys: tuple[tuple[str, str], ...]
+    variant_families: tuple[str, ...]
     family_index_by_id: dict[str, int]
     variant_index_by_key: dict[tuple[str, str], int]
     family_buffer_data: bytes
@@ -63,6 +80,7 @@ class GpuMaterialTables:
             for family_id, family in registry.families.items()
             for variant_id in family.variants.keys()
         )
+        variant_families = tuple(family_id for family_id, _variant_id in variant_keys)
         variant_index_by_key = {key: index for index, key in enumerate(variant_keys)}
 
         phase_ranges: dict[str, tuple[int, int]] = {}
@@ -171,6 +189,7 @@ class GpuMaterialTables:
         return cls(
             family_ids=family_ids,
             variant_keys=variant_keys,
+            variant_families=variant_families,
             family_index_by_id=family_index_by_id,
             variant_index_by_key=variant_index_by_key,
             family_buffer_data=bytes(family_buffer),
@@ -212,7 +231,58 @@ class GpuFeedbackToken:
     world_width: float
 
 
+MAX_PROJECTILES = 64
+
+
+@dataclass
+class GpuProjectileFeedbackToken:
+    result_texture: moderngl.Texture
+    result_pbo: moderngl.Buffer | None
+    issued_step: int
+    projectile_count: int
+    projectile_positions: list[tuple[int, int]]
+
+
+@dataclass
+class ProjectileHitInfo:
+    hit: bool
+    hit_variant: int
+    hit_x: int
+    hit_y: int
+
+
 FeedbackQueryPoint = tuple[int, int, int]
+
+
+@dataclass
+class GpuFeedbackBatchToken:
+    result_texture: moderngl.Texture
+    result_pbo: moderngl.Buffer | None
+    issued_step: int
+    entity_count: int
+    entity_ids: list[str]
+    world_width: float
+    sync: object | None = None
+
+
+def _same_feedback_token(left: GpuFeedbackBatchToken, right: GpuFeedbackBatchToken) -> bool:
+    return (
+        left.result_texture is right.result_texture
+        and left.issued_step == right.issued_step
+        and left.entity_count == right.entity_count
+    )
+
+
+def _delete_gl_sync(sync: object | None) -> None:
+    if sync is not None:
+        gl.glDeleteSync(sync)
+
+
+def _gl_sync_signaled(sync: object | None) -> bool:
+    if sync is None:
+        return True
+    wait_result = gl.glClientWaitSync(sync, 0, gl.GLuint64(0))
+    return int(wait_result) in (int(gl.GL_ALREADY_SIGNALED), int(gl.GL_CONDITION_SATISFIED))
 
 
 @dataclass(frozen=True)
@@ -971,7 +1041,8 @@ vec3 temperature_color(float temperature) {{
 }}
 
 vec3 pressure_color(float pressure) {{
-    float excess_pressure = max(0.0, pressure - AIR_PRESSURE);
+    float ambient_pressure = AIR_PRESSURE + density_for_variant(EMPTY_VARIANT_INDEX);
+    float excess_pressure = max(0.0, pressure - ambient_pressure);
     float factor = clamp(log(1.0 + excess_pressure) / log(129.0), 0.0, 1.0);
     if (factor <= 0.15) {{
         float local_factor = factor / 0.15;
@@ -1016,13 +1087,17 @@ void main() {
         int variant_index = imageLoad(state_int_src, coord).x;
         float previous_pressure = imageLoad(pressure_prev_tex, coord).x;
         float cell_temperature = imageLoad(state_misc_src, coord).x;
-        float pressure = previous_pressure + (AIR_PRESSURE - previous_pressure) * PRESSURE_RELAXATION;
+        float retained_pressure = previous_pressure + (AIR_PRESSURE - previous_pressure) * PRESSURE_RELAXATION;
+        float pressure = retained_pressure;
         float ambient_temperature_value = ambient_temperature_for_y(y);
         if (matter_state_for_variant(variant_index) == MATTER_STATE_GAS) {
             pressure = AIR_PRESSURE + effective_density_for_variant_and_temperature(variant_index, cell_temperature, ambient_temperature_value);
         } else if (matter_state_for_variant(variant_index) == MATTER_STATE_LIQUID) {
             pressure = above_pressure + density_for_variant(variant_index);
+        } else {
+            pressure = AIR_PRESSURE;
         }
+        pressure = max(pressure, retained_pressure);
         imageStore(pressure_next_tex, coord, vec4(pressure, 0.0, 0.0, 0.0));
         above_pressure = pressure;
     }
@@ -2321,6 +2396,8 @@ def _feedback_shader_source(tables: GpuMaterialTables) -> str:
 layout(local_size_x = 1, local_size_y = 1) in;
 
 layout(rgba32i, binding = 3) uniform readonly iimage2D state_int_src;
+layout(rgba32f, binding = 4) uniform readonly image2D state_vec_src;
+layout(rgba32f, binding = 5) uniform readonly image2D state_misc_src;
 layout(rgba32f, binding = 17) uniform writeonly image2D feedback_tex;
 layout(std430, binding = 4) readonly buffer EntityQueryPointBuffer {
     ivec4 query_points[];
@@ -2342,13 +2419,73 @@ bool liquid_for_feedback(int variant_index) {
     return matter_state_for_variant(variant_index) == MATTER_STATE_LIQUID;
 }
 
+float impact_damage_from_variant(int variant_index, vec4 cell_vec) {
+    if (variant_index == EMPTY_VARIANT_INDEX || matter_state_for_variant(variant_index) != MATTER_STATE_SOLID) {
+        return 0.0;
+    }
+    float speed = length(cell_vec.xy);
+    if (speed <= 12.0) {
+        return 0.0;
+    }
+    return min(0.18, (speed - 12.0) * 0.0012 * max(0.4, density_for_variant(variant_index)));
+}
+
+float hazard_damage_for_feedback(ivec2 coord, int variant_index) {
+    vec4 misc = imageLoad(state_misc_src, coord);
+    vec4 cell_vec = imageLoad(state_vec_src, coord);
+    float damage = 0.0;
+    if (misc.x > 80.0) {
+        damage += min(0.24, (misc.x - 80.0) * 0.00045);
+    } else if (misc.x < -35.0) {
+        damage += min(0.12, (-35.0 - misc.x) * 0.00018);
+    }
+    if (damage_mask_has_living(damage_mask_for_variant(variant_index))) {
+        damage += reaction_strength_for_variant(variant_index) * 0.022;
+    }
+    damage += impact_damage_from_variant(variant_index, cell_vec);
+    for (int index = 0; index < 8; index += 1) {
+        ivec2 neighbor_coord = coord + NEIGHBORS_8[index];
+        if (!in_bounds(neighbor_coord)) {
+            continue;
+        }
+        int neighbor_variant = imageLoad(state_int_src, neighbor_coord).x;
+        if (neighbor_variant == EMPTY_VARIANT_INDEX) {
+            continue;
+        }
+        if (damage_mask_has_living(damage_mask_for_variant(neighbor_variant))) {
+            damage += reaction_strength_for_variant(neighbor_variant) * 0.018;
+        }
+        damage += impact_damage_from_variant(neighbor_variant, imageLoad(state_vec_src, neighbor_coord));
+    }
+    return min(0.35, damage);
+}
+
+bool liquid_contact_for_feedback(ivec2 coord, int variant_index) {
+    if (liquid_for_feedback(variant_index)) {
+        return true;
+    }
+    for (int index = 0; index < 8; index += 1) {
+        ivec2 neighbor_coord = coord + NEIGHBORS_8[index];
+        if (in_bounds(neighbor_coord) && liquid_for_feedback(imageLoad(state_int_src, neighbor_coord).x)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void main() {
     float blocked_below = 0.0;
     float blocked_left = 0.0;
     float blocked_right = 0.0;
     float blocked_up = 0.0;
-
+    float left_step_foot = 0.0;
+    float right_step_foot = 0.0;
+    float left_step_clearance_blocked = 0.0;
+    float right_step_clearance_blocked = 0.0;
+    float embedded = 0.0;
     float in_liquid = 0.0;
+    float living_damage = 0.0;
+    int damage_point_count = 0;
     int capped_count = min(query_point_count, 64);
     for (int index = 0; index < capped_count; index += 1) {
         ivec4 point = query_points[index];
@@ -2358,9 +2495,14 @@ void main() {
         }
         int variant_index = imageLoad(state_int_src, coord).x;
         if (point.z == 4) {
-            if (liquid_for_feedback(variant_index)) {
+            if (liquid_contact_for_feedback(coord, variant_index)) {
                 in_liquid = 1.0;
             }
+            living_damage += hazard_damage_for_feedback(coord, variant_index);
+            damage_point_count += 1;
+        } else if (point.z == 5) {
+            living_damage += hazard_damage_for_feedback(coord, variant_index);
+            damage_point_count += 1;
         } else if (solid_for_feedback(variant_index)) {
             if (point.z == 0) {
                 blocked_below = 1.0;
@@ -2370,11 +2512,190 @@ void main() {
                 blocked_right = 1.0;
             } else if (point.z == 3) {
                 blocked_up = 1.0;
+            } else if (point.z == 6) {
+                left_step_foot = 1.0;
+            } else if (point.z == 7) {
+                right_step_foot = 1.0;
+            } else if (point.z == 8) {
+                embedded = 1.0;
+            } else if (point.z == 9) {
+                left_step_clearance_blocked = 1.0;
+            } else if (point.z == 10) {
+                right_step_clearance_blocked = 1.0;
             }
         }
     }
 
+    // Normalize damage: average integrity loss per damage point
+    float normalized_damage = 0.0;
+    if (damage_point_count > 0) {
+        normalized_damage = living_damage / float(damage_point_count);
+    }
+    float blocked_left_ahead = left_step_foot * (1.0 - left_step_clearance_blocked);
+    float blocked_right_ahead = right_step_foot * (1.0 - right_step_clearance_blocked);
+
     imageStore(feedback_tex, ivec2(0, 0), vec4(blocked_below, blocked_left, blocked_right, blocked_up * 2.0 + in_liquid));
+    imageStore(feedback_tex, ivec2(1, 0), vec4(normalized_damage, blocked_left_ahead, blocked_right_ahead, embedded));
+}
+"""
+
+
+def _batched_feedback_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 1, local_size_y = 1) in;
+
+layout(rgba32i, binding = 3) uniform readonly iimage2D state_int_src;
+layout(rgba32f, binding = 4) uniform readonly image2D state_vec_src;
+layout(rgba32f, binding = 5) uniform readonly image2D state_misc_src;
+layout(rgba32f, binding = 17) uniform writeonly image2D feedback_tex;
+layout(std430, binding = 4) readonly buffer BatchQueryPointBuffer {
+    ivec4 batch_query_points[];
+};
+layout(std430, binding = 6) readonly buffer BatchEntityHeaderBuffer {
+    ivec4 batch_entity_headers[];  // (query_start, query_count, 0, 0)
+};
+
+uniform int entity_count;
+
+bool solid_for_feedback(int variant_index) {
+    if (variant_index == EMPTY_VARIANT_INDEX) {
+        return false;
+    }
+    return matter_state_for_variant(variant_index) == MATTER_STATE_SOLID;
+}
+
+bool liquid_for_feedback(int variant_index) {
+    if (variant_index == EMPTY_VARIANT_INDEX) {
+        return false;
+    }
+    return matter_state_for_variant(variant_index) == MATTER_STATE_LIQUID;
+}
+
+float impact_damage_from_variant(int variant_index, vec4 cell_vec) {
+    if (variant_index == EMPTY_VARIANT_INDEX || matter_state_for_variant(variant_index) != MATTER_STATE_SOLID) {
+        return 0.0;
+    }
+    float speed = length(cell_vec.xy);
+    if (speed <= 12.0) {
+        return 0.0;
+    }
+    return min(0.18, (speed - 12.0) * 0.0012 * max(0.4, density_for_variant(variant_index)));
+}
+
+float hazard_damage_for_feedback(ivec2 coord, int variant_index) {
+    vec4 misc = imageLoad(state_misc_src, coord);
+    vec4 cell_vec = imageLoad(state_vec_src, coord);
+    float damage = 0.0;
+    if (misc.x > 80.0) {
+        damage += min(0.24, (misc.x - 80.0) * 0.00045);
+    } else if (misc.x < -35.0) {
+        damage += min(0.12, (-35.0 - misc.x) * 0.00018);
+    }
+    if (damage_mask_has_living(damage_mask_for_variant(variant_index))) {
+        damage += reaction_strength_for_variant(variant_index) * 0.022;
+    }
+    damage += impact_damage_from_variant(variant_index, cell_vec);
+    for (int index = 0; index < 8; index += 1) {
+        ivec2 neighbor_coord = coord + NEIGHBORS_8[index];
+        if (!in_bounds(neighbor_coord)) {
+            continue;
+        }
+        int neighbor_variant = imageLoad(state_int_src, neighbor_coord).x;
+        if (neighbor_variant == EMPTY_VARIANT_INDEX) {
+            continue;
+        }
+        if (damage_mask_has_living(damage_mask_for_variant(neighbor_variant))) {
+            damage += reaction_strength_for_variant(neighbor_variant) * 0.018;
+        }
+        damage += impact_damage_from_variant(neighbor_variant, imageLoad(state_vec_src, neighbor_coord));
+    }
+    return min(0.35, damage);
+}
+
+bool liquid_contact_for_feedback(ivec2 coord, int variant_index) {
+    if (liquid_for_feedback(variant_index)) {
+        return true;
+    }
+    for (int index = 0; index < 8; index += 1) {
+        ivec2 neighbor_coord = coord + NEIGHBORS_8[index];
+        if (in_bounds(neighbor_coord) && liquid_for_feedback(imageLoad(state_int_src, neighbor_coord).x)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    int entity_idx = int(gl_GlobalInvocationID.x);
+    if (entity_idx >= entity_count) {
+        return;
+    }
+
+    ivec4 header = batch_entity_headers[entity_idx];
+    int query_start = header.x;
+    int query_count = header.y;
+
+    float blocked_below = 0.0;
+    float blocked_left = 0.0;
+    float blocked_right = 0.0;
+    float blocked_up = 0.0;
+    float left_step_foot = 0.0;
+    float right_step_foot = 0.0;
+    float left_step_clearance_blocked = 0.0;
+    float right_step_clearance_blocked = 0.0;
+    float embedded = 0.0;
+    float in_liquid = 0.0;
+    float living_damage = 0.0;
+    int damage_point_count = 0;
+
+    for (int i = 0; i < query_count; i += 1) {
+        ivec4 point = batch_query_points[query_start + i];
+        ivec2 coord = point.xy;
+        if (coord.x < 0 || coord.y < 0 || coord.x >= grid_size.x || coord.y >= grid_size.y) {
+            continue;
+        }
+        int variant_index = imageLoad(state_int_src, coord).x;
+        if (point.z == 4) {
+            if (liquid_contact_for_feedback(coord, variant_index)) {
+                in_liquid = 1.0;
+            }
+            living_damage += hazard_damage_for_feedback(coord, variant_index);
+            damage_point_count += 1;
+        } else if (point.z == 5) {
+            living_damage += hazard_damage_for_feedback(coord, variant_index);
+            damage_point_count += 1;
+        } else if (solid_for_feedback(variant_index)) {
+            if (point.z == 0) {
+                blocked_below = 1.0;
+            } else if (point.z == 1) {
+                blocked_left = 1.0;
+            } else if (point.z == 2) {
+                blocked_right = 1.0;
+            } else if (point.z == 3) {
+                blocked_up = 1.0;
+            } else if (point.z == 6) {
+                left_step_foot = 1.0;
+            } else if (point.z == 7) {
+                right_step_foot = 1.0;
+            } else if (point.z == 8) {
+                embedded = 1.0;
+            } else if (point.z == 9) {
+                left_step_clearance_blocked = 1.0;
+            } else if (point.z == 10) {
+                right_step_clearance_blocked = 1.0;
+            }
+        }
+    }
+
+    float normalized_damage = 0.0;
+    if (damage_point_count > 0) {
+        normalized_damage = living_damage / float(damage_point_count);
+    }
+    float blocked_left_ahead = left_step_foot * (1.0 - left_step_clearance_blocked);
+    float blocked_right_ahead = right_step_foot * (1.0 - right_step_clearance_blocked);
+
+    imageStore(feedback_tex, ivec2(0, entity_idx), vec4(blocked_below, blocked_left, blocked_right, blocked_up * 2.0 + in_liquid));
+    imageStore(feedback_tex, ivec2(1, entity_idx), vec4(normalized_damage, blocked_left_ahead, blocked_right_ahead, embedded));
 }
 """
 
@@ -2418,6 +2739,110 @@ void main() {
 """
 
 
+MAX_ENTITIES = 256
+
+
+def _entity_placeholder_shader_source(tables: GpuMaterialTables) -> str:
+    placeholder_variant_index = tables.variant_index_by_key[("entity_placeholder", "placeholder")]
+    placeholder_family_index = tables.family_index_by_id["entity_placeholder"]
+    return _build_common_glsl(tables) + f"""
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32i, binding = 3) uniform iimage2D state_int_image;
+layout(rgba32f, binding = 4) uniform image2D state_vec_image;
+layout(rgba32f, binding = 5) uniform image2D state_misc_image;
+
+layout(std430, binding = 6) readonly buffer EntityStateBuffer {{
+    ivec4 entity_states[];   // (center_x, center_y, facing_right, variant_index)
+}};
+layout(std430, binding = 7) readonly buffer EntityIntegrityBuffer {{
+    float entity_integrities[];
+}};
+layout(std430, binding = 5) readonly buffer EntityShapeBuffer {{
+    ivec4 entity_shapes[];   // (shape_offset_x, shape_offset_y, shape_width, shape_height) per entity
+}};
+
+uniform int entity_count;
+uniform int placeholder_variant_index = {placeholder_variant_index};
+uniform int placeholder_family_index = {placeholder_family_index};
+uniform int placeholder_clear_mode;  // 0 = write, 1 = clear
+uniform ivec4 entity_dispatch_clip;  // (lx0, ly0, lx1, ly1) bounding box of all entities
+uniform ivec2 entity_dispatch_origin;
+uniform ivec2 entity_dispatch_size;
+
+bool is_entity_placeholder_cell(ivec2 coord) {{
+    ivec4 cell_int = imageLoad(state_int_image, coord);
+    return cell_int.x == placeholder_variant_index;
+}}
+
+bool coord_in_entity_rect(ivec2 coord, ivec2 center, ivec2 shape_offset, int shape_w, int shape_h) {{
+    // Entity AABB: from center.x + shape_offset.x to center.x + shape_offset.x + shape_w
+    // and from center.y + shape_offset.y to center.y + shape_offset.y + shape_h
+    int x0 = center.x + shape_offset.x;
+    int y0 = center.y + shape_offset.y;
+    return coord.x >= x0 && coord.x < x0 + shape_w && coord.y >= y0 && coord.y < y0 + shape_h;
+}}
+
+void main() {{
+    ivec2 local_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (local_coord.x >= entity_dispatch_size.x || local_coord.y >= entity_dispatch_size.y) {{
+        return;
+    }}
+    ivec2 coord = entity_dispatch_origin + local_coord;
+    if (!in_bounds(coord)) {{
+        return;
+    }}
+    // Only process cells within the combined bounding clip
+    if (coord.x < entity_dispatch_clip.x || coord.y < entity_dispatch_clip.y ||
+        coord.x >= entity_dispatch_clip.z || coord.y >= entity_dispatch_clip.w) {{
+        return;
+    }}
+
+    if (placeholder_clear_mode == 1) {{
+        // CLEAR mode: only clear cells that are entity_placeholder
+        if (is_entity_placeholder_cell(coord)) {{
+            imageStore(state_int_image, coord, empty_cell_int());
+            imageStore(state_vec_image, coord, empty_cell_vec());
+            imageStore(state_misc_image, coord, empty_cell_misc_for_coord(coord));
+        }}
+        return;
+    }}
+
+    // WRITE mode: check if this coord falls within any entity's shape rect
+    for (int ei = 0; ei < entity_count; ei++) {{
+        ivec2 center = entity_states[ei].xy;
+        int facing = entity_states[ei].z;
+        ivec4 shape = entity_shapes[ei];
+        int shape_w = shape.z;
+        int shape_h = shape.w;
+
+        // Flip width offset for facing_left: shift the AABB right edge
+        // Original: center.x + shape_offset.x to center.x + shape_offset.x + shape_w
+        // For hero: shape_offset.x = -(width/2), shape_w = width
+        // When facing_left, mirror around center: x0 = center.x + (shape_offset.x + shape_w - 1) = center.x - shape_offset.x - 1
+        // Simplified: for center-based entities, facing_left means shape_offset.x = -(width/2) → x0 = center.x - width/2
+        // facing_left should swap: x0 = center.x + shape_offset.x → center.x - (shape_offset.x + shape_w)
+        // Actually simpler: if facing_left, negate shape_offset.x and mirror the x range
+        ivec2 offset = shape.xy;
+        if (facing == 0) {{
+            // Facing left: mirror offset.x so the shape extends in the opposite direction
+            offset.x = -(offset.x + shape_w);
+        }}
+        if (coord_in_entity_rect(coord, center, offset, shape_w, shape_h)) {{
+            float integrity = entity_integrities[ei];
+            vec4 ambient_temp = empty_cell_misc_for_coord(coord);
+            imageStore(state_int_image, coord,
+                ivec4(placeholder_variant_index, 0, 0, 0));
+            imageStore(state_vec_image, coord, vec4(0.0));
+            imageStore(state_misc_image, coord,
+                vec4(ambient_temp.x, 0.0, integrity, 0.0));
+            return;  // Found matching entity, done
+        }}
+    }}
+}}
+"""
+
+
 def _reaction_resolve_shader_source(tables: GpuMaterialTables) -> str:
     return _build_common_glsl(tables) + """
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -2456,6 +2881,7 @@ void main() {
     float gathered_corrosion = 0.0;
     float strongest_neighbor_corrosion = 0.0;
     int strongest_neighbor_variant = 0;
+    int strongest_neighbor_generation = 0;
     bool adjacent_heat_source = false;
     bool caused_terrain_damage = false;
     bool caused_living_damage = false;
@@ -2500,15 +2926,18 @@ void main() {
             if (neighbor_corrosion > strongest_neighbor_corrosion) {
                 strongest_neighbor_corrosion = neighbor_corrosion;
                 strongest_neighbor_variant = neighbor_variant;
+                strongest_neighbor_generation = neighbor_int.y;
             }
         }
     }
+
+    // ── Age increment (all cells) ──
+    out_misc.w = cell_misc.w + dt;
 
     // ── Self-heating (reaction_energy > 0) ──
     float energy = reaction_energy_for_variant(variant_index);
     if (energy > 0.0) {
         out_misc.x += energy * dt / max(heat_capacity_for_variant(variant_index), 0.001);
-        out_misc.w = cell_misc.w + dt;
         if (lifetime_mode_for_variant(variant_index) == 1) {
             float max_age = family_table[family_index].floats0.x;
             if (out_misc.w >= max_age) {
@@ -2585,12 +3014,19 @@ void main() {
                 return;
             } else if (cm == 2) {
                 // "self" — convert to the strongest neighbor's variant
-                ivec4 new_int = ivec4(strongest_neighbor_variant, 0, 0, 0);
-                vec4 new_misc = vec4(out_misc.x, 0.0, 1.0, 0.0);
-                imageStore(state_int_dst, coord, new_int);
-                imageStore(state_vec_dst, coord, vec4(0.0));
-                imageStore(state_misc_dst, coord, new_misc);
-                return;
+                // Generation decrements by 1; if 0, stop reacting
+                int new_gen = strongest_neighbor_generation - 1;
+                if (new_gen < 0) new_gen = 0;
+                if (strongest_neighbor_generation <= 0) {
+                    // Generation exhausted — don't convert, just reduce integrity
+                } else {
+                    ivec4 new_int = ivec4(strongest_neighbor_variant, new_gen, 0, 0);
+                    vec4 new_misc = vec4(out_misc.x, 0.0, 1.0, 0.0);
+                    imageStore(state_int_dst, coord, new_int);
+                    imageStore(state_vec_dst, coord, vec4(0.0));
+                    imageStore(state_misc_dst, coord, new_misc);
+                    return;
+                }
             }
             // cm == 0 ("none"): just reduce integrity, no conversion
         }
@@ -2768,6 +3204,8 @@ uniform int paint_generation;
 uniform float paint_age;
 uniform int paint_flags;
 uniform int erase_mode;
+uniform float paint_vel_x;
+uniform float paint_vel_y;
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -2788,9 +3226,111 @@ void main() {
     }
 
     imageStore(state_int_image, coord, ivec4(paint_variant_index, paint_generation, paint_flags, 0));
-    imageStore(state_vec_image, coord, vec4(0.0));
+    imageStore(state_vec_image, coord, vec4(paint_vel_x, paint_vel_y, 0.0, 0.0));
     imageStore(state_misc_image, coord, vec4(paint_temperature, paint_support_value, paint_integrity, paint_age));
 }
+"""
+
+
+def _projectile_feedback_shader_source(tables: GpuMaterialTables) -> str:
+    return _build_common_glsl(tables) + """
+layout(local_size_x = 1, local_size_y = 1) in;
+
+layout(rgba32i, binding = 3) uniform readonly iimage2D state_int_src;
+layout(rgba32f, binding = 17) uniform writeonly image2D feedback_tex;
+layout(std430, binding = 8) readonly buffer ProjectileBuffer {
+    ivec4 projectile_positions[];
+};
+
+uniform int projectile_count;
+
+bool solid_at(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= grid_size.x || coord.y >= grid_size.y) {
+        return false;
+    }
+    int variant_index = imageLoad(state_int_src, coord).x;
+    if (variant_index == EMPTY_VARIANT_INDEX) {
+        return false;
+    }
+    return matter_state_for_variant(variant_index) == MATTER_STATE_SOLID;
+}
+
+void main() {
+    int index = int(gl_GlobalInvocationID.x);
+    if (index >= projectile_count) {
+        return;
+    }
+    ivec4 proj = projectile_positions[index];
+    ivec2 coord = proj.xy;
+    int hit = 0;
+    int hit_variant = 0;
+    if (coord.x >= 0 && coord.y >= 0 && coord.x < grid_size.x && coord.y < grid_size.y) {
+        int variant_index = imageLoad(state_int_src, coord).x;
+        if (variant_index != EMPTY_VARIANT_INDEX && matter_state_for_variant(variant_index) != MATTER_STATE_GAS) {
+            hit = 1;
+            hit_variant = variant_index;
+        }
+    }
+    imageStore(feedback_tex, ivec2(index, 0), vec4(float(hit), float(hit_variant), 0.0, 0.0));
+}
+"""
+
+
+def _pressure_inject_shader_source(tables: GpuMaterialTables) -> str:
+    # Cannot use _build_common_glsl because it declares pressure_tex as readonly at binding=12
+    return f"""
+#version 430
+
+#define EMPTY_VARIANT_INDEX {tables.empty_variant_index}
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f, binding = 12) uniform image2D pressure_tex;
+
+uniform ivec2 inject_origin;
+uniform ivec2 inject_center;
+uniform int inject_inner_radius;
+uniform int inject_outer_radius;
+uniform float inject_pressure;
+uniform ivec2 grid_size;
+
+bool in_bounds(ivec2 coord) {{
+    return coord.x >= 0 && coord.y >= 0 && coord.x < grid_size.x && coord.y < grid_size.y;
+}}
+
+void main() {{
+    ivec2 coord = inject_origin + ivec2(gl_GlobalInvocationID.xy);
+    if (!in_bounds(coord)) {{
+        return;
+    }}
+    ivec2 delta = coord - inject_center;
+    int dist_sq = delta.x * delta.x + delta.y * delta.y;
+    int outer_sq = inject_outer_radius * inject_outer_radius;
+    if (dist_sq > outer_sq) {{
+        return;
+    }}
+    int inner_sq = inject_inner_radius * inject_inner_radius;
+    if (inject_inner_radius > 0 && dist_sq < inner_sq) {{
+        return;
+    }}
+    float dist = sqrt(float(dist_sq));
+    float falloff = 0.0;
+    if (inject_inner_radius > 0) {{
+        float inner_radius = float(inject_inner_radius);
+        float outer_radius = float(inject_outer_radius);
+        float band_mid = (inner_radius + outer_radius) * 0.5;
+        float band_half_width = max(1.0, (outer_radius - inner_radius) * 0.5);
+        falloff = 1.0 - abs(dist - band_mid) / band_half_width;
+    }} else {{
+        falloff = 1.0 - dist / max(1.0, float(inject_outer_radius));
+    }}
+    if (falloff <= 0.0) {{
+        return;
+    }}
+    float existing = imageLoad(pressure_tex, coord).x;
+    float injected = inject_pressure * falloff;
+    imageStore(pressure_tex, coord, vec4(max(existing, injected), 0.0, 0.0, 0.0));
+}}
 """
 
 
@@ -2853,9 +3393,39 @@ class GpuSimulator:
         self.reaction_claim = self._make_texture(1, "i4")
         self.entity_mask = self._make_texture(1, "i4")
         self._entity_mask_rects: list[tuple[int, int, int, int]] = []
-        self._feedback_textures = [self._make_texture_for_size(1, 1, 4, "f4") for _ in range(3)]
+        self._feedback_textures = [self._make_texture_for_size(2, 1, 4, "f4") for _ in range(3)]
         self._feedback_buffer_index = 0
         self._entity_query_buffer = self.ctx.buffer(reserve=64 * 16)
+        self._batched_feedback_textures = [self._make_texture_for_size(2, MAX_ENTITIES, 4, "f4") for _ in range(3)]
+        self._batched_feedback_buffer_index = 0
+        self._batched_entity_header_buffer = self.ctx.buffer(reserve=MAX_ENTITIES * 16)  # ivec4 per entity
+        self._batched_query_point_buffer = self.ctx.buffer(reserve=MAX_ENTITIES * 64 * 16)  # worst case
+        self._batched_feedback_result_buffer = self.ctx.buffer(reserve=MAX_ENTITIES * 2 * 16)  # 2 vec4 per entity
+        # Dynamic texture pool: pre-create textures for common sizes (2 x N rows)
+        # Texture sizes: 4, 8, 16, 32, 64, 128 (rounded up entity counts)
+        self._batched_feedback_texture_pool: dict[int, list[moderngl.Texture]] = {}
+        self._batched_feedback_pbo_pool: dict[int, list[moderngl.Buffer]] = {}
+        for row_count in (4, 8, 16, 32, 64, 128, MAX_ENTITIES):
+            pbo_size = 2 * row_count * 4 * 4  # 2 cols x row_count rows x 4 components x 4 bytes (f4)
+            self._batched_feedback_texture_pool[row_count] = [
+                self._make_texture_for_size(2, row_count, 4, "f4") for _ in range(3)
+            ]
+            self._batched_feedback_pbo_pool[row_count] = [
+                self.ctx.buffer(reserve=pbo_size) for _ in range(3)
+            ]
+        self._entity_shape_buffer = self.ctx.buffer(reserve=MAX_ENTITIES * 16)  # ivec4 per entity
+        self._entity_state_buffer = self.ctx.buffer(reserve=MAX_ENTITIES * 16)  # ivec4 per entity
+        self._entity_state_float_buffer = self.ctx.buffer(reserve=MAX_ENTITIES * 4)  # float integrity per entity
+        self._placeholder_rects: list[tuple[int, int, int, int]] = []
+        self._prev_placeholder_rects: list[tuple[int, int, int, int]] = []
+        self._placeholder_origin: tuple[int, int] = (0, 0)
+        self._registered_entity_shapes: dict[str, tuple[int, int, int, int]] = {}  # (offset_x, offset_y, width, height)
+        self._entity_id_to_index: dict[str, int] = {}
+        self._pending_pressure_injections: list[tuple[int, int, int, int, float]] = []  # (cx, cy, inner_radius, outer_radius, pressure)
+        self._projectile_query_buffer = self.ctx.buffer(reserve=MAX_PROJECTILES * 16)  # ivec4 per projectile
+        self._projectile_feedback_textures = [self._make_texture_for_size(4, MAX_PROJECTILES, 4, "f4") for _ in range(3)]
+        self._projectile_feedback_pbos = [self.ctx.buffer(reserve=4 * MAX_PROJECTILES * 4 * 4) for _ in range(3)]  # PBO for async readback
+        self._projectile_feedback_buffer_index = 0
         self.frame_texture = self._make_texture(4, "f1")
         self.frame_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.frame_texture.repeat_x = False
@@ -2877,11 +3447,15 @@ class GpuSimulator:
         self.phase_shader = self.ctx.compute_shader(_phase_shader_source(self.tables))
         self.thermal_phase_shader = self.ctx.compute_shader(_thermal_phase_shader_source(self.tables))
         self.feedback_shader = self.ctx.compute_shader(_feedback_shader_source(self.tables))
+        self.batched_feedback_shader = self.ctx.compute_shader(_batched_feedback_shader_source(self.tables))
         self.entity_mask_shader = self.ctx.compute_shader(_entity_mask_shader_source(self.tables))
+        self.placeholder_shader = self.ctx.compute_shader(_entity_placeholder_shader_source(self.tables))
         self.reaction_resolve_shader = self.ctx.compute_shader(_reaction_resolve_shader_source(self.tables))
         self.collapse_shader = self.ctx.compute_shader(_collapse_shader_source(self.tables))
         self.render_shader = self.ctx.compute_shader(_render_shader_source(self.tables))
         self.paint_shader = self.ctx.compute_shader(_paint_shader_source(self.tables))
+        self.pressure_inject_shader = self.ctx.compute_shader(_pressure_inject_shader_source(self.tables))
+        self.projectile_feedback_shader = self.ctx.compute_shader(_projectile_feedback_shader_source(self.tables))
         self.fill_empty_region_shader = self.ctx.compute_shader(_fill_empty_region_shader_source(self.tables))
         self.clear_transient_region_shader = self.ctx.compute_shader(_clear_transient_region_shader_source())
 
@@ -2899,11 +3473,15 @@ class GpuSimulator:
             self.phase_shader,
             self.thermal_phase_shader,
             self.feedback_shader,
+            self.batched_feedback_shader,
             self.entity_mask_shader,
+            self.placeholder_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.pressure_inject_shader,
+            self.projectile_feedback_shader,
             self.fill_empty_region_shader,
         )
         _set_uniform_if_present(self.clear_transient_region_shader, "grid_size", (self.width, self.height))
@@ -2949,11 +3527,15 @@ class GpuSimulator:
             self.phase_shader,
             self.thermal_phase_shader,
             self.feedback_shader,
+            self.batched_feedback_shader,
             self.entity_mask_shader,
+            self.placeholder_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.pressure_inject_shader,
+            self.projectile_feedback_shader,
             self.fill_empty_region_shader,
         )
 
@@ -2973,11 +3555,15 @@ class GpuSimulator:
             self.phase_shader,
             self.thermal_phase_shader,
             self.feedback_shader,
+            self.batched_feedback_shader,
             self.entity_mask_shader,
+            self.placeholder_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.pressure_inject_shader,
+            self.projectile_feedback_shader,
             self.fill_empty_region_shader,
         )
 
@@ -2997,11 +3583,15 @@ class GpuSimulator:
             self.phase_shader,
             self.thermal_phase_shader,
             self.feedback_shader,
+            self.batched_feedback_shader,
             self.entity_mask_shader,
+            self.placeholder_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.pressure_inject_shader,
+            self.projectile_feedback_shader,
             self.fill_empty_region_shader,
         )
 
@@ -3021,11 +3611,15 @@ class GpuSimulator:
             self.phase_shader,
             self.thermal_phase_shader,
             self.feedback_shader,
+            self.batched_feedback_shader,
             self.entity_mask_shader,
+            self.placeholder_shader,
             self.reaction_resolve_shader,
             self.collapse_shader,
             self.render_shader,
             self.paint_shader,
+            self.pressure_inject_shader,
+            self.projectile_feedback_shader,
             self.fill_empty_region_shader,
         )
 
@@ -3905,9 +4499,11 @@ class GpuSimulator:
         self._staged_region_pool.setdefault((staged.width, staged.height), []).append(staged)
 
     def step(self, dt: float) -> None:
+        self._write_entity_placeholders()
         self._run_support(dt)
         self._run_reactions(dt)
         self._run_stage(self.thermal_phase_shader, dt)
+        queued_pressure_injections = self._process_pressure_injections(clear=False)
         self._run_pressure(step_seed=self.step_index)
         self._run_source_force(step_seed=self.step_index)
         next_wave_index = self._run_force_wave(step_seed=self.step_index)
@@ -3920,8 +4516,178 @@ class GpuSimulator:
                 step_seed = self.step_index * (LIQUID_RELAXATION_PASSES + 1) + 1 + pass_index
                 self._run_pressure(step_seed=step_seed)
                 self._run_motion(relaxation_dt, step_seed=step_seed, liquids_only=True)
+        if queued_pressure_injections:
+            self._apply_pressure_injections(queued_pressure_injections)
+            # Keep freshly injected pressure observable for at least one full frame.
+            self._run_source_force(step_seed=self.step_index + 8192)
+            self.wave_force_front_index = self._run_force_wave(step_seed=self.step_index + 8192)
+        self._pending_pressure_injections.clear()
         self._run_stage(self.collapse_shader, dt)
         self.step_index += 1
+
+    def register_entity_shape(self, entity_id: str, width: int, height: int) -> None:
+        """Register entity shape as a rectangle. offset_x = -(width//2), offset_y = 0.
+        The entity AABB is: center.x + offset_x to center.x + offset_x + width,
+                            center.y + offset_y to center.y + offset_y + height."""
+        offset_x = -(width // 2)
+        offset_y = 0
+        idx = len(self._entity_id_to_index)
+        self._entity_id_to_index[entity_id] = idx
+        self._registered_entity_shapes[entity_id] = (offset_x, offset_y, width, height)
+        self._upload_entity_shapes()
+
+    def unregister_entity_shape(self, entity_id: str) -> None:
+        """Remove entity shape. Requires re-uploading all shapes."""
+        self._registered_entity_shapes.pop(entity_id, None)
+        self._entity_id_to_index.pop(entity_id, None)
+        new_index = {}
+        for eid in sorted(self._registered_entity_shapes.keys()):
+            new_index[eid] = len(new_index)
+        self._entity_id_to_index = new_index
+        self._upload_entity_shapes()
+
+    def _upload_entity_shapes(self) -> None:
+        """Pack all entity shape rects (ivec4) into the shape SSBO."""
+        data = bytearray()
+        for eid in sorted(self._registered_entity_shapes.keys()):
+            ox, oy, w, h = self._registered_entity_shapes[eid]
+            data.extend(struct.pack("<4i", ox, oy, w, h))
+        # Pad to MAX_ENTITIES
+        remaining = MAX_ENTITIES - len(self._registered_entity_shapes)
+        for _ in range(remaining):
+            data.extend(struct.pack("<4i", 0, 0, 0, 0))
+        self._entity_shape_buffer.write(bytes(data))
+        self._entity_shape_buffer.bind_to_storage_buffer(5)
+
+    def upload_entity_states(self, states: list[tuple[str, int, int, bool, float]], origin_x: int = 0, origin_y: int = 0) -> None:
+        """Upload per-frame entity positions, facing, and integrity to GPU SSBO.
+        states: list of (entity_id, center_x, center_y, facing_right, integrity)
+        origin_x/y: active window origin in world coords (to convert to local buffer coords).
+        """
+        variant_index = self.tables.variant_index_by_key[("entity_placeholder", "placeholder")]
+        ivec4_data = bytearray()
+        float_data = bytearray()
+        # Convert world coords to local buffer coords for the shader
+        local_states: list[tuple[int, int, int, float]] = []
+        for eid, cx, cy, facing, integrity in states:
+            lx = cx - origin_x
+            ly = cy - origin_y
+            ivec4_data.extend(struct.pack("<4i", lx, ly, int(facing), variant_index))
+            float_data.extend(struct.pack("<f", integrity))
+            local_states.append((lx, ly, int(facing), integrity))
+        # Pad to MAX_ENTITIES
+        while len(ivec4_data) < MAX_ENTITIES * 16:
+            ivec4_data.extend(struct.pack("<4i", 0, 0, 0, 0))
+        while len(float_data) < MAX_ENTITIES * 4:
+            float_data.extend(struct.pack("<f", 0.0))
+        self._entity_state_buffer.write(bytes(ivec4_data))
+        self._entity_state_float_buffer.write(bytes(float_data))
+        self._entity_state_buffer.bind_to_storage_buffer(6)
+        self._entity_state_float_buffer.bind_to_storage_buffer(7)
+
+        # Compute bounding box in WORLD coords (stored, converted to local each frame)
+        if states:
+            all_x = [s[1] for s in states]
+            all_y = [s[2] for s in states]
+            min_x = min(all_x)
+            min_y = min(all_y)
+            max_x = max(all_x)
+            max_y = max(all_y)
+            max_extent_x = 0
+            max_h = 0
+            for ox, oy, w, h in self._registered_entity_shapes.values():
+                max_extent_x = max(max_extent_x, abs(ox) + w)
+                max_h = max(max_h, h)
+            margin_x = max_extent_x + 1
+            margin_y = max_h + 1
+            wx0 = min_x - margin_x
+            wy0 = min_y - 1
+            wx1 = max_x + margin_x + 1
+            wy1 = max_y + margin_y
+            self._placeholder_rects = [(wx0, wy0, wx1, wy1)]
+            self._placeholder_origin = (origin_x, origin_y)
+        else:
+            self._placeholder_rects = []
+            self._placeholder_origin = (0, 0)
+
+    def _write_entity_placeholders(self) -> None:
+        """Clear old placeholders then write new ones into the front buffer.
+        All rects are stored in world coords; converted to local buffer coords each frame.
+        """
+        if not self._registered_entity_shapes:
+            return
+        ax, ay = self._placeholder_origin
+        self.state_int[self.front_index].bind_to_image(3, read=True, write=True)
+        self.state_vec[self.front_index].bind_to_image(4, read=True, write=True)
+        self.state_misc[self.front_index].bind_to_image(5, read=True, write=True)
+        _set_uniform_if_present(self.placeholder_shader, "dt", 0.0)
+        _set_uniform_if_present(self.placeholder_shader, "step_index", self.step_index)
+        self.placeholder_shader["placeholder_clear_mode"].value = 1  # clear mode
+        self.placeholder_shader["entity_count"].value = 0
+        # Convert prev world rects to current local coords for clearing
+        for wx0, wy0, wx1, wy1 in self._prev_placeholder_rects:
+            lx0 = max(0, wx0 - ax)
+            ly0 = max(0, wy0 - ay)
+            lx1 = min(self.width, wx1 - ax)
+            ly1 = min(self.height, wy1 - ay)
+            if lx0 >= lx1 or ly0 >= ly1:
+                continue
+            self.placeholder_shader["entity_dispatch_clip"].value = (lx0, ly0, lx1, ly1)
+            self.placeholder_shader["entity_dispatch_origin"].value = (lx0, ly0)
+            self.placeholder_shader["entity_dispatch_size"].value = (lx1 - lx0, ly1 - ly0)
+            group_x, group_y = _dispatch_groups(lx1 - lx0, ly1 - ly0)
+            self.placeholder_shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
+        self._prev_placeholder_rects = list(self._placeholder_rects)
+
+        # Phase 2: Write new placeholder cells
+        if not self._placeholder_rects:
+            return
+        self.placeholder_shader["placeholder_clear_mode"].value = 0  # write mode
+        self.placeholder_shader["entity_count"].value = len(self._registered_entity_shapes)
+        for wx0, wy0, wx1, wy1 in self._placeholder_rects:
+            lx0 = max(0, wx0 - ax)
+            ly0 = max(0, wy0 - ay)
+            lx1 = min(self.width, wx1 - ax)
+            ly1 = min(self.height, wy1 - ay)
+            if lx0 >= lx1 or ly0 >= ly1:
+                continue
+            self.placeholder_shader["entity_dispatch_clip"].value = (lx0, ly0, lx1, ly1)
+            self.placeholder_shader["entity_dispatch_origin"].value = (lx0, ly0)
+            self.placeholder_shader["entity_dispatch_size"].value = (lx1 - lx0, ly1 - ly0)
+            group_x, group_y = _dispatch_groups(lx1 - lx0, ly1 - ly0)
+            self.placeholder_shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
+
+    def clear_entity_placeholders(self) -> None:
+        """Manually clear all entity_placeholder cells from the front buffer.
+        Normally not needed — step() clears old placeholders at the start of each frame.
+        Only call this if you need to force-clear outside the normal lifecycle."""
+        if not self._placeholder_rects and not self._prev_placeholder_rects:
+            return
+        ax, ay = self._placeholder_origin
+        self.state_int[self.front_index].bind_to_image(3, read=True, write=True)
+        self.state_vec[self.front_index].bind_to_image(4, read=True, write=True)
+        self.state_misc[self.front_index].bind_to_image(5, read=True, write=True)
+        _set_uniform_if_present(self.placeholder_shader, "dt", 0.0)
+        _set_uniform_if_present(self.placeholder_shader, "step_index", self.step_index)
+        self.placeholder_shader["placeholder_clear_mode"].value = 1
+        self.placeholder_shader["entity_count"].value = 0
+        for wx0, wy0, wx1, wy1 in self._placeholder_rects + self._prev_placeholder_rects:
+            lx0 = max(0, wx0 - ax)
+            ly0 = max(0, wy0 - ay)
+            lx1 = min(self.width, wx1 - ax)
+            ly1 = min(self.height, wy1 - ay)
+            if lx0 >= lx1 or ly0 >= ly1:
+                continue
+            self.placeholder_shader["entity_dispatch_clip"].value = (lx0, ly0, lx1, ly1)
+            self.placeholder_shader["entity_dispatch_origin"].value = (lx0, ly0)
+            self.placeholder_shader["entity_dispatch_size"].value = (lx1 - lx0, ly1 - ly0)
+            group_x, group_y = _dispatch_groups(lx1 - lx0, ly1 - ly0)
+            self.placeholder_shader.run(group_x=group_x, group_y=group_y, group_z=1)
+        self.ctx.memory_barrier()
+        self._placeholder_rects.clear()
+        self._prev_placeholder_rects.clear()
 
     def render(self, view_mode: DebugViewMode = DebugViewMode.MATERIAL) -> moderngl.Texture:
         self.state_int[self.front_index].bind_to_image(3, read=True, write=False)
@@ -3949,6 +4715,8 @@ class GpuSimulator:
         world_width: float,
     ) -> GpuFeedbackToken:
         self.state_int[self.front_index].bind_to_image(3, read=True, write=False)
+        self.state_vec[self.front_index].bind_to_image(4, read=True, write=False)
+        self.state_misc[self.front_index].bind_to_image(5, read=True, write=False)
         texture = self._feedback_textures[self._feedback_buffer_index]
         self._feedback_buffer_index = (self._feedback_buffer_index + 1) % len(self._feedback_textures)
         texture.bind_to_image(17, read=False, write=True)
@@ -3972,12 +4740,26 @@ class GpuSimulator:
     def _default_entity_feedback_points(self, clip: tuple[int, int, int, int]) -> list[FeedbackQueryPoint]:
         lx0, ly0, lx1, ly1 = (int(v) for v in clip)
         points: list[FeedbackQueryPoint] = []
+        width = lx1 - lx0
         for x in range(lx0, min(lx1, lx0 + 16)):
             points.append((x, ly1, 0))
             points.append((x, ly0 - 1, 3))
-        for y in range(ly0, min(ly1, ly0 + 16)):
+        for y in range(ly0, min(ly1, ly0 + 10)):
             points.append((lx0 - 1, y, 1))
             points.append((lx1, y, 2))
+        foot_y = ly1 - 1
+        clearance_y = ly1 - 2
+        points.extend((
+            (lx0 - 1, foot_y, 6),
+            (lx1, foot_y, 7),
+            (lx0 - 1, clearance_y, 9),
+            (lx1, clearance_y, 10),
+        ))
+        embedded_cols = range(lx0, min(lx1, lx0 + min(width, 8)))
+        for row in (foot_y, clearance_y):
+            if ly0 <= row < ly1:
+                for x in embedded_cols:
+                    points.append((x, row, 8))
         return points
 
     def poll_entity_feedback(self, token: GpuFeedbackToken):
@@ -3989,14 +4771,24 @@ class GpuSimulator:
         values.frombytes(token.result_texture.read(alignment=1))
         if len(values) < 4:
             return None
-        packed_flags_damage = float(values[3])
-        blocked_up = packed_flags_damage >= 1.5
+        # Pixel (0,0): blocked_below, blocked_left, blocked_right, packed_flags
+        packed_flags = float(values[3])
+        blocked_up = packed_flags >= 1.5
         if blocked_up:
-            packed_flags_damage -= 2.0
-        in_liquid = packed_flags_damage >= 0.5
+            packed_flags -= 2.0
+        in_liquid = packed_flags >= 0.5
         if in_liquid:
-            packed_flags_damage -= 1.0
-        damage = max(0.0, packed_flags_damage * 1000.0)
+            packed_flags -= 1.0
+        # Pixel (1,0): normalized_damage
+        damage = 0.0
+        blocked_left_ahead = False
+        blocked_right_ahead = False
+        embedded = False
+        if len(values) >= 8:
+            damage = max(0.0, float(values[4]))
+            blocked_left_ahead = values[5] >= 0.5
+            blocked_right_ahead = values[6] >= 0.5
+            embedded = values[7] >= 0.5
         if damage < 0.001:
             damage = 0.0
         return GridFeedback(
@@ -4005,9 +4797,149 @@ class GpuSimulator:
             blocked_left=values[1] >= 0.5,
             blocked_right=values[2] >= 0.5,
             blocked_up=blocked_up,
+            blocked_left_ahead=blocked_left_ahead,
+            blocked_right_ahead=blocked_right_ahead,
+            embedded=embedded,
             in_liquid=in_liquid,
             damage=damage,
         )
+
+    def request_batched_entity_feedback(
+        self,
+        entities_info: list[tuple[str, tuple[int, int, int, int], list[FeedbackQueryPoint], int]],
+        world_width: float,
+    ) -> GpuFeedbackBatchToken:
+        """Submit all entity feedback queries in one batch. Returns a token for async polling.
+
+        entities_info: list of (entity_id, clip, query_points, entity_tag) per entity.
+        """
+        from src.game.entity_manager import MAX_GPU_QUERY_POINTS as _MAX_QP
+
+        self.state_int[self.front_index].bind_to_image(3, read=True, write=False)
+        self.state_vec[self.front_index].bind_to_image(4, read=True, write=False)
+        self.state_misc[self.front_index].bind_to_image(5, read=True, write=False)
+        _set_uniform_if_present(self.batched_feedback_shader, "dt", 0.0)
+        _set_uniform_if_present(self.batched_feedback_shader, "step_index", self.step_index)
+
+        entity_count = min(len(entities_info), MAX_ENTITIES)
+        # Pick the smallest texture that fits
+        row_count = entity_count
+        for pool_size in sorted(self._batched_feedback_texture_pool.keys()):
+            if pool_size >= entity_count:
+                row_count = pool_size
+                break
+        texture_pool = self._batched_feedback_texture_pool[row_count]
+        pool_idx = self._batched_feedback_buffer_index % len(texture_pool)
+        texture = texture_pool[pool_idx]
+        self._batched_feedback_buffer_index += 1
+        texture.bind_to_image(17, read=False, write=True)
+
+        # Build header buffer and query point buffer
+        header_data = array("i")
+        point_data = array("i")
+        query_offset = 0
+        entity_ids: list[str] = []
+        for i, (eid, clip, qps, tag) in enumerate(entities_info[:entity_count]):
+            capped = min(len(qps), _MAX_QP)
+            header_data.extend((query_offset, capped, 0, 0))
+            for x, y, kind in qps[:capped]:
+                point_data.extend((int(x), int(y), int(kind), 0))
+            query_offset += capped
+            entity_ids.append(eid)
+        # Pad headers to at least entity_count entries
+        while len(header_data) < entity_count * 4:
+            header_data.extend((0, 0, 0, 0))
+        self._batched_entity_header_buffer.write(header_data.tobytes())
+        self._batched_entity_header_buffer.bind_to_storage_buffer(6)
+        if point_data:
+            self._batched_query_point_buffer.write(point_data.tobytes())
+        self._batched_query_point_buffer.bind_to_storage_buffer(4)
+        self.batched_feedback_shader["entity_count"].value = entity_count
+        self.batched_feedback_shader.run(group_x=entity_count, group_y=1, group_z=1)
+        self.ctx.memory_barrier()
+
+        pbo = None
+        sync = gl.glFenceSync(gl.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+
+        return GpuFeedbackBatchToken(
+            result_texture=texture,
+            result_pbo=pbo,
+            issued_step=self.step_index,
+            entity_count=entity_count,
+            entity_ids=entity_ids,
+            world_width=float(world_width),
+            sync=sync,
+        )
+
+    def poll_batched_entity_feedback(
+        self,
+        token: GpuFeedbackBatchToken,
+        *,
+        force_ready: bool = False,
+    ) -> dict[str, GridFeedback] | None:
+        """Poll batched feedback results using async PBO readback (no GPU stall).
+
+        The PBO was filled asynchronously during the previous frame's
+        schedule_feedback. By now the GPU has completed that transfer, so
+        buffer.read() returns immediately without a pipeline stall.
+        """
+        from src.game.hero import GridFeedback
+
+        if self.step_index <= token.issued_step:
+            return None
+        if not force_ready and not _gl_sync_signaled(token.sync):
+            return None
+        _delete_gl_sync(token.sync)
+        token.sync = None
+        # For the tiny 2xN feedback texture, direct texture.read() is faster on the
+        # current driver stack than moderngl Buffer.read() after a PBO transfer.
+        raw_bytes = token.result_texture.read(alignment=1)
+        values = array("f")
+        values.frombytes(raw_bytes)
+        results: dict[str, GridFeedback] = {}
+        tex_width = 2
+        for i in range(token.entity_count):
+            eid = token.entity_ids[i]
+            offset_row0 = (i * tex_width) * 4  # pixel (0, i)
+            offset_row1 = (i * tex_width + 1) * 4  # pixel (1, i)
+            if offset_row0 + 4 > len(values):
+                continue
+            blocked_below = values[offset_row0] >= 0.5
+            blocked_left = values[offset_row0 + 1] >= 0.5
+            blocked_right = values[offset_row0 + 2] >= 0.5
+            packed_flags = values[offset_row0 + 3]
+            blocked_up = packed_flags >= 1.5
+            if blocked_up:
+                packed_flags -= 2.0
+            in_liquid = packed_flags >= 0.5
+            damage = 0.0
+            blocked_left_ahead = False
+            blocked_right_ahead = False
+            embedded = False
+            if offset_row1 + 4 <= len(values):
+                damage = max(0.0, values[offset_row1])
+                if damage < 0.001:
+                    damage = 0.0
+                blocked_left_ahead = values[offset_row1 + 1] >= 0.5
+                blocked_right_ahead = values[offset_row1 + 2] >= 0.5
+                embedded = values[offset_row1 + 3] >= 0.5
+            results[eid] = GridFeedback(
+                world_width=token.world_width,
+                blocked_below=blocked_below,
+                blocked_left=blocked_left,
+                blocked_right=blocked_right,
+                blocked_up=blocked_up,
+                blocked_left_ahead=blocked_left_ahead,
+                blocked_right_ahead=blocked_right_ahead,
+                embedded=embedded,
+                in_liquid=in_liquid,
+                damage=damage,
+            )
+        return results
+
+    def release_batched_entity_feedback(self, token: GpuFeedbackBatchToken) -> None:
+        _delete_gl_sync(token.sync)
+        token.sync = None
 
     def paint_circle(
         self,
@@ -4047,8 +4979,134 @@ class GpuSimulator:
         self.paint_shader["paint_age"].value = age
         self.paint_shader["paint_flags"].value = flags
         self.paint_shader["erase_mode"].value = erase_mode
+        self.paint_shader["paint_vel_x"].value = float(overrides.get("vel_x", 0.0))
+        self.paint_shader["paint_vel_y"].value = float(overrides.get("vel_y", 0.0))
         self.paint_shader.run(group_x=self.group_x, group_y=self.group_y, group_z=1)
         self.ctx.memory_barrier()
+
+    def inject_pressure(self, center_x: int, center_y: int, radius: int, pressure_value: float) -> None:
+        """Queue a filled pressure pulse that will be processed during the next step()."""
+        center_x = int(center_x)
+        center_y = int(center_y)
+        radius = int(radius)
+        if radius <= 0 or pressure_value <= 1.0:
+            return
+        self._pending_pressure_injections.append((center_x, center_y, 0, radius, pressure_value))
+
+    def inject_pressure_ring(
+        self,
+        center_x: int,
+        center_y: int,
+        inner_radius: int,
+        outer_radius: int,
+        pressure_value: float,
+    ) -> None:
+        """Queue a shell-shaped pressure pulse that peaks across an annulus."""
+        center_x = int(center_x)
+        center_y = int(center_y)
+        inner_radius = max(0, int(inner_radius))
+        outer_radius = max(inner_radius + 1, int(outer_radius))
+        if pressure_value <= 1.0:
+            return
+        self._pending_pressure_injections.append(
+            (center_x, center_y, inner_radius, outer_radius, float(pressure_value))
+        )
+
+    def _apply_pressure_injections(
+        self,
+        injections: list[tuple[int, int, int, int, float]] | tuple[tuple[int, int, int, int, float], ...],
+    ) -> None:
+        if not injections:
+            return
+        self.pressure_tex[self.pressure_front_index].bind_to_image(12, read=True, write=True)
+        for cx, cy, inner_radius, outer_radius, pressure_value in injections:
+            diameter = outer_radius * 2 + 1
+            self.pressure_inject_shader["inject_origin"].value = (cx - outer_radius, cy - outer_radius)
+            self.pressure_inject_shader["inject_center"].value = (cx, cy)
+            self.pressure_inject_shader["inject_inner_radius"].value = inner_radius
+            self.pressure_inject_shader["inject_outer_radius"].value = outer_radius
+            self.pressure_inject_shader["inject_pressure"].value = pressure_value
+            dispatch_x = max(1, (diameter + 7) // 8)
+            dispatch_y = max(1, (diameter + 7) // 8)
+            self.pressure_inject_shader.run(group_x=dispatch_x, group_y=dispatch_y, group_z=1)
+            self.ctx.memory_barrier()
+
+    def _process_pressure_injections(
+        self,
+        *,
+        clear: bool = True,
+    ) -> tuple[tuple[int, int, int, int, float], ...]:
+        """Execute all queued pressure injections on the current pressure texture."""
+        if not self._pending_pressure_injections:
+            return ()
+        injections = tuple(self._pending_pressure_injections)
+        self._apply_pressure_injections(injections)
+        if clear:
+            self._pending_pressure_injections.clear()
+        return injections
+
+    def debug_apply_pressure_injections_now(self) -> tuple[tuple[int, int, int, int, float], ...]:
+        """Apply queued pressure injections immediately without advancing the full simulation."""
+        if not self._pending_pressure_injections:
+            return ()
+        injections = tuple(self._pending_pressure_injections)
+        self._apply_pressure_injections(injections)
+        self._pending_pressure_injections.clear()
+        return injections
+
+    def request_projectile_feedback(
+        self,
+        projectiles: list[tuple[int, int, int]],
+    ) -> GpuProjectileFeedbackToken:
+        """Submit projectile positions for GPU collision query. Returns a token for async polling."""
+        self.state_int[self.front_index].bind_to_image(3, read=True, write=False)
+        pbo_idx = self._projectile_feedback_buffer_index
+        texture = self._projectile_feedback_textures[pbo_idx]
+        self._projectile_feedback_buffer_index = (pbo_idx + 1) % len(self._projectile_feedback_textures)
+        texture.bind_to_image(17, read=False, write=True)
+        count = min(len(projectiles), MAX_PROJECTILES)
+        point_data = array("i")
+        positions: list[tuple[int, int]] = []
+        for x, y, ptype in projectiles[:count]:
+            point_data.extend((int(x), int(y), int(ptype), 0))
+            positions.append((int(x), int(y)))
+        if point_data:
+            self._projectile_query_buffer.write(point_data.tobytes())
+        self._projectile_query_buffer.bind_to_storage_buffer(8)
+        self.projectile_feedback_shader["projectile_count"].value = count
+        groups = max(1, (count + 63) // 64)
+        self.projectile_feedback_shader.run(group_x=groups, group_y=1, group_z=1)
+        self.ctx.memory_barrier()
+        # Start async PBO readback
+        pbo = self._projectile_feedback_pbos[pbo_idx]
+        texture.read_into(pbo, alignment=1)
+        return GpuProjectileFeedbackToken(
+            result_texture=texture,
+            result_pbo=pbo,
+            issued_step=self.step_index,
+            projectile_count=count,
+            projectile_positions=positions,
+        )
+
+    def poll_projectile_feedback(self, token: GpuProjectileFeedbackToken) -> list[ProjectileHitInfo] | None:
+        """Poll projectile feedback results using async PBO readback (no GPU stall)."""
+        if self.step_index <= token.issued_step:
+            return None
+        raw_bytes = token.result_pbo.read() if token.result_pbo is not None else token.result_texture.read(alignment=1)
+        values = array("f")
+        values.frombytes(raw_bytes)
+        results: list[ProjectileHitInfo] = []
+        for i in range(token.projectile_count):
+            offset = i * 4
+            if offset + 1 < len(values):
+                hit = values[offset] >= 0.5
+                hit_variant = int(values[offset + 1])
+                px, py = token.projectile_positions[i]
+                results.append(ProjectileHitInfo(hit=hit, hit_variant=hit_variant, hit_x=px, hit_y=py))
+            else:
+                px, py = token.projectile_positions[i]
+                results.append(ProjectileHitInfo(hit=False, hit_variant=0, hit_x=px, hit_y=py))
+        return results
 
     def readback_grid(self) -> Grid:
         grid = unpack_grid_state(
@@ -4059,11 +5117,15 @@ class GpuSimulator:
             self.state_vec[self.front_index].read(),
             self.state_misc[self.front_index].read(),
         )
+        pressure_values = array("f")
+        pressure_values.frombytes(self.pressure_tex[self.pressure_front_index].read())
         grid.step_id = self.step_index
         grid.liquid_brownian_enabled = self.liquid_brownian_enabled
         grid.blocked_impulse_enabled = self.blocked_impulse_enabled
         grid.directional_fallback_enabled = self.directional_fallback_enabled
         grid.directional_fallback_angle_limit_degrees = self.directional_fallback_angle_limit_degrees
+        if len(pressure_values) == self.width * self.height:
+            grid.pressure = list(pressure_values)
         return grid
 
     def upload_cells_region(self, gx: int, gy: int, grid: Grid) -> None:
@@ -4153,3 +5215,124 @@ class GpuSimulator:
                 ))
             cells_2d.append(row_cells)
         return cells_2d
+
+    def snapshot_cells_region(
+        self,
+        *,
+        entity_id: str,
+        world_x: int,
+        world_y: int,
+        gx: int,
+        gy: int,
+        gw: int,
+        gh: int,
+    ) -> LocalCellsSnapshot:
+        gx0 = max(0, gx)
+        gy0 = max(0, gy)
+        gx1 = min(self.width, gx + gw)
+        gy1 = min(self.height, gy + gh)
+        if gx0 >= gx1 or gy0 >= gy1:
+            return LocalCellsSnapshot(
+                entity_id=entity_id,
+                world_x=int(world_x),
+                world_y=int(world_y),
+                width=max(0, int(gw)),
+                height=max(0, int(gh)),
+                variant_indices=tuple(),
+                velocities=tuple(),
+                temperatures=tuple(),
+                variant_families=self.tables.variant_families,
+                empty_variant_index=self.tables.empty_variant_index,
+                issued_step=int(self.step_index),
+            )
+        read_w = gx1 - gx0
+        read_h = gy1 - gy0
+        state_int_data = self._read_texture_region(
+            self.state_int[self.front_index],
+            gx0,
+            gy0,
+            read_w,
+            read_h,
+            components=4,
+            dtype="i4",
+        )
+        state_misc_data = self._read_texture_region(
+            self.state_misc[self.front_index],
+            gx0,
+            gy0,
+            read_w,
+            read_h,
+            components=4,
+            dtype="f4",
+        )
+        state_int = array("i")
+        state_int.frombytes(state_int_data)
+        state_vec = array("f")
+        state_vec.frombytes(self._read_texture_region(
+            self.state_vec[self.front_index],
+            gx0,
+            gy0,
+            read_w,
+            read_h,
+            components=4,
+            dtype="f4",
+        ))
+        state_misc = array("f")
+        state_misc.frombytes(state_misc_data)
+        variant_rows: list[tuple[int, ...]] = []
+        velocity_rows: list[tuple[tuple[float, float], ...]] = []
+        temperature_rows: list[tuple[float, ...]] = []
+        for row in range(read_h):
+            variant_row: list[int] = []
+            velocity_row: list[tuple[float, float]] = []
+            temperature_row: list[float] = []
+            for col in range(read_w):
+                idx = row * read_w + col
+                offset = idx * 4
+                variant_row.append(int(state_int[offset]))
+                velocity_row.append((float(state_vec[offset]), float(state_vec[offset + 1])))
+                temperature_row.append(float(state_misc[offset]))
+            variant_rows.append(tuple(variant_row))
+            velocity_rows.append(tuple(velocity_row))
+            temperature_rows.append(tuple(temperature_row))
+        return LocalCellsSnapshot(
+            entity_id=entity_id,
+            world_x=int(world_x),
+            world_y=int(world_y),
+            width=max(0, int(gw)),
+            height=max(0, int(gh)),
+            variant_indices=tuple(variant_rows),
+            velocities=tuple(velocity_rows),
+            temperatures=tuple(temperature_rows),
+            variant_families=self.tables.variant_families,
+            empty_variant_index=self.tables.empty_variant_index,
+            issued_step=int(self.step_index),
+        )
+
+    def readback_pressure_region(self, gx: int, gy: int, gw: int, gh: int) -> list[list[float]]:
+        """Read a sub-region of the pressure texture in grid coordinates."""
+        gx0 = max(0, gx)
+        gy0 = max(0, gy)
+        gx1 = min(self.width, gx + gw)
+        gy1 = min(self.height, gy + gh)
+        if gx0 >= gx1 or gy0 >= gy1:
+            return []
+        read_w = gx1 - gx0
+        read_h = gy1 - gy0
+        tex_y0 = self.height - gy1
+        pressure_data = self._read_texture_region(
+            self.pressure_tex[self.pressure_front_index],
+            gx0,
+            tex_y0,
+            read_w,
+            read_h,
+            components=1,
+            dtype="f4",
+        )
+        pressure_values = array("f")
+        pressure_values.frombytes(pressure_data)
+        rows: list[list[float]] = []
+        for row in range(read_h):
+            start = row * read_w
+            rows.append([float(value) for value in pressure_values[start:start + read_w]])
+        return rows

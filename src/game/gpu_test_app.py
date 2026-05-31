@@ -271,7 +271,6 @@ class GpuTestWindow(pyglet.window.Window):
             height=cfg.HERO_HEIGHT,
         ))
         self.entity_mgr.update_gpu_entity_mask(self.world)
-        self.entity_mgr.schedule_feedback(self.world)
 
         # Texture
         self.texture: moderngl.Texture | None = None

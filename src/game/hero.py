@@ -109,12 +109,28 @@ class Hero:
                 cells.append((ix, iy))
         return cells
 
-    def update(self, dt: float, *, grid_feedback: GridFeedback | None = None) -> None:
+    def update(
+        self,
+        dt: float,
+        *,
+        grid_feedback: GridFeedback | None = None,
+        local_snapshot: LocalCellSnapshot | None = None,
+        world_width: float | None = None,
+    ) -> None:
         """Update hero physics and state."""
         self.regen_mp(dt)
         self.state_timer += dt
 
         feedback = grid_feedback
+        if local_snapshot is not None:
+            feedback = feedback_from_snapshot(
+                snapshot=local_snapshot,
+                center_x=self.x,
+                bottom_y=self.y,
+                width=self.width,
+                height=self.height,
+                world_width=world_width if world_width is not None else (grid_feedback.world_width if grid_feedback else 0.0),
+            )
         blocked_below = bool(feedback and feedback.blocked_below)
         blocked_left = bool(feedback and feedback.blocked_left)
         blocked_right = bool(feedback and feedback.blocked_right)
@@ -135,15 +151,14 @@ class Hero:
             self.state = "idle"
             self.state_timer = 0.0
 
+        move_dir = 0
         if self.state in ("idle", "walk", "jump"):
-            if self.input_left and not blocked_left:
-                self.vel_x = -cfg.HERO_WALK_SPEED
+            if self.input_left and not self.input_right:
+                move_dir = -1
                 self.facing_right = False
-            elif self.input_right and not blocked_right:
-                self.vel_x = cfg.HERO_WALK_SPEED
+            elif self.input_right and not self.input_left:
+                move_dir = 1
                 self.facing_right = True
-            else:
-                self.vel_x = 0.0
 
         if self.input_jump and self.on_ground and self.state in ("idle", "walk") and not blocked_up:
             self.vel_y = -cfg.HERO_JUMP_VELOCITY
@@ -164,12 +179,9 @@ class Hero:
                     self.state,
                 )
 
+        step_climbed = False
         if feedback is not None:
-            if self.vel_x < 0.0 and blocked_left:
-                self.vel_x = 0.0
-            elif self.vel_x > 0.0 and blocked_right:
-                self.vel_x = 0.0
-
+            # Landing / lift-off detection runs before de-stuck and slope climb.
             if self.vel_y < 0.0 and blocked_up:
                 self.vel_y = 0.0
             elif self.vel_y >= 0.0 and blocked_below:
@@ -182,6 +194,34 @@ class Hero:
                     log.debug("[hero] LIFT_OFF: y=%.2f vel_y=%.2f -> on_ground=False", self.y, self.vel_y)
                 self.on_ground = False
 
+            # Slope climbing: blocked below + wall ahead at foot level -> lift 1 cell.
+            if blocked_below and move_dir != 0 and not blocked_up:
+                is_step = False
+                if move_dir > 0 and feedback.blocked_right_ahead:
+                    is_step = True
+                elif move_dir < 0 and feedback.blocked_left_ahead:
+                    is_step = True
+                if is_step:
+                    self.y -= 1.0
+                    self.vel_y = 0.0
+                    blocked_below = False
+                    step_climbed = True
+                    self.on_ground = True
+
+            # De-stuck: body is embedded while the head row is free -> push up 1 cell.
+            if feedback.embedded and not blocked_up and (blocked_below or self.on_ground or self.vel_y >= 0.0):
+                self.y -= 1.0
+                if self.vel_y > 0.0:
+                    self.vel_y = 0.0
+                blocked_below = False
+
+        if self.state in ("idle", "walk", "jump"):
+            blocked_by_wall = (
+                (move_dir < 0 and blocked_left and not step_climbed)
+                or (move_dir > 0 and blocked_right and not step_climbed)
+            )
+            self.vel_x = 0.0 if move_dir == 0 or blocked_by_wall else move_dir * cfg.HERO_WALK_SPEED
+
         self.x += self.vel_x * dt
         self.y += self.vel_y * dt
 
@@ -193,7 +233,7 @@ class Hero:
                 self.vel_y *= 0.5
 
             if feedback.damage > 0.0:
-                self.take_damage(feedback.damage * dt)
+                self.take_damage(feedback.damage * cfg.HERO_PLACEHOLDER_DAMAGE_SCALE)
 
             if log.isEnabledFor(logging.DEBUG):
                 log.debug(
@@ -233,5 +273,147 @@ class GridFeedback:
     blocked_left: bool = False
     blocked_right: bool = False
     blocked_up: bool = False
+    blocked_left_ahead: bool = False   # wall at foot level on left
+    blocked_right_ahead: bool = False  # wall at foot level on right
+    embedded: bool = False             # row above feet has terrain (body embedded)
     in_liquid: bool = False
     damage: float = 0.0
+
+
+@dataclass
+class LocalCellSnapshot:
+    """GPU-read local cell snapshot around an entity."""
+
+    entity_id: str
+    origin_x: int
+    origin_y: int
+    width: int
+    height: int
+    variant_indices: tuple[tuple[int, ...], ...]
+    velocities: tuple[tuple[tuple[float, float], ...], ...]
+    temperatures: tuple[tuple[float, ...], ...]
+    variant_families: tuple[str, ...]
+    empty_variant_index: int
+    tick_id: int = 0
+    age_frames: int = 0
+
+    def _local_coords(self, world_x: int, world_y: int) -> tuple[int, int] | None:
+        local_x = world_x - self.origin_x
+        local_y = world_y - self.origin_y
+        if local_x < 0 or local_y < 0 or local_x >= self.width or local_y >= self.height:
+            return None
+        if local_y >= len(self.variant_indices):
+            return None
+        row = self.variant_indices[local_y]
+        if local_x >= len(row):
+            return None
+        return (local_x, local_y)
+
+    def variant_index_at_world(self, world_x: int, world_y: int) -> int | None:
+        coords = self._local_coords(world_x, world_y)
+        if coords is None:
+            return None
+        local_x, local_y = coords
+        return self.variant_indices[local_y][local_x]
+
+    def family_id_at_world(self, world_x: int, world_y: int) -> str | None:
+        variant_index = self.variant_index_at_world(world_x, world_y)
+        if variant_index is None or variant_index < 0 or variant_index >= len(self.variant_families):
+            return None
+        return self.variant_families[variant_index]
+
+    def temperature_at_world(self, world_x: int, world_y: int) -> float | None:
+        coords = self._local_coords(world_x, world_y)
+        if coords is None:
+            return None
+        local_x, local_y = coords
+        if local_y >= len(self.temperatures):
+            return None
+        row = self.temperatures[local_y]
+        if local_x >= len(row):
+            return None
+        return row[local_x]
+
+    def velocity_at_world(self, world_x: int, world_y: int) -> tuple[float, float] | None:
+        coords = self._local_coords(world_x, world_y)
+        if coords is None:
+            return None
+        local_x, local_y = coords
+        if local_y >= len(self.velocities):
+            return None
+        row = self.velocities[local_y]
+        if local_x >= len(row):
+            return None
+        return row[local_x]
+
+
+def _solid_cell(snapshot: LocalCellSnapshot | None, world_x: int, world_y: int) -> bool:
+    if snapshot is None:
+        return False
+    variant_index = snapshot.variant_index_at_world(world_x, world_y)
+    return variant_index is not None and variant_index != snapshot.empty_variant_index
+
+
+def feedback_from_snapshot(
+    *,
+    snapshot: LocalCellSnapshot | None,
+    center_x: float,
+    bottom_y: float,
+    width: float,
+    height: float,
+    world_width: float,
+) -> GridFeedback:
+    feedback = GridFeedback(world_width=world_width)
+    if snapshot is None:
+        return feedback
+
+    left = int(center_x - width / 2.0)
+    right = int(center_x + width / 2.0)
+    bottom = int(bottom_y)
+    top = int(bottom_y + height)
+    foot_y = top + 1
+    head_y = bottom - 1
+    left_wall_x = left - 1
+    right_wall_x = right + 1
+
+    feedback.blocked_below = any(_solid_cell(snapshot, x, foot_y) for x in range(left, right + 1))
+    feedback.blocked_up = any(_solid_cell(snapshot, x, head_y) for x in range(left, right + 1))
+    feedback.blocked_left = any(_solid_cell(snapshot, left_wall_x, y) for y in range(bottom, top + 1))
+    feedback.blocked_right = any(_solid_cell(snapshot, right_wall_x, y) for y in range(bottom, top + 1))
+
+    clearance_y = max(bottom, top - 1)
+    feedback.blocked_left_ahead = _solid_cell(snapshot, left_wall_x, top)
+    feedback.blocked_right_ahead = _solid_cell(snapshot, right_wall_x, top)
+    feedback.embedded = any(
+        _solid_cell(snapshot, x, y)
+        for x in range(left, right + 1)
+        for y in (top, clearance_y)
+    )
+
+    hazard = 0.0
+    in_liquid = False
+    for x in range(left, right + 1):
+        for y in range(bottom, top + 1):
+            family_id = snapshot.family_id_at_world(x, y)
+            if family_id is None or family_id == "empty":
+                continue
+            temperature = snapshot.temperature_at_world(x, y)
+            if family_id in {"water", "tar", "acid", "magic_acid", "poison"}:
+                in_liquid = True
+            if family_id in {"fire", "acid", "magic_acid"}:
+                hazard += 0.1
+            velocity = snapshot.velocity_at_world(x, y)
+            if velocity is not None:
+                vel_x, vel_y = velocity
+                speed = abs(vel_x) + abs(vel_y)
+                if speed >= 30.0:
+                    hazard += min(0.18, (speed - 30.0) * 0.0015)
+            if temperature is None:
+                continue
+            if temperature >= 80.0:
+                hazard += min(0.24, (temperature - 80.0) * 0.00045)
+            if temperature <= -35.0:
+                hazard += min(0.12, (-35.0 - temperature) * 0.00018)
+    feedback.in_liquid = in_liquid
+    feedback.damage = min(0.35, hazard)
+    return feedback

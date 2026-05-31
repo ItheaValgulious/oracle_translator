@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import struct
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from array import array
 from collections import deque
 from dataclasses import dataclass, field
@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Callable
 log = logging.getLogger(__name__)
 
 from .atmosphere import default_ambient_air_temperature_for_row
+from .gpu_backend import LocalCellsSnapshot, PackedStateRegion
 from .grid import Grid
 from .render import DebugViewMode
 from .types import CellFlag, CellState, MaterialRegistry
@@ -148,6 +149,58 @@ class PagingStats:
     max_incoming_transient_clear_seconds: float = 0.0
     max_anchor_build_seconds: float = 0.0
     max_anchor_upload_seconds: float = 0.0
+    last_shift_cache_hits: int = 0
+    last_shift_empty_hits: int = 0
+    last_shift_inflight_wait_hits: int = 0
+    last_shift_disk_loads: int = 0
+    last_shift_generates: int = 0
+    last_shift_saves: int = 0
+    last_shift_disk_load_seconds: float = 0.0
+    last_shift_generate_seconds: float = 0.0
+    last_shift_save_seconds: float = 0.0
+
+
+@dataclass
+class ChunkIoStats:
+    cache_hits: int = 0
+    empty_hits: int = 0
+    inflight_wait_hits: int = 0
+    disk_load_count: int = 0
+    disk_load_total_seconds: float = 0.0
+    disk_load_last_seconds: float = 0.0
+    disk_load_max_seconds: float = 0.0
+    generate_count: int = 0
+    generate_total_seconds: float = 0.0
+    generate_last_seconds: float = 0.0
+    generate_max_seconds: float = 0.0
+    save_count: int = 0
+    save_total_seconds: float = 0.0
+    save_last_seconds: float = 0.0
+    save_max_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class ChunkCacheDebugSnapshot:
+    cached_chunks: int
+    empty_chunks: int
+    prefetch_queued: int
+    prefetch_inflight: int
+    pinned_chunks: int
+    cache_hits: int
+    empty_hits: int
+    inflight_wait_hits: int
+    disk_load_count: int
+    disk_load_total_seconds: float
+    disk_load_last_seconds: float
+    disk_load_max_seconds: float
+    generate_count: int
+    generate_total_seconds: float
+    generate_last_seconds: float
+    generate_max_seconds: float
+    save_count: int
+    save_total_seconds: float
+    save_last_seconds: float
+    save_max_seconds: float
 
 
 @dataclass(frozen=True)
@@ -251,6 +304,156 @@ def _blank_chunk(
     )
 
 
+class _PackedChunkTerrainWriter:
+    def __init__(
+        self,
+        *,
+        world_width: int,
+        world_height: int,
+        chunk_x: int,
+        chunk_y: int,
+        chunk_size: int,
+        seed: int,
+        tables,
+    ) -> None:
+        self.width = int(world_width)
+        self.height = int(world_height)
+        self.chunk_size = int(chunk_size)
+        self.seed = int(seed)
+        self._chunk_x = int(chunk_x)
+        self._chunk_y = int(chunk_y)
+        self._origin_x = self._chunk_x * self.chunk_size
+        self._origin_y = self._chunk_y * self.chunk_size
+        self._tables = tables
+        blank = _blank_chunk(self.chunk_size, self.height, self._chunk_y, tables.empty_variant_index)
+        self._chunk = blank
+        self._state_int = array("i")
+        self._state_int.frombytes(blank.state_int)
+        self._state_vec = array("f")
+        self._state_vec.frombytes(blank.state_vec)
+        self._state_misc = array("f")
+        self._state_misc.frombytes(blank.state_misc)
+        self._encoded_cell_cache: dict[tuple[object, ...], tuple[int, int, int, float, float, float, float, float, float, float, float]] = {}
+        self._nondefault_writes = 0
+
+    def in_bounds(self, x: int, y: int) -> bool:
+        return 0 <= x < self.width and 0 <= y < self.height
+
+    def _encode_cell(
+        self,
+        cell: CellState,
+    ) -> tuple[int, int, int, float, float, float, float, float, float, float, float]:
+        key = (
+            cell.family_id,
+            cell.variant_id,
+            cell.generation,
+            int(cell.flags),
+            cell.vel_x,
+            cell.vel_y,
+            cell.blocked_x,
+            cell.blocked_y,
+            cell.temperature,
+            cell.support_value,
+            cell.integrity,
+            cell.age,
+        )
+        encoded = self._encoded_cell_cache.get(key)
+        if encoded is not None:
+            return encoded
+        encoded = (
+            self._tables.variant_index_by_key[(cell.family_id, cell.variant_id)],
+            cell.generation,
+            int(cell.flags),
+            cell.vel_x,
+            cell.vel_y,
+            cell.blocked_x,
+            cell.blocked_y,
+            cell.temperature,
+            cell.support_value,
+            cell.integrity,
+            cell.age,
+        )
+        self._encoded_cell_cache[key] = encoded
+        return encoded
+
+    def _write_local_index(self, local_index: int, world_y: int, cell: CellState) -> None:
+        int_offset = local_index * 4
+        if _is_default_empty_cell(cell, self.height, world_y):
+            self._state_int[int_offset] = self._tables.empty_variant_index
+            self._state_int[int_offset + 1] = 0
+            self._state_int[int_offset + 2] = int(CellFlag.NONE)
+            self._state_int[int_offset + 3] = 0
+            self._state_vec[int_offset] = 0.0
+            self._state_vec[int_offset + 1] = 0.0
+            self._state_vec[int_offset + 2] = 0.0
+            self._state_vec[int_offset + 3] = 0.0
+            ambient = default_ambient_air_temperature_for_row(self.height, world_y)
+            self._state_misc[int_offset] = ambient
+            self._state_misc[int_offset + 1] = 0.0
+            self._state_misc[int_offset + 2] = 1.0
+            self._state_misc[int_offset + 3] = 0.0
+            return
+        (
+            variant_index,
+            generation,
+            flags,
+            vel_x,
+            vel_y,
+            blocked_x,
+            blocked_y,
+            temperature,
+            support_value,
+            integrity,
+            age,
+        ) = self._encode_cell(cell)
+        self._state_int[int_offset] = variant_index
+        self._state_int[int_offset + 1] = generation
+        self._state_int[int_offset + 2] = flags
+        self._state_int[int_offset + 3] = 0
+        self._state_vec[int_offset] = vel_x
+        self._state_vec[int_offset + 1] = vel_y
+        self._state_vec[int_offset + 2] = blocked_x
+        self._state_vec[int_offset + 3] = blocked_y
+        self._state_misc[int_offset] = temperature
+        self._state_misc[int_offset + 1] = support_value
+        self._state_misc[int_offset + 2] = integrity
+        self._state_misc[int_offset + 3] = age
+        self._nondefault_writes += 1
+
+    def _terrain_write_span(self, world_x: int, world_y0: int, world_y1: int, cell: CellState) -> None:
+        if not (self._origin_x <= world_x < self._origin_x + self.chunk_size):
+            return
+        clipped_y0 = max(int(world_y0), self._origin_y)
+        clipped_y1 = min(int(world_y1), self._origin_y + self.chunk_size)
+        if clipped_y0 >= clipped_y1:
+            return
+        local_x = world_x - self._origin_x
+        for world_y in range(clipped_y0, clipped_y1):
+            local_y = world_y - self._origin_y
+            self._write_local_index(local_y * self.chunk_size + local_x, world_y, cell)
+
+    def _terrain_write_cell(self, world_x: int, world_y: int, cell: CellState) -> None:
+        self.set_cell(world_x, world_y, cell)
+
+    def set_cell(self, x: int, y: int, cell: CellState) -> None:
+        if not self.in_bounds(x, y):
+            return
+        if x // self.chunk_size != self._chunk_x or y // self.chunk_size != self._chunk_y:
+            return
+        local_x = x - self._origin_x
+        local_y = y - self._origin_y
+        self._write_local_index(local_y * self.chunk_size + local_x, y, cell)
+
+    def finalize(self) -> PackedChunk:
+        if self._nondefault_writes <= 0:
+            return self._chunk
+        self._chunk.state_int = bytearray(self._state_int.tobytes())
+        self._chunk.state_vec = bytearray(self._state_vec.tobytes())
+        self._chunk.state_misc = bytearray(self._state_misc.tobytes())
+        self._chunk.dirty = True
+        return self._chunk
+
+
 def _copy_packed_rect(
     src,
     dst: PackedChunk,
@@ -285,8 +488,6 @@ def _extract_packed_rect(
     width: int,
     height: int,
 ):
-    from .gpu_backend import PackedStateRegion
-
     if width <= 0 or height <= 0:
         return PackedStateRegion(width=0, height=0, state_int=b"", state_vec=b"", state_misc=b"")
     state_int = bytearray()
@@ -304,6 +505,61 @@ def _extract_packed_rect(
         state_int=bytes(state_int),
         state_vec=bytes(state_vec),
         state_misc=bytes(state_misc),
+    )
+
+
+def _sanitize_packed_region_for_storage(
+    packed_region,
+    *,
+    world_y0: int,
+    world_height: int,
+    placeholder_variant_index: int,
+    empty_variant_index: int,
+):
+    if placeholder_variant_index < 0:
+        return packed_region
+    int_values = array("i")
+    int_values.frombytes(bytes(packed_region.state_int))
+    changed = False
+    placeholder_pixels: list[int] = []
+    for pixel_index in range(0, len(int_values), 4):
+        if int_values[pixel_index] != placeholder_variant_index:
+            continue
+        int_values[pixel_index] = empty_variant_index
+        int_values[pixel_index + 1] = 0
+        int_values[pixel_index + 2] = int(CellFlag.NONE)
+        int_values[pixel_index + 3] = 0
+        placeholder_pixels.append(pixel_index)
+        changed = True
+    if not changed:
+        return packed_region
+
+    vec_values = array("f")
+    vec_values.frombytes(bytes(packed_region.state_vec))
+    misc_values = array("f")
+    misc_values.frombytes(bytes(packed_region.state_misc))
+    width = int(packed_region.width)
+    for pixel_index in placeholder_pixels:
+        cell_index = pixel_index // 4
+        world_y = world_y0 + cell_index // width
+        ambient = default_ambient_air_temperature_for_row(world_height, world_y)
+        vec_values[pixel_index] = 0.0
+        vec_values[pixel_index + 1] = 0.0
+        vec_values[pixel_index + 2] = 0.0
+        vec_values[pixel_index + 3] = 0.0
+        misc_values[pixel_index] = ambient
+        misc_values[pixel_index + 1] = 0.0
+        misc_values[pixel_index + 2] = 1.0
+        misc_values[pixel_index + 3] = 0.0
+
+    from .gpu_backend import PackedStateRegion
+
+    return PackedStateRegion(
+        width=packed_region.width,
+        height=packed_region.height,
+        state_int=int_values.tobytes(),
+        state_vec=vec_values.tobytes(),
+        state_misc=misc_values.tobytes(),
     )
 
 
@@ -331,10 +587,46 @@ class GpuChunkCache:
         self._prefetch_queue: deque[tuple[int, int]] = deque()
         self._prefetch_queued: set[tuple[int, int]] = set()
         self._inflight: dict[tuple[int, int], Future[PackedChunk | None]] = {}
+        self._prime_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gpu-chunk-prime")
+        self._prime_inflight: set[tuple[int, int]] = set()
+        self._pinned_chunks: set[tuple[int, int]] = set()
         self._empty_chunks: set[tuple[int, int]] = set()
+        self._blank_chunk_cache: dict[int, PackedChunk] = {}
         self._executor = ThreadPoolExecutor(max_workers=DEFAULT_CHUNK_IO_WORKERS, thread_name_prefix="gpu-chunk")
         self._lock = threading.Lock()
         self._material_fingerprint = _variant_fingerprint(registry)
+        self._placeholder_variant_index = self.tables.variant_index_by_key.get(("entity_placeholder", "placeholder"), -1)
+        self.stats = ChunkIoStats()
+
+    def snapshot_stats(self) -> ChunkCacheDebugSnapshot:
+        with self._lock:
+            cached_chunks = len(self._chunks)
+            empty_chunks = len(self._empty_chunks)
+            prefetch_queued = len(self._prefetch_queue)
+            prefetch_inflight = len(self._inflight)
+            pinned_chunks = len(self._pinned_chunks)
+        return ChunkCacheDebugSnapshot(
+            cached_chunks=cached_chunks,
+            empty_chunks=empty_chunks,
+            prefetch_queued=prefetch_queued,
+            prefetch_inflight=prefetch_inflight,
+            pinned_chunks=pinned_chunks,
+            cache_hits=self.stats.cache_hits,
+            empty_hits=self.stats.empty_hits,
+            inflight_wait_hits=self.stats.inflight_wait_hits,
+            disk_load_count=self.stats.disk_load_count,
+            disk_load_total_seconds=self.stats.disk_load_total_seconds,
+            disk_load_last_seconds=self.stats.disk_load_last_seconds,
+            disk_load_max_seconds=self.stats.disk_load_max_seconds,
+            generate_count=self.stats.generate_count,
+            generate_total_seconds=self.stats.generate_total_seconds,
+            generate_last_seconds=self.stats.generate_last_seconds,
+            generate_max_seconds=self.stats.generate_max_seconds,
+            save_count=self.stats.save_count,
+            save_total_seconds=self.stats.save_total_seconds,
+            save_last_seconds=self.stats.save_last_seconds,
+            save_max_seconds=self.stats.save_max_seconds,
+        )
 
     def _chunk_path(self, chunk_x: int, chunk_y: int) -> Path:
         return self.save_dir / f"{chunk_x}_{chunk_y}.ogchunk"
@@ -360,12 +652,26 @@ class GpuChunkCache:
             self.chunk_size,
         )
 
+    def _blank_chunk_for(self, chunk_y: int) -> PackedChunk:
+        chunk = self._blank_chunk_cache.get(chunk_y)
+        if chunk is None:
+            chunk = _blank_chunk(self.chunk_size, self.store.height, chunk_y, self.tables.empty_variant_index)
+            self._blank_chunk_cache[chunk_y] = chunk
+        return chunk
+
     def _load_from_disk(self, chunk_x: int, chunk_y: int) -> PackedChunk | None:
+        started_at = perf_counter()
         path = self._chunk_path(chunk_x, chunk_y)
         if not path.exists():
+            elapsed = perf_counter() - started_at
+            self.stats.disk_load_last_seconds = elapsed
+            self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
             return None
         data = path.read_bytes()
         if len(data) < GPU_CHUNK_HEADER_SIZE:
+            elapsed = perf_counter() - started_at
+            self.stats.disk_load_last_seconds = elapsed
+            self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
             return None
         (
             magic,
@@ -387,10 +693,16 @@ class GpuChunkCache:
             or height != self.chunk_size
             or fingerprint != self._material_fingerprint
         ):
+            elapsed = perf_counter() - started_at
+            self.stats.disk_load_last_seconds = elapsed
+            self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
             return None
         plane_size = width * height * GPU_STATE_PIXEL_BYTES
         expected = GPU_CHUNK_HEADER_SIZE + plane_size * 3
         if len(data) != expected:
+            elapsed = perf_counter() - started_at
+            self.stats.disk_load_last_seconds = elapsed
+            self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
             return None
         offset = GPU_CHUNK_HEADER_SIZE
         chunk = PackedChunk(
@@ -401,10 +713,16 @@ class GpuChunkCache:
             state_misc=bytearray(data[offset + plane_size * 2:offset + plane_size * 3]),
             dirty=False,
         )
+        elapsed = perf_counter() - started_at
+        self.stats.disk_load_count += 1
+        self.stats.disk_load_total_seconds += elapsed
+        self.stats.disk_load_last_seconds = elapsed
+        self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
         log.debug("[world] loaded GPU chunk (%d,%d) from disk", chunk_x, chunk_y)
         return chunk
 
     def _save_to_disk(self, chunk_x: int, chunk_y: int, chunk: PackedChunk) -> None:
+        started_at = perf_counter()
         self.save_dir.mkdir(parents=True, exist_ok=True)
         path = self._chunk_path(chunk_x, chunk_y)
         header = struct.pack(
@@ -423,24 +741,62 @@ class GpuChunkCache:
         tmp_path.write_bytes(header + bytes(chunk.state_int) + bytes(chunk.state_vec) + bytes(chunk.state_misc))
         tmp_path.replace(path)
         chunk.dirty = False
+        elapsed = perf_counter() - started_at
+        self.stats.save_count += 1
+        self.stats.save_total_seconds += elapsed
+        self.stats.save_last_seconds = elapsed
+        self.stats.save_max_seconds = max(self.stats.save_max_seconds, elapsed)
         log.debug("[world] saved GPU chunk (%d,%d) to disk", chunk_x, chunk_y)
 
     def _generate_chunk(self, chunk_x: int, chunk_y: int) -> PackedChunk:
+        started_at = perf_counter()
         log.debug("[world] generating GPU chunk (%d,%d) for the first time", chunk_x, chunk_y)
-        chunk = _blank_chunk(self.chunk_size, self.store.height, chunk_y, self.tables.empty_variant_index)
         store_chunk = self.store._chunk(chunk_x, chunk_y, create=False)  # noqa: SLF001
-        if store_chunk is None and self.store.chunk_generator is not None:
+        chunk_generator = self.store.chunk_generator
+        generator_owner = getattr(chunk_generator, "__self__", None) if chunk_generator is not None else None
+        if (
+            store_chunk is None
+            and chunk_generator is not None
+            and getattr(generator_owner, "supports_packed_chunk_generation", False)
+        ):
+            writer = _PackedChunkTerrainWriter(
+                world_width=self.store.width,
+                world_height=self.store.height,
+                chunk_x=chunk_x,
+                chunk_y=chunk_y,
+                chunk_size=self.chunk_size,
+                seed=self.store.seed,
+                tables=self.tables,
+            )
+            chunk_generator(writer, chunk_x, chunk_y, self.chunk_size, self.store.seed)
+            chunk = writer.finalize()
+            if writer._nondefault_writes <= 0:  # noqa: SLF001
+                self._empty_chunks.add((chunk_x, chunk_y))
+            elapsed = perf_counter() - started_at
+            self.stats.generate_count += 1
+            self.stats.generate_total_seconds += elapsed
+            self.stats.generate_last_seconds = elapsed
+            self.stats.generate_max_seconds = max(self.stats.generate_max_seconds, elapsed)
+            return chunk
+
+        chunk = _blank_chunk(self.chunk_size, self.store.height, chunk_y, self.tables.empty_variant_index)
+        if store_chunk is None and chunk_generator is not None:
             temp_store = WorldChunkStore(
                 self.store.width,
                 self.store.height,
                 chunk_size=self.chunk_size,
                 seed=self.store.seed,
             )
-            self.store.chunk_generator(temp_store, chunk_x, chunk_y, self.chunk_size, self.store.seed)
+            chunk_generator(temp_store, chunk_x, chunk_y, self.chunk_size, self.store.seed)
             store_chunk = temp_store._chunk(chunk_x, chunk_y, create=False)  # noqa: SLF001
         if store_chunk is None or not store_chunk.cells:
             self._empty_chunks.add((chunk_x, chunk_y))
-            return chunk
+            elapsed = perf_counter() - started_at
+            self.stats.generate_count += 1
+            self.stats.generate_total_seconds += elapsed
+            self.stats.generate_last_seconds = elapsed
+            self.stats.generate_max_seconds = max(self.stats.generate_max_seconds, elapsed)
+            return self._blank_chunk_for(chunk_y)
         if store_chunk is not None and store_chunk.cells:
             state_int = array("i")
             state_int.frombytes(chunk.state_int)
@@ -466,18 +822,26 @@ class GpuChunkCache:
             chunk.state_vec = bytearray(state_vec.tobytes())
             chunk.state_misc = bytearray(state_misc.tobytes())
         chunk.dirty = True
+        elapsed = perf_counter() - started_at
+        self.stats.generate_count += 1
+        self.stats.generate_total_seconds += elapsed
+        self.stats.generate_last_seconds = elapsed
+        self.stats.generate_max_seconds = max(self.stats.generate_max_seconds, elapsed)
         return chunk
 
     def ensure_chunk_cached(self, chunk_x: int, chunk_y: int) -> PackedChunk:
         key = (chunk_x, chunk_y)
         if key in self._empty_chunks:
-            return _blank_chunk(self.chunk_size, self.store.height, chunk_y, self.tables.empty_variant_index)
+            self.stats.empty_hits += 1
+            return self._blank_chunk_for(chunk_y)
         with self._lock:
             chunk = self._chunks.get(key)
             if chunk is not None:
+                self.stats.cache_hits += 1
                 return chunk
             future = self._inflight.get(key)
         if future is not None:
+            self.stats.inflight_wait_hits += 1
             chunk = future.result()
             with self._lock:
                 self._inflight.pop(key, None)
@@ -495,9 +859,17 @@ class GpuChunkCache:
         for chunk_x, chunk_y in self._prefetch_keys_for_rect(rect):
             self.ensure_chunk_cached(chunk_x, chunk_y)
 
-    def _prefetch_keys_for_rect(self, rect: WorldRect) -> list[tuple[int, int]]:
+    def _prefetch_keys_for_rect(
+        self,
+        rect: WorldRect,
+        *,
+        margin_x: int | None = None,
+        margin_y: int | None = None,
+    ) -> list[tuple[int, int]]:
         if rect.is_empty:
             return []
+        pad_x = self.prefetch_x if margin_x is None else max(0, int(margin_x))
+        pad_y = self.prefetch_y if margin_y is None else max(0, int(margin_y))
         chunk_min_x = max(0, rect.x) // self.chunk_size
         chunk_max_x = max(0, rect.right - 1) // self.chunk_size
         chunk_min_y = max(0, rect.y) // self.chunk_size
@@ -505,22 +877,114 @@ class GpuChunkCache:
         max_chunk_x = max(0, (self.store.width - 1) // self.chunk_size)
         max_chunk_y = max(0, (self.store.height - 1) // self.chunk_size)
         keys: list[tuple[int, int]] = []
-        for chunk_y in range(max(0, chunk_min_y - self.prefetch_y), min(max_chunk_y, chunk_max_y + self.prefetch_y) + 1):
-            for chunk_x in range(max(0, chunk_min_x - self.prefetch_x), min(max_chunk_x, chunk_max_x + self.prefetch_x) + 1):
+        for chunk_y in range(max(0, chunk_min_y - pad_y), min(max_chunk_y, chunk_max_y + pad_y) + 1):
+            for chunk_x in range(max(0, chunk_min_x - pad_x), min(max_chunk_x, chunk_max_x + pad_x) + 1):
                 keys.append((chunk_x, chunk_y))
         return keys
 
-    def schedule_prefetch_for_rect(self, rect: WorldRect) -> None:
-        for key in self._prefetch_keys_for_rect(rect):
+    def schedule_prefetch_for_rect(
+        self,
+        rect: WorldRect,
+        *,
+        margin_x: int | None = None,
+        margin_y: int | None = None,
+        prioritize: bool = False,
+    ) -> None:
+        for key in self._prefetch_keys_for_rect(rect, margin_x=margin_x, margin_y=margin_y):
             with self._lock:
                 already_known = key in self._chunks or key in self._prefetch_queued or key in self._inflight
             if already_known:
                 continue
-            self._prefetch_queue.append(key)
+            if prioritize:
+                self._prefetch_queue.appendleft(key)
+            else:
+                self._prefetch_queue.append(key)
             self._prefetch_queued.add(key)
 
     def _load_for_worker(self, chunk_x: int, chunk_y: int) -> PackedChunk | None:
-        return self._load_from_disk(chunk_x, chunk_y)
+        chunk = self._load_from_disk(chunk_x, chunk_y)
+        if chunk is not None:
+            return chunk
+        chunk = self._generate_chunk(chunk_x, chunk_y)
+        if (chunk_x, chunk_y) in self._empty_chunks:
+            return None
+        if chunk.dirty:
+            self._save_to_disk(chunk_x, chunk_y, chunk)
+        return chunk
+
+    def _prime_for_worker(self, chunk_x: int, chunk_y: int) -> None:
+        chunk = self._load_from_disk(chunk_x, chunk_y)
+        if chunk is not None:
+            with self._lock:
+                self._chunks[(chunk_x, chunk_y)] = chunk
+            return
+        chunk = self._generate_chunk(chunk_x, chunk_y)
+        if (chunk_x, chunk_y) in self._empty_chunks:
+            return
+        if chunk.dirty:
+            self._save_to_disk(chunk_x, chunk_y, chunk)
+        with self._lock:
+            self._chunks[(chunk_x, chunk_y)] = chunk
+
+    def prime_rect_on_disk(self, rect: WorldRect) -> None:
+        for key in self._prefetch_keys_for_rect(rect, margin_x=0, margin_y=0):
+            self._pinned_chunks.add(key)
+            with self._lock:
+                already_known = (
+                    key in self._chunks
+                    or key in self._prefetch_queued
+                    or key in self._inflight
+                    or key in self._prime_inflight
+                )
+            if already_known:
+                continue
+            with self._lock:
+                self._prime_inflight.add(key)
+            future = self._prime_executor.submit(self._prime_for_worker, *key)
+
+            def _clear(_future, *, key=key) -> None:
+                with self._lock:
+                    self._prime_inflight.discard(key)
+
+            future.add_done_callback(_clear)
+
+    def prime_rect_now(self, rect: WorldRect) -> None:
+        for chunk_x, chunk_y in self._prefetch_keys_for_rect(rect, margin_x=0, margin_y=0):
+            key = (chunk_x, chunk_y)
+            self._pinned_chunks.add(key)
+            chunk = self._chunks.get(key)
+            if chunk is None:
+                chunk = self._load_from_disk(chunk_x, chunk_y)
+            if chunk is None:
+                chunk = self._generate_chunk(chunk_x, chunk_y)
+            if key in self._empty_chunks:
+                continue
+            if chunk.dirty:
+                self._save_to_disk(chunk_x, chunk_y, chunk)
+            with self._lock:
+                self._chunks[key] = chunk
+
+    def prepare_rect_now(self, rect: WorldRect) -> None:
+        keys = self._prefetch_keys_for_rect(rect, margin_x=0, margin_y=0)
+        if not keys:
+            return
+        for key in keys:
+            self._pinned_chunks.add(key)
+        futures: list[tuple[tuple[int, int], Future[PackedChunk | None]]] = []
+        for key in keys:
+            with self._lock:
+                chunk = self._chunks.get(key)
+            if chunk is not None:
+                continue
+            futures.append((key, self._executor.submit(self._load_for_worker, *key)))
+        if futures:
+            wait([future for _key, future in futures])
+        for key, future in futures:
+            chunk = future.result()
+            if chunk is None:
+                continue
+            with self._lock:
+                self._chunks[key] = chunk
 
     def service_prefetch(self, *, max_chunks: int = 1, collect_ready: bool = True) -> bool:
         did_work = False
@@ -572,6 +1036,8 @@ class GpuChunkCache:
             chunk_x, chunk_y = key
             if chunk_min_x <= chunk_x <= chunk_max_x and chunk_min_y <= chunk_y <= chunk_max_y:
                 continue
+            if key in self._pinned_chunks:
+                continue
             if chunk.dirty:
                 if not flush_dirty:
                     continue
@@ -592,6 +1058,7 @@ class GpuChunkCache:
 
     def shutdown(self) -> None:
         self.flush_dirty()
+        self._prime_executor.shutdown(wait=False, cancel_futures=True)
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def read_rect(self, rect: WorldRect):
@@ -654,6 +1121,13 @@ class GpuChunkCache:
     def write_rect(self, rect: WorldRect, packed_region: object) -> None:
         if rect.width <= 0 or rect.height <= 0:
             return
+        packed_region = _sanitize_packed_region_for_storage(
+            packed_region,
+            world_y0=rect.y,
+            world_height=self.store.height,
+            placeholder_variant_index=self._placeholder_variant_index,
+            empty_variant_index=self.tables.empty_variant_index,
+        )
         for chunk_x, chunk_y in _chunks_for_rect(rect, self.chunk_size):
             chunk_rect = self._chunk_world_rect(chunk_x, chunk_y)
             overlap = rect.intersection(chunk_rect)
@@ -690,6 +1164,9 @@ class GpuChunkCache:
             return False
         chunk_x = x // self.chunk_size
         chunk_y = y // self.chunk_size
+        key = (chunk_x, chunk_y)
+        if key in self._empty_chunks:
+            return False
         local_x = x % self.chunk_size
         local_y = y % self.chunk_size
         local_index = local_y * self.chunk_size + local_x
@@ -1108,7 +1585,7 @@ class ActiveWorldWindow:
             target_origin_y=self.active_origin_y,
         )
         self.chunk_cache.schedule_prefetch_for_rect(self.active_rect)
-        self.chunk_cache.service_prefetch(max_chunks=16, collect_ready=False)
+        self.chunk_cache.service_prefetch(max_chunks=4, collect_ready=False)
         self._set_external_support_anchors()
         log.debug("[world] GPU simulator created")
 
@@ -1471,6 +1948,7 @@ class ActiveWorldWindow:
                  self.active_origin_x, self.active_origin_y, new_origin_x, new_origin_y,
                  self.camera_x, self.camera_y)
         shift_started_at = perf_counter()
+        chunk_stats_before = self.chunk_cache.snapshot_stats()
         self.paging_stats.last_evict_stage_seconds = 0.0
         self.paging_stats.last_overlap_copy_seconds = 0.0
         self.paging_stats.last_overlap_transient_copy_seconds = 0.0
@@ -1560,6 +2038,24 @@ class ActiveWorldWindow:
         self.chunk_cache.service_prefetch(max_chunks=4, collect_ready=False)
         self.chunk_cache.evict_far_chunks(self.active_rect)
         self._set_external_support_anchors()
+        chunk_stats_after = self.chunk_cache.snapshot_stats()
+        self.paging_stats.last_shift_cache_hits = chunk_stats_after.cache_hits - chunk_stats_before.cache_hits
+        self.paging_stats.last_shift_empty_hits = chunk_stats_after.empty_hits - chunk_stats_before.empty_hits
+        self.paging_stats.last_shift_inflight_wait_hits = (
+            chunk_stats_after.inflight_wait_hits - chunk_stats_before.inflight_wait_hits
+        )
+        self.paging_stats.last_shift_disk_loads = chunk_stats_after.disk_load_count - chunk_stats_before.disk_load_count
+        self.paging_stats.last_shift_generates = chunk_stats_after.generate_count - chunk_stats_before.generate_count
+        self.paging_stats.last_shift_saves = chunk_stats_after.save_count - chunk_stats_before.save_count
+        self.paging_stats.last_shift_disk_load_seconds = (
+            chunk_stats_after.disk_load_total_seconds - chunk_stats_before.disk_load_total_seconds
+        )
+        self.paging_stats.last_shift_generate_seconds = (
+            chunk_stats_after.generate_total_seconds - chunk_stats_before.generate_total_seconds
+        )
+        self.paging_stats.last_shift_save_seconds = (
+            chunk_stats_after.save_total_seconds - chunk_stats_before.save_total_seconds
+        )
         self._record_shift_stats(perf_counter() - shift_started_at)
 
     def _record_shift_stats(self, shift_seconds: float) -> None:
@@ -1579,10 +2075,38 @@ class ActiveWorldWindow:
         if self._camera_idle_elapsed_seconds >= self.idle_flush_cooldown_seconds:
             self._camera_recently_moved = False
 
-    def ensure_resident_for_camera(self) -> None:
+    def _direct_origin_for_camera(self) -> tuple[int, int]:
+        max_origin_x = max(0, self.store.width - self.active_width)
+        max_origin_y = max(0, self.store.height - self.active_height)
+        min_origin_x = self.camera_x + self.viewport_width + self.safety_margin_cells - self.active_width
+        min_origin_y = self.camera_y + self.viewport_height + self.safety_margin_cells - self.active_height
+        max_origin_for_margin_x = self.camera_x - self.safety_margin_cells
+        max_origin_for_margin_y = self.camera_y - self.safety_margin_cells
+        low_x = max(0, min_origin_x)
+        low_y = max(0, min_origin_y)
+        high_x = min(max_origin_x, max_origin_for_margin_x)
+        high_y = min(max_origin_y, max_origin_for_margin_y)
+        if low_x > high_x:
+            low_x = high_x = _clamp(self.camera_x - self.halo_cells, 0, max_origin_x)
+        if low_y > high_y:
+            low_y = high_y = _clamp(self.camera_y - self.halo_cells, 0, max_origin_y)
+        target_x = _clamp(self.camera_x - self.halo_cells, low_x, high_x)
+        target_y = _clamp(self.camera_y - self.halo_cells, low_y, high_y)
+        return (
+            _clamp(int(target_x), 0, max_origin_x),
+            _clamp(int(target_y), 0, max_origin_y),
+        )
+
+    def ensure_resident_for_camera(self, *, force_jump: bool = False) -> None:
         log.debug("[world] ensure_resident: camera=(%d,%d) active_origin=(%d,%d) active_size=%dx%d",
                   self.camera_x, self.camera_y, self.active_origin_x, self.active_origin_y,
                   self.active_width, self.active_height)
+        if force_jump:
+            new_origin_x, new_origin_y = self._direct_origin_for_camera()
+            if new_origin_x != self.active_origin_x or new_origin_y != self.active_origin_y:
+                self._shift_active_window(new_origin_x, new_origin_y)
+            return
+
         new_origin_x = self.active_origin_x
         new_origin_y = self.active_origin_y
         max_origin_x = max(0, self.store.width - self.active_width)
@@ -1613,6 +2137,43 @@ class ActiveWorldWindow:
         self.mark_camera_activity(moved)
         self.ensure_resident_for_camera()
 
+    def set_camera(self, camera_x: int, camera_y: int) -> None:
+        next_camera_x = _clamp(int(camera_x), 0, max(0, self.store.width - self.viewport_width))
+        next_camera_y = _clamp(int(camera_y), 0, max(0, self.store.height - self.viewport_height))
+        moved = next_camera_x != self.camera_x or next_camera_y != self.camera_y
+        self.camera_x = next_camera_x
+        self.camera_y = next_camera_y
+        self.mark_camera_activity(moved)
+        self.ensure_resident_for_camera(force_jump=True)
+
+    def _active_rect_for_camera(self, camera_x: int, camera_y: int) -> WorldRect:
+        next_camera_x = _clamp(int(camera_x), 0, max(0, self.store.width - self.viewport_width))
+        next_camera_y = _clamp(int(camera_y), 0, max(0, self.store.height - self.viewport_height))
+        saved_camera_x = self.camera_x
+        saved_camera_y = self.camera_y
+        self.camera_x = next_camera_x
+        self.camera_y = next_camera_y
+        try:
+            origin_x, origin_y = self._direct_origin_for_camera()
+        finally:
+            self.camera_x = saved_camera_x
+            self.camera_y = saved_camera_y
+        return WorldRect(origin_x, origin_y, self.active_width, self.active_height)
+
+    def prefetch_camera_region(self, camera_x: int, camera_y: int, *, submit_chunks: int = 8) -> None:
+        rect = self._active_rect_for_camera(camera_x, camera_y)
+        self.chunk_cache.schedule_prefetch_for_rect(rect, margin_x=0, margin_y=0, prioritize=True)
+        self.chunk_cache.service_prefetch(max_chunks=max(1, int(submit_chunks)), collect_ready=False)
+
+    def prime_camera_region(self, camera_x: int, camera_y: int) -> None:
+        self.chunk_cache.prime_rect_on_disk(self._active_rect_for_camera(camera_x, camera_y))
+
+    def prime_camera_region_sync(self, camera_x: int, camera_y: int) -> None:
+        self.chunk_cache.prime_rect_now(self._active_rect_for_camera(camera_x, camera_y))
+
+    def prepare_camera_region_sync(self, camera_x: int, camera_y: int) -> None:
+        self.chunk_cache.prepare_rect_now(self._active_rect_for_camera(camera_x, camera_y))
+
     def screen_to_world(self, sx: int, sy: int, *, screen_width: int, screen_height: int) -> tuple[int, int]:
         viewport_x = max(0, min(self.viewport_width - 1, int(float(sx) * self.viewport_width / max(1, screen_width))))
         viewport_y_from_bottom = int(float(sy) * self.viewport_height / max(1, screen_height))
@@ -1636,6 +2197,53 @@ class ActiveWorldWindow:
         if self.gpu_simulator is None:
             raise RuntimeError("GPU simulator required.")
         self.gpu_simulator.paint_circle(local_x, local_y, radius, family_id, variant_id, overrides=overrides)
+
+    def inject_pressure_world(self, world_x: int, world_y: int, radius: int, pressure_value: float) -> None:
+        """Inject high pressure at a world position for explosion effects."""
+        if not self.active_rect.x <= world_x < self.active_rect.right or not self.active_rect.y <= world_y < self.active_rect.bottom:
+            return
+        local_x = world_x - self.active_origin_x
+        local_y = world_y - self.active_origin_y
+        if self.gpu_simulator is None:
+            raise RuntimeError("GPU simulator required.")
+        self.gpu_simulator.inject_pressure(local_x, local_y, radius, pressure_value)
+
+    def inject_pressure_ring_world(
+        self,
+        world_x: int,
+        world_y: int,
+        inner_radius: int,
+        outer_radius: int,
+        pressure_value: float,
+    ) -> None:
+        """Inject a ring-shaped pressure shell at a world position."""
+        if not self.active_rect.x <= world_x < self.active_rect.right or not self.active_rect.y <= world_y < self.active_rect.bottom:
+            return
+        local_x = world_x - self.active_origin_x
+        local_y = world_y - self.active_origin_y
+        if self.gpu_simulator is None:
+            raise RuntimeError("GPU simulator required.")
+        self.gpu_simulator.inject_pressure_ring(local_x, local_y, inner_radius, outer_radius, pressure_value)
+
+    def request_projectile_feedback_world(
+        self,
+        projectiles: list[tuple[int, int, int]],
+    ) -> object:
+        """Submit projectile positions (world coords) for GPU collision query."""
+        if self.gpu_simulator is None:
+            return None
+        local_projectiles: list[tuple[int, int, int]] = []
+        for wx, wy, ptype in projectiles:
+            lx = wx - self.active_origin_x
+            ly = wy - self.active_origin_y
+            local_projectiles.append((lx, ly, ptype))
+        return self.gpu_simulator.request_projectile_feedback(local_projectiles)
+
+    def poll_projectile_feedback_world(self, token: object) -> list | None:
+        """Poll projectile feedback results from GPU."""
+        if self.gpu_simulator is None or token is None:
+            return None
+        return self.gpu_simulator.poll_projectile_feedback(token)
 
     def set_liquid_brownian_enabled(self, enabled: bool) -> None:
         self.liquid_brownian_enabled = bool(enabled)
@@ -1735,5 +2343,42 @@ class ActiveWorldWindow:
         grid.external_support_anchors = list(self.external_support_anchors)
         return grid
 
+    def readback_pressure_region_world(self, world_x: int, world_y: int, width: int, height: int) -> list[list[float]]:
+        if self.gpu_simulator is None:
+            raise RuntimeError("GPU simulator required.")
+        local_x = world_x - self.active_origin_x
+        local_y = world_y - self.active_origin_y
+        return self.gpu_simulator.readback_pressure_region(local_x, local_y, width, height)
+
+    def snapshot_cells_region_world(
+        self,
+        *,
+        entity_id: str,
+        world_x: int,
+        world_y: int,
+        width: int,
+        height: int,
+    ) -> LocalCellsSnapshot:
+        if self.gpu_simulator is None:
+            raise RuntimeError("GPU simulator required.")
+        local_x = world_x - self.active_origin_x
+        local_y = world_y - self.active_origin_y
+        return self.gpu_simulator.snapshot_cells_region(
+            entity_id=entity_id,
+            world_x=world_x,
+            world_y=world_y,
+            gx=local_x,
+            gy=local_y,
+            gw=width,
+            gh=height,
+        )
+
     def close(self) -> None:
+        if self.gpu_simulator is not None:
+            self._stage_evicted_region(self.active_rect)
+            flush_budget = max(1, self.active_width * self.active_height)
+            self.pending_writeback_slice_cell_budget = flush_budget
+            while self._pending_gpu_writebacks:
+                if not self._flush_one_pending_gpu_writeback():
+                    break
         self.chunk_cache.shutdown()

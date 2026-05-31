@@ -264,6 +264,15 @@ def execute_magic_socket(magic: MagicSocket, world: Any, registry: Any) -> None 
         overrides["vel_x"] = magic.direction[0] * magic.carrier_velocity
         overrides["vel_y"] = magic.direction[1] * magic.carrier_velocity
 
+    # Set initial generation from family's max_generation
+    try:
+        family = registry.family(magic.subject_family)
+        max_gen = family.reaction_profile.get("max_generation", 0)
+        if max_gen > 0:
+            overrides["generation"] = max_gen
+    except Exception:
+        pass
+
     # Attach reaction parameters to injected cells
     if magic.reaction_convert_mode and magic.reaction_convert_mode != "none":
         overrides["spell_convert_mode"] = magic.reaction_convert_mode
@@ -311,6 +320,15 @@ def inject_stream_tick(stream: ActiveStream, world: Any, registry: Any, hero_x: 
         overrides["temperature"] = magic.subject_temperature
     overrides["vel_x"] = magic.direction[0] * magic.carrier_velocity
     overrides["vel_y"] = magic.direction[1] * magic.carrier_velocity
+
+    # Set initial generation from family's max_generation
+    try:
+        family = registry.family(magic.subject_family)
+        max_gen = family.reaction_profile.get("max_generation", 0)
+        if max_gen > 0:
+            overrides["generation"] = max_gen
+    except Exception:
+        pass
 
     if magic.reaction_convert_mode and magic.reaction_convert_mode != "none":
         overrides["spell_convert_mode"] = magic.reaction_convert_mode

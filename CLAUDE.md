@@ -81,3 +81,9 @@ data/
 - 追求涌现式物理互动, 不依赖预设"火克水"数值表
 - 魔法可持续改写世界环境
 - **网格尺寸不可缩减**: active window 672x412 是设计基准, 不能通过缩小网格来提升帧率。性能优化必须从 shader 本身、调度策略、异步化等方向入手。
+
+## 测试方式
+
+- 测试游戏功能时, **必须通过 debug server (HTTP, port 9123) 发指令来运行真实评测**, 不能只跑短时间 timeout 观察.
+- debug server 支持的端点: `/status`, `/teleport?x=&y=`, `/spawn?type=A|B|C`, `/heal?amount=`, `/fps` 等.
+- 先 `python -m src.game` 启动游戏, 再用 `curl http://localhost:9123/...` 发送指令验证行为.

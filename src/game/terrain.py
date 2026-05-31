@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -207,6 +208,29 @@ def _poison_cell(gen: int = 0) -> CellState:
     return _cell("poison", "poison_liquid", gen=gen)
 
 
+def _sand_surface_cell(gen: int = 0) -> CellState:
+    return _cell("sand", "sand_powder", gen=gen, flags=CellFlag.FIXPOINT)
+
+
+@dataclass(frozen=True)
+class PlainsTreeFeature:
+    center_x: int
+    ground_y: float
+    trunk_height: int
+    canopy_radius_x: int
+    canopy_radius_y: int
+    canopy_center_y: float
+
+
+@dataclass(frozen=True)
+class PlainsPondFeature:
+    center_x: int
+    ground_y: float
+    half_width: int
+    max_depth: int
+    water_surface_y: int
+
+
 # ---------------------------------------------------------------------------
 # TerrainGenerator
 # ---------------------------------------------------------------------------
@@ -265,32 +289,32 @@ class TerrainGenerator:
                 heights[lx] = 0.0
 
         # Precompute features for this chunk
-        tree_cols: dict[int, tuple[int, float]] = {}
-        pond_cols: dict[int, tuple[int, float]] = {}
+        tree_cols: dict[int, PlainsTreeFeature] = {}
+        pond_cols: dict[int, PlainsPondFeature] = {}
         for lx in range(x_start, x_end):
             if biomes[lx] == "plains":
-                tc = self._plains_tree_center(lx, heights)
+                tc = self._plains_tree_feature(lx, heights)
                 if tc is not None:
                     tree_cols[lx] = tc
-                pc = self._plains_pond_center(lx, heights)
+                pc = self._plains_pond_feature(lx, heights)
                 if pc is not None:
                     pond_cols[lx] = pc
 
         # Precompute alpine feature x-ranges for this chunk
         alpine_feature_xs: set[int] = set()
         has_alpine = any(b == "alpine" for b in biomes.values())
+        alpine_islands = self._alpine_islands() if has_alpine else []
         if has_alpine:
-            islands = self._alpine_islands()
-            for isl in islands:
+            for isl in alpine_islands:
                 ix0 = isl['cx'] - isl['w'] // 2
                 ix1 = ix0 + isl['w']
                 for x in range(max(x_start, ix0), min(x_end, ix1)):
                     alpine_feature_xs.add(x)
-            for i, isl in enumerate(islands):
+            for i, isl in enumerate(alpine_islands):
                 for j in isl.get('connections', []):
                     if j <= i:
                         continue
-                    other = islands[j]
+                    other = alpine_islands[j]
                     bx0 = min(isl['cx'], other['cx'])
                     bx1 = max(isl['cx'], other['cx'])
                     for x in range(max(x_start, bx0), min(x_end, bx1 + 1)):
@@ -351,18 +375,17 @@ class TerrainGenerator:
         alpine_y_min = y_end
         alpine_y_max = y_start
         if has_alpine and alpine_feature_xs:
-            islands = self._alpine_islands()
-            for isl in islands:
+            for isl in alpine_islands:
                 iy0 = isl['cy'] - isl['h'] // 2
                 iy1 = iy0 + isl['h']
                 if iy0 < y_end and iy1 > y_start:
                     alpine_y_min = min(alpine_y_min, max(y_start, iy0))
                     alpine_y_max = max(alpine_y_max, min(y_end, iy1))
-            for i, isl in enumerate(islands):
+            for i, isl in enumerate(alpine_islands):
                 for j in isl.get('connections', []):
                     if j <= i:
                         continue
-                    other = islands[j]
+                    other = alpine_islands[j]
                     bridge_y_min = min(isl['cy'], other['cy']) - cfg.ALPINE_BRIDGE_THICKNESS
                     bridge_y_max = max(isl['cy'], other['cy']) + cfg.ALPINE_BRIDGE_THICKNESS
                     if bridge_y_min < y_end and bridge_y_max > y_start:
@@ -379,7 +402,10 @@ class TerrainGenerator:
             biome = biomes[lx]
             ground = int(math.floor(heights[lx]))
             if biome == "plains":
-                tree_above = cfg.PLAINS_TREE_HEIGHT + cfg.PLAINS_TREE_CANOPY_H
+                feature = tree_cols.get(lx)
+                tree_above = 0
+                if feature is not None:
+                    tree_above = feature.trunk_height + feature.canopy_radius_y * 2
                 col_y_min[lx] = max(y_start, ground - tree_above)
             elif biome == "hillside":
                 col_y_min[lx] = max(y_start, ground)
@@ -395,15 +421,15 @@ class TerrainGenerator:
         # Plains columns — direct chunk writes (bypass store.set_cell overhead)
         grass_depth = cfg.PLAINS_GRASS_SURFACE_DEPTH
         floor_y = cfg.WORLD_HEIGHT - cfg.PLAINS_FLOOR_DEPTH
-        tree_h = cfg.PLAINS_TREE_HEIGHT
-        canopy_h = cfg.PLAINS_TREE_CANOPY_H
-        canopy_hw = cfg.PLAINS_TREE_CANOPY_W // 2
-        pond_water_d = cfg.PLAINS_POND_WATER_DEPTH
-        pond_d = cfg.PLAINS_POND_DEPTH
         cs = chunk_size
+        span_writer = getattr(store, "_terrain_write_span", None)
+        cell_writer = getattr(store, "_terrain_write_cell", None)
 
         def _direct_write(store, lx, y0, y1, cell):
             """Write cells directly to chunk dict, bypassing store.set_cell."""
+            if callable(span_writer):
+                span_writer(lx, y0, y1, cell)
+                return
             cx = lx // cs
             local_x = lx % cs
             for ly in range(y0, y1):
@@ -417,24 +443,43 @@ class TerrainGenerator:
                     store._chunks[key] = chunk
                 chunk.cells[local_y * cs + local_x] = cell
 
-        _grass = _grass_platform()
         _stone = _stone_platform()
         _wood = _wood_platform()
         _water = _water_cell()
+        _sand = _sand_surface_cell()
+        _fire = _fire_cell()
+        _poison = _poison_cell()
+        _ice = _ice_cell()
+        _snow = _snow_cell()
+        _obsidian = _obsidian_platform()
+
+        def _direct_set(store, lx: int, ly: int, cell: CellState) -> None:
+            if callable(cell_writer):
+                cell_writer(lx, ly, cell)
+                return
+            _direct_write(store, lx, ly, ly + 1, cell)
+
+        def _store_set(store, lx: int, ly: int, cell: CellState) -> None:
+            if callable(cell_writer):
+                cell_writer(lx, ly, cell)
+                return
+            store.set_cell(lx, ly, cell)
 
         for lx in plains_xs:
             ground_y_f = heights[lx]
-            ground_y_i = int(math.floor(ground_y_f))
             tc = tree_cols.get(lx)
             pc = pond_cols.get(lx)
+            pond_floor_y = self._pond_floor_y(lx, ground_y_f, pc)
+            surface_y = int(math.floor(pond_floor_y))
+            surface_cell = self._surface_cell_for_column(lx)
 
             # Build base terrain spans
-            grass_top = max(y_start, ground_y_i)
-            grass_bot = min(y_end, ground_y_i + grass_depth)
+            grass_top = max(y_start, surface_y)
+            grass_bot = min(y_end, surface_y + grass_depth)
             if grass_top < grass_bot:
-                _direct_write(store, lx, grass_top, grass_bot, _grass)
+                _direct_write(store, lx, grass_top, grass_bot, _sand if surface_cell.family_id == "sand" else surface_cell)
 
-            stone_top = max(y_start, ground_y_i + grass_depth)
+            stone_top = max(y_start, surface_y + grass_depth)
             stone_bot = min(y_end, floor_y)
             if stone_top < stone_bot:
                 _direct_write(store, lx, stone_top, stone_bot, _stone)
@@ -445,35 +490,30 @@ class TerrainGenerator:
 
             # Pond overlay
             if pc is not None:
-                pcx, ground_at_pc = pc
-                pc_top = int(math.floor(ground_at_pc))
-                water_bot = pc_top + pond_water_d
-                pond_bot = pc_top + pond_d
-                wt = max(y_start, pc_top)
-                wb = min(y_end, water_bot + 1)
+                wt = max(y_start, pc.water_surface_y)
+                wb = min(y_end, surface_y + 1)
                 if wt < wb:
                     _direct_write(store, lx, wt, wb, _water)
-                st = max(y_start, water_bot + 1)
-                sb = min(y_end, pond_bot + 1)
+                st = max(y_start, surface_y + 1)
+                sb = min(y_end, int(math.floor(ground_y_f)) + 1)
                 if st < sb:
                     _direct_write(store, lx, st, sb, _stone)
 
             # Tree overlay
             elif tc is not None:
-                tcx, ground_at_tc = tc
-                trunk_base = int(math.floor(ground_at_tc))
-                trunk_top = trunk_base - tree_h
-                canopy_top = trunk_top - canopy_h
-                if abs(lx - tcx) <= canopy_hw:
-                    ct = max(y_start, canopy_top)
-                    cb = min(y_end, trunk_top)
-                    if ct < cb:
-                        _direct_write(store, lx, ct, cb, _grass)
-                if lx == tcx:
+                trunk_base = int(math.floor(tc.ground_y))
+                trunk_top = trunk_base - tc.trunk_height
+                if lx == tc.center_x:
                     tt = max(y_start, trunk_top)
                     tb = min(y_end, trunk_base + 1)
                     if tt < tb:
                         _direct_write(store, lx, tt, tb, _wood)
+                if abs(lx - tc.center_x) <= tc.canopy_radius_x:
+                    leaf_y0 = max(y_start, int(math.floor(tc.canopy_center_y - tc.canopy_radius_y - 2)))
+                    leaf_y1 = min(y_end, int(math.ceil(tc.canopy_center_y + tc.canopy_radius_y + 2)))
+                    for ly in range(leaf_y0, leaf_y1):
+                        if self._tree_leaf_present(tc, lx, ly):
+                            _direct_set(store, lx, ly, _grass_platform())
 
         # Hillside columns — direct chunk writes
         hs_floor_y = cfg.WORLD_HEIGHT - cfg.PLAINS_FLOOR_DEPTH
@@ -483,7 +523,7 @@ class TerrainGenerator:
             gt = max(y_start, ground_y_i)
             gb = min(y_end, ground_y_i + 3)
             if gt < gb:
-                _direct_write(store, lx, gt, gb, _grass)
+                _direct_write(store, lx, gt, gb, self._surface_cell_for_column(lx))
             st = max(y_start, ground_y_i + 3)
             sb = min(y_end, hs_floor_y)
             if st < sb:
@@ -493,26 +533,104 @@ class TerrainGenerator:
                 _direct_write(store, lx, dt, y_end, _stone)
 
         # Alpine columns
+        shaft_x = int(2 * cfg.BIOME_WIDTH + cfg.ALPINE_SHAFT_X_RATIO * cfg.BIOME_WIDTH)
+        shaft_half = cfg.ALPINE_SHAFT_WIDTH
+        shaft_y_min = cfg.ALPINE_ISLAND_Y_MAX + 20
+        shaft_wall_thickness = max(1, shaft_half // 2)
+        bridge_half_thickness = cfg.ALPINE_BRIDGE_THICKNESS // 2
+        ice_depth = cfg.ALPINE_ICE_SURFACE_DEPTH
         for lx in alpine_xs:
             if lx not in alpine_feature_xs:
                 continue
-            for ly in range(alpine_y_min, alpine_y_max + 1):
-                cell = self._alpine_cell(lx, ly)
-                if cell is not None:
-                    store.set_cell(lx, ly, cell)
+            for island in alpine_islands:
+                ix0 = island['cx'] - island['w'] // 2
+                iy0 = island['cy'] - island['h'] // 2
+                iy1 = iy0 + island['h']
+                if not (ix0 <= lx < ix0 + island['w']):
+                    continue
+                ice_top = max(y_start, iy0)
+                ice_bottom = min(y_end, iy0 + ice_depth)
+                if ice_top < ice_bottom:
+                    _direct_write(store, lx, ice_top, ice_bottom, _ice)
+                stone_top = max(y_start, iy0 + ice_depth)
+                stone_bottom = min(y_end, iy1)
+                if stone_top < stone_bottom:
+                    _direct_write(store, lx, stone_top, stone_bottom, _stone)
+                snow_y = iy0 + ice_depth
+                if y_start <= snow_y < y_end and _hash01(self.seed, lx, snow_y, 600) < 0.3:
+                    _direct_set(store, lx, snow_y, _snow)
+            for i, island in enumerate(alpine_islands):
+                for j in island.get('connections', []):
+                    if j <= i:
+                        continue
+                    other = alpine_islands[j]
+                    bx0 = min(island['cx'], other['cx'])
+                    bx1 = max(island['cx'], other['cx'])
+                    if not (bx0 <= lx <= bx1):
+                        continue
+                    span = bx1 - bx0
+                    if span < 1:
+                        continue
+                    t = (lx - bx0) / span
+                    bridge_y = int(island['cy'] + (other['cy'] - island['cy']) * t)
+                    bridge_top = max(y_start, bridge_y - bridge_half_thickness)
+                    bridge_bottom = min(y_end, bridge_y + bridge_half_thickness + 1)
+                    for ly in range(bridge_top, bridge_bottom):
+                        overlaps_island = False
+                        for island_fill in alpine_islands:
+                            island_x0 = island_fill['cx'] - island_fill['w'] // 2
+                            island_y0 = island_fill['cy'] - island_fill['h'] // 2
+                            if (island_x0 <= lx < island_x0 + island_fill['w']
+                                    and island_y0 <= ly < island_y0 + island_fill['h']):
+                                overlaps_island = True
+                                break
+                        if not overlaps_island:
+                            _direct_set(store, lx, ly, _stone)
+            dx = abs(lx - shaft_x)
+            if dx <= shaft_half and dx > shaft_wall_thickness:
+                shaft_top = max(y_start, shaft_y_min)
+                if shaft_top < y_end:
+                    _direct_write(store, lx, shaft_top, y_end, _obsidian)
 
         # Underground columns
         ug_cap_y = cfg.UNDERGROUND_Y_START + cfg.UNDERGROUND_STONE_CAP_DEPTH
-        _obsidian = _obsidian_platform()
+        ug_fire_y = cfg.UNDERGROUND_SURFACE_FIRE_DEPTH
+        ug_poison_y = cfg.UNDERGROUND_SURFACE_FIRE_DEPTH + cfg.UNDERGROUND_SURFACE_POISON_DEPTH
         for lx in ug_xs:
-            for ly in range(y_start, y_end):
-                if ly >= ug_cap_y:
-                    if lx not in ug_feature_xs or ly < ug_y_min or ly > ug_y_max:
-                        _direct_write(store, lx, ly, ly + 1, _obsidian)
-                        continue
-                cell = self._underground_cell(lx, ly)
+            fire_top = y_start
+            fire_bottom = min(y_end, ug_fire_y)
+            if fire_top < fire_bottom:
+                _direct_write(store, lx, fire_top, fire_bottom, _fire)
+
+            poison_top = max(y_start, ug_fire_y)
+            poison_bottom = min(y_end, ug_poison_y)
+            if poison_top < poison_bottom:
+                _direct_write(store, lx, poison_top, poison_bottom, _poison)
+
+            cap_top = max(y_start, ug_poison_y)
+            cap_bottom = min(y_end, ug_cap_y)
+            if cap_top < cap_bottom:
+                _direct_write(store, lx, cap_top, cap_bottom, _stone)
+
+            below_cap_top = max(y_start, ug_cap_y)
+            if below_cap_top >= y_end:
+                continue
+            if lx not in ug_feature_xs or below_cap_top >= ug_y_max or y_end <= ug_y_min:
+                _direct_write(store, lx, below_cap_top, y_end, _obsidian)
+                continue
+
+            breakpoints = self._underground_column_breakpoints(
+                lx,
+                below_cap_top,
+                y_end,
+                ug_chambers,
+            )
+            for seg_top, seg_bottom in zip(breakpoints, breakpoints[1:]):
+                if seg_top >= seg_bottom:
+                    continue
+                cell = self._underground_cell(lx, seg_top)
                 if cell is not None:
-                    store.set_cell(lx, ly, cell)
+                    _direct_write(store, lx, seg_top, seg_bottom, cell)
 
         elapsed = (perf_counter() - t0) * 1000
         log.debug("[terrain] chunk (%d,%d) done in %.1fms", chunk_x, chunk_y, elapsed)
@@ -530,6 +648,141 @@ class TerrainGenerator:
             return self._alpine_surface_y(world_x)
         else:
             return self._underground_surface_y(world_x)
+
+    def cell_at(self, wx: int, wy: int) -> CellState | None:
+        biome = _biome_for_x(wx)
+        if biome == "plains":
+            return self._plains_cell_fast(
+                wx,
+                wy,
+                self._plains_height(wx),
+                tree_info=self._plains_tree_feature(wx),
+                pond_info=self._plains_pond_feature(wx),
+            )
+        if biome == "hillside":
+            return self._hillside_cell_fast(wx, wy, self._hillside_height(wx))
+        if biome == "alpine":
+            return self._alpine_cell(wx, wy)
+        return self._underground_cell(wx, wy)
+
+    def find_spawn_point_near(
+        self,
+        world_x: int,
+        *,
+        entity_width: float,
+        entity_height: float,
+        search_radius: int = 256,
+        step: int = 4,
+    ) -> tuple[float, float] | None:
+        half_width = max(1, int(math.ceil(entity_width / 2.0)))
+        height = max(1, int(math.ceil(entity_height)))
+        max_x = cfg.WORLD_WIDTH - half_width - 2
+
+        def _try_column(candidate_x: int) -> tuple[float, float] | None:
+            candidate_x = max(half_width + 1, min(max_x, int(candidate_x)))
+            base_floor_y = int(math.floor(self.ground_height_at(candidate_x)))
+            floor_candidates = [base_floor_y]
+            if _biome_for_x(candidate_x) == "underground":
+                search_limit = min(cfg.WORLD_HEIGHT - 2, base_floor_y + cfg.UNDERGROUND_STONE_CAP_DEPTH + cfg.UNDERGROUND_CHAMBER_MAX_H * 2)
+                floor_candidates = list(range(max(1, base_floor_y), search_limit + 1, 2))
+            for floor_y in floor_candidates:
+                spawn_y = floor_y - 1 - entity_height
+                if spawn_y < 1:
+                    continue
+                solid_floor = False
+                blocked = False
+                for sample_x in range(candidate_x - half_width, candidate_x + half_width + 1):
+                    sample_floor = self.cell_at(sample_x, floor_y)
+                    if sample_floor is not None and not sample_floor.is_empty:
+                        solid_floor = True
+                    else:
+                        blocked = True
+                        break
+                    for sample_y in range(int(math.floor(spawn_y)), int(math.ceil(spawn_y + height))):
+                        cell = self.cell_at(sample_x, sample_y)
+                        if cell is not None and not cell.is_empty:
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+                if solid_floor and not blocked:
+                    return (float(candidate_x), float(spawn_y))
+            return None
+
+        offsets = [0]
+        stride = max(1, step)
+        for delta in range(stride, max(1, search_radius) + 1, stride):
+            offsets.extend((delta, -delta))
+        for delta in offsets:
+            spawn = _try_column(int(world_x + delta))
+            if spawn is not None:
+                return spawn
+
+        biome = _biome_for_x(int(world_x))
+        if biome == "alpine":
+            islands = sorted(self._alpine_islands(), key=lambda island: abs(island["cx"] - world_x))
+            for island in islands:
+                for candidate_x in range(island["cx"], island["cx"] + island["w"] // 3 + 1, max(4, island["w"] // 12)):
+                    spawn = _try_column(candidate_x)
+                    if spawn is not None:
+                        return spawn
+                    spawn = _try_column(island["cx"] - (candidate_x - island["cx"]))
+                    if spawn is not None:
+                        return spawn
+        elif biome == "underground":
+            chambers = sorted(self._underground_chambers(), key=lambda chamber: abs(chamber["cx"] - world_x))
+            for chamber in chambers:
+                span = max(8, chamber["w"] // 3)
+                stride = max(4, chamber["w"] // 12)
+                for delta in range(0, span + 1, stride):
+                    for candidate_x in (chamber["cx"] + delta, chamber["cx"] - delta):
+                        spawn = _try_column(candidate_x)
+                        if spawn is not None:
+                            return spawn
+        return None
+
+    def spawn_points(self) -> list[dict]:
+        """Seed-based continuous enemy distribution across all biomes."""
+        if hasattr(self, '_cached_spawn_points'):
+            return self._cached_spawn_points
+        points: list[dict] = []
+        for wx in range(cfg.ENEMY_SPACING, cfg.WORLD_WIDTH - cfg.ENEMY_SPACING, cfg.ENEMY_SPACING):
+            biome = _biome_for_x(wx)
+            if biome == "underground":
+                continue
+            if _hash01(self.seed, wx, 0, cfg.ENEMY_TYPE_SALT_A) < cfg.ENEMY_A_PROBABILITY:
+                ground_y = self.ground_height_at(wx)
+                y = ground_y - 1 - cfg.ENEMY_A_HEIGHT
+                points.append({"type": "A", "x": float(wx), "y": y, "biome": biome})
+            if biome in ("hillside", "alpine") and _hash01(self.seed, wx, 0, cfg.ENEMY_TYPE_SALT_B) < cfg.ENEMY_B_PROBABILITY:
+                ground_y = self.ground_height_at(wx)
+                y = ground_y - 1 - cfg.ENEMY_B_HOVER_HEIGHT - cfg.ENEMY_B_HEIGHT
+                points.append({"type": "B", "x": float(wx), "y": y, "biome": biome})
+
+        # Underground: each chamber has 1-2 EnemyA
+        chambers = self._underground_chambers()
+        for i, ch in enumerate(chambers[:-1]):  # non-boss chambers
+            count = 1 + int(_hash01(self.seed, i, 20, 850) < 0.5)
+            for j in range(count):
+                offset_x = int(_hash01(self.seed, j, i, 860) * ch['w'] * 0.4) - ch['w'] // 4
+                x = ch['cx'] + offset_x
+                # Chamber floor: cy + h/2 is bottom edge in world coords
+                floor_y = ch['cy'] + ch['h'] // 2
+                y = floor_y - 1 - cfg.ENEMY_A_HEIGHT
+                points.append({"type": "A", "x": float(x), "y": float(y), "biome": "underground"})
+
+        # Boss in last chamber
+        boss_ch = chambers[-1]
+        boss_floor_y = boss_ch['cy'] + boss_ch['h'] // 2
+        points.append({
+            "type": "C",
+            "x": float(boss_ch['cx']),
+            "y": float(boss_floor_y - 1 - cfg.ENEMY_C_HEIGHT),
+            "biome": "underground",
+        })
+
+        self._cached_spawn_points = points
+        return points
 
     # ── Plains ──
 
@@ -552,63 +805,112 @@ class TerrainGenerator:
         return self._plains_cell_fast(wx, wy, self._plains_height(wx))
 
     def _plains_cell_fast(self, wx: int, wy: int, ground_y: float,
-                          tree_info: tuple[int, float] | None = None,
-                          pond_info: tuple[int, float] | None = None) -> CellState | None:
-        ground_y_int = int(math.floor(ground_y))
+                          tree_info: PlainsTreeFeature | None = None,
+                          pond_info: PlainsPondFeature | None = None) -> CellState | None:
+        natural_surface = self._pond_floor_y(wx, ground_y, pond_info)
+        surface_y = int(math.floor(natural_surface))
 
-        # Pond (precomputed)
         if pond_info is not None:
-            pcx, ground_at_center = pond_info
-            pond_top = int(math.floor(ground_at_center))
-            water_bottom = pond_top + cfg.PLAINS_POND_WATER_DEPTH
-            pond_bottom = pond_top + cfg.PLAINS_POND_DEPTH
-            if pond_top <= wy <= water_bottom:
+            if pond_info.water_surface_y <= wy <= surface_y:
                 return _water_cell()
-            if water_bottom < wy <= pond_bottom:
+            if surface_y < wy <= int(math.floor(ground_y)):
                 return _stone_platform()
 
-        # Tree (precomputed, skip if pond)
         if tree_info is not None and pond_info is None:
-            tcx, ground_at_trunk = tree_info
-            trunk_base = int(math.floor(ground_at_trunk))
-            trunk_top = trunk_base - cfg.PLAINS_TREE_HEIGHT
-            canopy_top = trunk_top - cfg.PLAINS_TREE_CANOPY_H
-            canopy_half_w = cfg.PLAINS_TREE_CANOPY_W // 2
-            if (canopy_top <= wy < trunk_top
-                    and abs(wx - tcx) <= canopy_half_w):
+            trunk_base = int(math.floor(tree_info.ground_y))
+            trunk_top = trunk_base - tree_info.trunk_height
+            if self._tree_leaf_present(tree_info, wx, wy):
                 return _grass_platform()
-            if trunk_top <= wy <= trunk_base and wx == tcx:
+            if trunk_top <= wy <= trunk_base and wx == tree_info.center_x:
                 return _wood_platform()
 
-        # Base terrain
         if wy >= cfg.WORLD_HEIGHT - cfg.PLAINS_FLOOR_DEPTH:
             return _stone_platform()
-        if wy >= ground_y_int + cfg.PLAINS_GRASS_SURFACE_DEPTH:
+        if wy >= surface_y + cfg.PLAINS_GRASS_SURFACE_DEPTH:
             return _stone_platform()
-        if wy >= ground_y_int:
-            return _grass_platform()
+        if wy >= surface_y:
+            return self._surface_cell_for_column(wx)
         return None
 
-    def _plains_tree_center(self, wx: int, heights: dict[int, float] | None = None) -> tuple[int, float] | None:
-        """If wx is the center column of a tree, return (center_x, ground_y)."""
+    def _surface_cell_for_column(self, wx: int) -> CellState:
+        surface_noise = _noise_octaves(
+            float(wx) / cfg.PLAINS_SURFACE_PATCH_SCALE,
+            0.0,
+            self.seed,
+            3,
+            0.55,
+            salt=140,
+        )
+        if surface_noise >= cfg.PLAINS_SURFACE_GRASS_THRESHOLD:
+            return _grass_platform()
+        if surface_noise >= cfg.PLAINS_SURFACE_SAND_THRESHOLD:
+            return _sand_surface_cell()
+        return _stone_platform()
+
+    def _tree_leaf_present(self, feature: PlainsTreeFeature, wx: int, wy: int) -> bool:
+        dx = (wx - feature.center_x) / max(1.0, float(feature.canopy_radius_x))
+        dy = (wy - feature.canopy_center_y) / max(1.0, float(feature.canopy_radius_y))
+        radial = dx * dx + dy * dy
+        if radial > 1.08:
+            return False
+        edge_noise = _hash01(self.seed, wx, wy, 545)
+        if radial > 0.82 and edge_noise < (radial - 0.82) * 1.4:
+            return False
+        return True
+
+    def _pond_floor_y(self, wx: int, ground_y: float, pond_info: PlainsPondFeature | None) -> float:
+        if pond_info is None:
+            return ground_y
+        dx = abs(wx - pond_info.center_x)
+        if dx > pond_info.half_width:
+            return ground_y
+        edge = 1.0 - dx / max(1.0, float(pond_info.half_width))
+        profile = edge * edge * (1.2 - 0.2 * edge)
+        noise = 0.7 + 0.6 * _noise_octaves(float(wx) / 17.0, float(pond_info.center_x) / 43.0, self.seed, 2, 0.5, salt=530)
+        return ground_y + pond_info.max_depth * profile * noise
+
+    def _plains_tree_feature(self, wx: int, heights: dict[int, float] | None = None) -> PlainsTreeFeature | None:
+        """If wx is the center column of a tree, return a deterministic profile."""
         spacing = max(1, cfg.PLAINS_TREE_CANOPY_W + 20)
         center = round(wx / spacing) * spacing
         if center == wx and 0 < wx < cfg.BIOME_WIDTH:
             if _hash01(self.seed, center, 0, 500) < 0.5:
-                if heights is not None and center in heights:
-                    return (center, heights[center])
-                return (center, self._plains_height(center))
+                ground = heights[center] if heights is not None and center in heights else self._plains_height(center)
+                trunk_height = cfg.PLAINS_TREE_HEIGHT + int((_hash01(self.seed, center, 4, 520) - 0.5) * 24.0)
+                canopy_rx = max(8, cfg.PLAINS_TREE_CANOPY_W // 2 + int((_hash01(self.seed, center, 5, 521) - 0.5) * 16.0))
+                canopy_ry = max(8, cfg.PLAINS_TREE_CANOPY_H // 2 + int((_hash01(self.seed, center, 6, 522) - 0.5) * 12.0))
+                trunk_top = int(math.floor(ground)) - trunk_height
+                canopy_center_y = trunk_top + canopy_ry * (0.55 + 0.2 * _hash01(self.seed, center, 7, 523))
+                return PlainsTreeFeature(
+                    center_x=center,
+                    ground_y=ground,
+                    trunk_height=trunk_height,
+                    canopy_radius_x=canopy_rx,
+                    canopy_radius_y=canopy_ry,
+                    canopy_center_y=canopy_center_y,
+                )
         return None
 
-    def _plains_pond_center(self, wx: int, heights: dict[int, float] | None = None) -> tuple[int, float] | None:
-        """If wx is within a pond's width, return (center_x, ground_y)."""
-        spacing = max(1, cfg.PLAINS_POND_WIDTH * 3)
+    def _plains_pond_feature(self, wx: int, heights: dict[int, float] | None = None) -> PlainsPondFeature | None:
+        """If wx is inside a pond footprint, return a deterministic profile."""
+        spacing = max(1, cfg.PLAINS_POND_WIDTH * 4)
         center = round(wx / spacing) * spacing
-        if abs(wx - center) <= cfg.PLAINS_POND_WIDTH // 2 and 0 < wx < cfg.BIOME_WIDTH:
+        if 0 < wx < cfg.BIOME_WIDTH:
+            half_width = max(16, cfg.PLAINS_POND_WIDTH // 2 + int((_hash01(self.seed, center, 8, 531) + 0.6) * cfg.PLAINS_POND_WIDTH * 0.65))
+        else:
+            half_width = cfg.PLAINS_POND_WIDTH // 2
+        if abs(wx - center) <= half_width and 0 < wx < cfg.BIOME_WIDTH:
             if _hash01(self.seed, center, 1, 510) < 0.3:
-                if heights is not None and center in heights:
-                    return (center, heights[center])
-                return (center, self._plains_height(center))
+                ground = heights[center] if heights is not None and center in heights else self._plains_height(center)
+                max_depth = max(cfg.PLAINS_POND_DEPTH, int(cfg.PLAINS_POND_DEPTH * (1.0 + _hash01(self.seed, center, 9, 532))))
+                water_surface_y = int(math.floor(ground)) + max(2, int(max_depth * 0.28))
+                return PlainsPondFeature(
+                    center_x=center,
+                    ground_y=ground,
+                    half_width=half_width,
+                    max_depth=max_depth,
+                    water_surface_y=water_surface_y,
+                )
         return None
 
     # ── Hillside ──
@@ -777,6 +1079,68 @@ class TerrainGenerator:
         _connect_mst(chambers)
         self._cached_underground_chambers = chambers
         return chambers
+
+    def _underground_column_breakpoints(
+        self,
+        wx: int,
+        y0: int,
+        y1: int,
+        chambers: list[dict],
+    ) -> list[int]:
+        breakpoints = {int(y0), int(y1)}
+        corridor_half_height = cfg.UNDERGROUND_CORRIDOR_HEIGHT / 2.0
+
+        for ch in chambers:
+            half_w = ch['w'] // 2
+            if not (ch['cx'] - half_w <= wx < ch['cx'] + half_w):
+                continue
+            top_y = ch['cy'] - ch['h'] // 2
+            bottom_y = ch['cy'] + ch['h'] // 2
+            if bottom_y <= y0 or top_y >= y1:
+                continue
+            breakpoints.add(max(y0, top_y))
+            breakpoints.add(min(y1, bottom_y))
+            has_liquid = ch.get('has_water') or ch.get('has_acid') or ch.get('has_oil')
+            if not ch.get('is_boss') and has_liquid:
+                pool_y = ch['cy'] + ch['h'] // 2 - 5
+                if y0 < pool_y < y1:
+                    breakpoints.add(pool_y)
+
+        for i, ch in enumerate(chambers):
+            for j in ch.get('connections', []):
+                if j <= i:
+                    continue
+                other = chambers[j]
+                bx0 = min(ch['cx'], other['cx'])
+                bx1 = max(ch['cx'], other['cx'])
+                if not (bx0 <= wx <= bx1):
+                    continue
+                span = bx1 - bx0
+                if span < 1:
+                    continue
+                t = (wx - bx0) / span
+                center_y = ch['cy'] + (other['cy'] - ch['cy']) * t
+                top_y = int(math.ceil(center_y - corridor_half_height))
+                bottom_y = int(math.floor(center_y + corridor_half_height)) + 1
+                if bottom_y <= y0 or top_y >= y1:
+                    continue
+                breakpoints.add(max(y0, top_y))
+                breakpoints.add(min(y1, bottom_y))
+
+        boss = chambers[-1]
+        boss_conns = boss.get('connections', [])
+        if boss_conns:
+            bn = chambers[boss_conns[0]]
+            bx0 = min(bn['cx'], boss['cx'])
+            bx1 = max(bn['cx'], boss['cx'])
+            if bx0 <= wx <= bx1 and abs(wx - boss['cx']) <= cfg.UNDERGROUND_CORRIDOR_WIDTH / 2:
+                top_y = min(bn['cy'], boss['cy'])
+                bottom_y = max(bn['cy'], boss['cy']) + 1
+                if bottom_y > y0 and top_y < y1:
+                    breakpoints.add(max(y0, top_y))
+                    breakpoints.add(min(y1, bottom_y))
+
+        return sorted(breakpoints)
 
     def _underground_cell(self, wx: int, wy: int) -> CellState | None:
         # Fast layer checks (most cells hit these early exits)

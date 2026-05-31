@@ -7,6 +7,8 @@ from .grid import Grid
 from .types import SUPPORT_SOURCE_VALUE
 from .types import CellFlag, MaterialRegistry
 
+PRESSURE_VIEW_BASELINE = 2.0
+
 
 class DebugViewMode(str, Enum):
     MATERIAL = "material"
@@ -62,7 +64,7 @@ def _temperature_rgba(temperature: float) -> tuple[int, int, int, int]:
 
 
 def _pressure_rgba(pressure: float) -> tuple[int, int, int, int]:
-    excess_pressure = max(0.0, pressure - 1.0)
+    excess_pressure = max(0.0, pressure - PRESSURE_VIEW_BASELINE)
     factor = min(1.0, log1p(excess_pressure) / log1p(128.0))
     stops = (
         (0.0, (8, 12, 28)),

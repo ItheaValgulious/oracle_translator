@@ -502,6 +502,7 @@ def build_material_registry() -> MaterialRegistry:
             PhaseRule("acid_liquid", "acid_gas", above_temperature=80.0),
             PhaseRule("acid_gas", "acid_liquid", below_temperature=55.0),
         ),
+        reaction_profile={"max_generation": 2},
     )
 
     families["poison"] = MaterialFamily(
@@ -731,7 +732,7 @@ def build_material_registry() -> MaterialRegistry:
             PhaseRule("magic_acid_liquid", "magic_acid_gas", above_temperature=120.0),
             PhaseRule("magic_acid_gas", "magic_acid_liquid", below_temperature=60.0),
         ),
-        reaction_profile={"damage_mask": ["terrain", "living"]},
+        reaction_profile={"damage_mask": ["terrain", "living"], "max_generation": 3},
     )
 
     # ── Obsidian (harder, darker stone; falling + non-falling variants) ──
