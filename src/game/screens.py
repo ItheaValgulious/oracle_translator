@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 log = logging.getLogger(__name__)
@@ -41,29 +42,28 @@ class TitleScreen(BaseScreen):
 
     def __init__(self, app: "GameApp") -> None:
         super().__init__(app)
-        self.title_label = pyglet.text.Label(
-            "Oracle Translator", font_size=36, x=app.width // 2, y=app.height * 0.7,
-            anchor_x="center", anchor_y="center", color=(240, 220, 180, 255),
-        )
-        self.sub_label = pyglet.text.Label(
-            "Press ENTER to start", font_size=14, x=app.width // 2, y=app.height * 0.5,
-            anchor_x="center", anchor_y="center", color=(180, 180, 180, 255),
-        )
-        self.hint_label = pyglet.text.Label(
-            "ESC to quit  |  O for options", font_size=10, x=app.width // 2, y=app.height * 0.3,
-            anchor_x="center", anchor_y="center", color=(140, 140, 140, 255),
-        )
 
     def on_draw(self) -> None:
-        if not hasattr(self, '_draw_count'):
-            self._draw_count = 0
-        self._draw_count += 1
-        if self._draw_count <= 3 and log.isEnabledFor(logging.DEBUG):
-            log.info("[TitleScreen] on_draw #%d", self._draw_count)
-        self.app.ctx.clear(0.04, 0.05, 0.07, 1.0)
-        self.title_label.draw()
-        self.sub_label.draw()
-        self.hint_label.draw()
+        self.app.clear_screen()
+        renderer = self.app.renderer
+        w = float(self.app.width)
+        h = float(self.app.height)
+        from array import array as _array
+        bg_verts = _array("f")
+        text_verts = _array("f")
+        renderer._append_rect(bg_verts, w * 0.18, h * 0.2, w * 0.82, h * 0.82, (8, 10, 14), opacity=210)
+        renderer._append_rect(bg_verts, w * 0.2, h * 0.22, w * 0.8, h * 0.8, (20, 24, 30), opacity=220)
+        title = "Oracle Translator"
+        title_x = (w - len(title) * 6 * 4.0) * 0.5
+        renderer._append_text(text_verts, title_x, h * 0.68, title, (240, 220, 180), pixel_size=4.0)
+        subtitle = "Press ENTER to start"
+        subtitle_x = (w - len(subtitle) * 6 * 2.5) * 0.5
+        renderer._append_text(text_verts, subtitle_x, h * 0.52, subtitle, (200, 205, 215), pixel_size=2.5)
+        hint = "O: Options   ESC: Quit"
+        hint_x = (w - len(hint) * 6 * 2.0) * 0.5
+        renderer._append_text(text_verts, hint_x, h * 0.36, hint, (150, 155, 165), pixel_size=2.0)
+        renderer._flush_overlay(bg_verts)
+        renderer._flush_overlay(text_verts)
 
     def on_key_press(self, symbol: int, modifiers: int) -> None:
         if symbol == key.O:
@@ -84,25 +84,56 @@ class GameScreen(BaseScreen):
     def on_draw(self) -> None:
         if self.app.world is None:
             return
-        self.app.ctx.clear(0.04, 0.05, 0.07, 1.0)
-        cam_x = self.app.world.camera_x
-        cam_y = self.app.world.camera_y
-        self.app.renderer.draw(
-            self.app.world,
-            self.app.hero,
-            cam_x,
-            cam_y,
-            self.app.view_mode,
-            dt=self.app._last_dt,
-            enemies=self.app.enemies,
-            projectiles=self.app.projectiles,
-        )
+        if bool(getattr(self.app, "gpu_owner_active", False)):
+            return
+        self.app.clear_screen()
+        status_fn = getattr(self.app, "gpu_world_status_snapshot", None)
+        world_status = status_fn(block=False) if callable(status_fn) else None
+        camera = None if world_status is None else world_status.get("camera")
+        if camera is not None:
+            cam_x = int(camera[0])
+            cam_y = int(camera[1])
+        else:
+            cam_x = self.app.world.camera_x
+            cam_y = self.app.world.camera_y
+        frame_payload = None
+        frame_fn = getattr(self.app, "gpu_frame_payload_snapshot", None)
+        if callable(frame_fn):
+            frame_payload = frame_fn()
+        owner_active = bool(getattr(self.app, "gpu_owner_active", False))
+        world_started_at = perf_counter()
+        if not owner_active or frame_payload is not None:
+            self.app.renderer.draw(
+                self.app.world,
+                self.app.hero,
+                cam_x,
+                cam_y,
+                self.app.view_mode,
+                dt=self.app._last_dt,
+                enemies=self.app.enemies,
+                projectiles=self.app.projectiles,
+                frame_payload=frame_payload,
+            )
+        world_finished_at = perf_counter()
+        self.app._set_perf_ms("draw_world", (world_finished_at - world_started_at) * 1000.0)
         if self.app.debug_overlay_enabled:
+            overlay_started_at = perf_counter()
             self.app.renderer.draw_perf_overlay(self.app)
+            overlay_finished_at = perf_counter()
+            self.app._set_perf_ms("draw_debug_overlay", (overlay_finished_at - overlay_started_at) * 1000.0)
+        else:
+            self.app._set_perf_ms("draw_debug_overlay", 0.0)
         if self.app.entity_manager.debug_collision:
             debug = self.app.entity_manager.last_debug
             if debug is not None:
+                collision_started_at = perf_counter()
                 self.app.renderer.draw_debug_collision(cam_x, cam_y, debug)
+                collision_finished_at = perf_counter()
+                self.app._set_perf_ms("draw_collision_overlay", (collision_finished_at - collision_started_at) * 1000.0)
+            else:
+                self.app._set_perf_ms("draw_collision_overlay", 0.0)
+        else:
+            self.app._set_perf_ms("draw_collision_overlay", 0.0)
         if self.show_console:
             self.console.draw()
 
@@ -123,7 +154,7 @@ class GameScreen(BaseScreen):
         self.app.update_game(dt)
 
 
-CELL_SCALE_OPTIONS = [4, 6, 8]
+CELL_SCALE_OPTIONS = list(cfg.CELL_SCALE_OPTIONS)
 
 class OptionsScreen(BaseScreen):
     """Options screen with seed input and cell scale selection."""
@@ -131,41 +162,34 @@ class OptionsScreen(BaseScreen):
     def __init__(self, app: "GameApp") -> None:
         super().__init__(app)
         self._scale_idx = CELL_SCALE_OPTIONS.index(cfg.CELL_SCALE) if cfg.CELL_SCALE in CELL_SCALE_OPTIONS else 0
-        self.title_label = pyglet.text.Label(
-            "Options", font_size=28, x=app.width // 2, y=app.height * 0.8,
-            anchor_x="center", anchor_y="center", color=(240, 220, 180, 255),
-        )
-        self.seed_label = pyglet.text.Label(
-            f"Seed: {app.seed}", font_size=14, x=app.width // 2, y=app.height * 0.5,
-            anchor_x="center", anchor_y="center", color=(200, 200, 200, 255),
-        )
-        self.scale_label = pyglet.text.Label(
-            font_size=14, x=app.width // 2, y=app.height * 0.4,
-            anchor_x="center", anchor_y="center", color=(200, 200, 200, 255),
-        )
-        self.controls_label = pyglet.text.Label(
-            "WASD: Move  SPACE: Chant  1-8: Select spell  C: Console",
-            font_size=10, x=app.width // 2, y=app.height * 0.3,
-            anchor_x="center", anchor_y="center", color=(160, 160, 160, 255),
-        )
-        self.back_hint = pyglet.text.Label(
-            "ESC: Back  LEFT/RIGHT: Change cell scale",
-            font_size=12, x=app.width // 2, y=app.height * 0.2,
-            anchor_x="center", anchor_y="center", color=(140, 140, 140, 255),
-        )
+        self._scale_text = ""
         self._update_labels()
 
     def _update_labels(self) -> None:
         scale = CELL_SCALE_OPTIONS[self._scale_idx]
-        self.scale_label.text = f"Cell Scale: {scale}  (LEFT/RIGHT to change)"
+        self._scale_text = f"Cell Scale: {scale}"
 
     def on_draw(self) -> None:
-        self.app.ctx.clear(0.04, 0.05, 0.07, 1.0)
-        self.title_label.draw()
-        self.seed_label.draw()
-        self.scale_label.draw()
-        self.controls_label.draw()
-        self.back_hint.draw()
+        self.app.clear_screen()
+        renderer = self.app.renderer
+        w = float(self.app.width)
+        h = float(self.app.height)
+        from array import array as _array
+        bg_verts = _array("f")
+        text_verts = _array("f")
+        renderer._append_rect(bg_verts, w * 0.14, h * 0.12, w * 0.86, h * 0.86, (10, 12, 16), opacity=215)
+        renderer._append_rect(bg_verts, w * 0.16, h * 0.14, w * 0.84, h * 0.84, (20, 24, 30), opacity=225)
+        title = "Options"
+        renderer._append_text(text_verts, (w - len(title) * 6 * 3.5) * 0.5, h * 0.74, title, (240, 220, 180), pixel_size=3.5)
+        seed_text = f"Seed: {self.app.seed}"
+        renderer._append_text(text_verts, (w - len(seed_text) * 6 * 2.5) * 0.5, h * 0.58, seed_text, (210, 210, 210), pixel_size=2.5)
+        renderer._append_text(text_verts, (w - len(self._scale_text) * 6 * 2.5) * 0.5, h * 0.48, self._scale_text, (210, 210, 210), pixel_size=2.5)
+        controls = "WASD Move  SPACE Chant  1-8 Spell  C Console"
+        renderer._append_text(text_verts, (w - len(controls) * 6 * 1.7) * 0.5, h * 0.34, controls, (170, 170, 170), pixel_size=1.7)
+        hint = "LEFT/RIGHT Change Scale   ESC Back"
+        renderer._append_text(text_verts, (w - len(hint) * 6 * 2.0) * 0.5, h * 0.24, hint, (150, 150, 160), pixel_size=2.0)
+        renderer._flush_overlay(bg_verts)
+        renderer._flush_overlay(text_verts)
 
     def on_key_press(self, symbol: int, modifiers: int) -> None:
         if symbol == key.ESCAPE:
@@ -236,7 +260,7 @@ class ConsoleOverlay:
             enemy = EnemyA.create(eid, sx, sy, "plains")
         self.app.enemies[eid] = enemy
         self.app.entity_manager.register_enemy(enemy)
-        self.app.entity_manager.register_entity_shapes(self.app.world)
+        self.app._submit_gpu_entity_shape_registration()
 
     def _heal(self, amount: float) -> None:
         self.app.hero.heal(amount)

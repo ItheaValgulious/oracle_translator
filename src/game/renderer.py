@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 import moderngl
 
+from src.engine.gpu_owner import GpuFramePayload
 from src.engine.render import DebugViewMode
 from src.game import config as cfg
 from src.game.animation import AnimationManager, SimpleSpriteBatch
@@ -146,6 +147,14 @@ class GameRenderer:
         self._fps_label_updated_at = 0.0
         self._fps_label_update_interval = 0.25
         self._fps_text = ""
+        self._fps_overlay_bytes = b""
+        self._fps_overlay_vertex_count = 0
+        self._perf_overlay_updated_at = 0.0
+        self._perf_overlay_update_interval = 0.25
+        self._perf_overlay_bg_bytes = b""
+        self._perf_overlay_bg_vertex_count = 0
+        self._perf_overlay_text_bytes = b""
+        self._perf_overlay_text_vertex_count = 0
 
         # Shader for grid rendering (full-screen quad)
         vertex_shader = """
@@ -350,12 +359,10 @@ class GameRenderer:
             cx += char_spacing
         return cx
 
-    def _flush_overlay(self, vertices: array, mode: int = moderngl.TRIANGLES) -> None:
-        """Upload and render accumulated overlay vertices."""
-        if not vertices:
+    def _flush_overlay_bytes(self, data: bytes, *, count: int, mode: int = moderngl.TRIANGLES) -> None:
+        """Upload and render prebuilt overlay bytes."""
+        if not data or count <= 0:
             return
-        data = vertices.tobytes()
-        count = len(vertices) // 6
         if self._overlay_vbo is None or len(data) > self._overlay_capacity_bytes:
             self._overlay_capacity_bytes = max(4096, len(data) * 2)
             self._overlay_vbo = self.ctx.buffer(reserve=self._overlay_capacity_bytes)
@@ -364,9 +371,22 @@ class GameRenderer:
                 [(self._overlay_vbo, "2f 4f", "in_pos", "in_color")],
             )
         self._overlay_vbo.write(data)
+        self.ctx.viewport = (0, 0, int(self.window_width), int(self.window_height))
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self.ctx.disable(moderngl.CULL_FACE)
         self.ctx.enable(moderngl.BLEND)
+        try:
+            self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        except Exception:
+            pass
         if self._overlay_vao is not None:
             self._overlay_vao.render(mode, vertices=count)
+
+    def _flush_overlay(self, vertices: array, mode: int = moderngl.TRIANGLES) -> None:
+        """Upload and render accumulated overlay vertices."""
+        if not vertices:
+            return
+        self._flush_overlay_bytes(vertices.tobytes(), count=len(vertices) // 6, mode=mode)
 
     # ── Grid ───────────────────────────────────────────────────────
 
@@ -387,10 +407,34 @@ class GameRenderer:
         self._texture = tex
         return tex
 
+    def render_frame_payload(self, payload: GpuFramePayload) -> moderngl.Texture:
+        """Upload an owner-rendered RGBA frame into the display context."""
+        size = (int(payload.width), int(payload.height))
+        if self._texture is not None and self._texture.size == size:
+            self._texture.write(payload.rgba)
+            tex = self._texture
+        else:
+            tex = self.ctx.texture(size, 4, payload.rgba)
+            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            tex.repeat_x = False
+            tex.repeat_y = False
+        self._texture = tex
+        return tex
+
     def draw_grid(self, world, view_mode: DebugViewMode) -> None:
         """Draw the world grid as a fullscreen quad."""
         tex = self.render_frame(world, view_mode)
         origin_x, origin_y, scale_x, scale_y = world.visible_uv_rect()
+        self.program["view_uv_origin"].value = (origin_x, origin_y)
+        self.program["view_uv_scale"].value = (scale_x, scale_y)
+        tex.use(location=0)
+        self.program["frame_tex"].value = 0
+        self.vao.render(moderngl.TRIANGLE_STRIP)
+
+    def draw_grid_payload(self, payload: GpuFramePayload) -> None:
+        """Draw a world grid frame produced by the GPU owner thread."""
+        tex = self.render_frame_payload(payload)
+        origin_x, origin_y, scale_x, scale_y = payload.uv_rect
         self.program["view_uv_origin"].value = (origin_x, origin_y)
         self.program["view_uv_scale"].value = (scale_x, scale_y)
         tex.use(location=0)
@@ -403,7 +447,7 @@ class GameRenderer:
         """Draw the hero rectangle."""
         cs = cfg.CELL_SCALE
         sx = (hero.left - camera_x) * cs
-        sy = self.window_height - (hero.top - camera_y) * cs - cs
+        sy = self.window_height - (hero.top - camera_y) * cs
         w = hero.width * cs
         h = hero.height * cs
         color: tuple[int, int, int] = (200, 60, 40)
@@ -428,24 +472,26 @@ class GameRenderer:
             if not enemy.is_alive:
                 continue
             sx = (enemy.left - camera_x) * cs
-            sy = self.window_height - (enemy.top - camera_y) * cs - cs
+            sy = self.window_height - (enemy.top - camera_y) * cs
             w = enemy.width * cs
             h = enemy.height * cs
             color: tuple[int, int, int] = (50, 100, 220)
-            if isinstance(enemy, EnemyB):
+            enemy_kind = str(getattr(enemy, "kind", type(enemy).__name__))
+            if isinstance(enemy, EnemyB) or enemy_kind == "EnemyB":
                 color = (160, 40, 200)
-            elif isinstance(enemy, EnemyC):
+            elif isinstance(enemy, EnemyC) or enemy_kind == "EnemyC":
                 color = (220, 30, 30)
             if enemy.damage_flash_timer > 0.0:
                 color = (255, 255, 255)
             self._append_rect(verts, sx, sy, sx + w, sy + h, color)
             # Boss HP bar
-            if isinstance(enemy, EnemyC):
+            if isinstance(enemy, EnemyC) or enemy_kind == "EnemyC":
                 bar_w = w * 0.8
                 bar_h = cs * 2
                 bar_x = sx + w * 0.1
                 bar_y = sy - bar_h - 2
-                hp_ratio = enemy.hp / enemy.max_hp
+                max_hp = max(1.0, float(getattr(enemy, "max_hp", enemy.hp or 1.0)))
+                hp_ratio = enemy.hp / max_hp
                 self._append_rect(verts, bar_x, bar_y, bar_x + bar_w, bar_y + bar_h, (60, 0, 0))
                 self._append_rect(verts, bar_x, bar_y, bar_x + bar_w * hp_ratio, bar_y + bar_h, (200, 30, 30))
         self._flush_overlay(verts)
@@ -459,7 +505,8 @@ class GameRenderer:
                 continue
             sx = (p.x - camera_x) * cs
             sy = self.window_height - (p.y - camera_y) * cs - cs
-            if isinstance(p, Arrow):
+            projectile_kind = str(getattr(p, "kind", type(p).__name__))
+            if isinstance(p, Arrow) or projectile_kind == "Arrow":
                 # Fixed 2x2 cell arrow, oriented by velocity direction
                 arrow_cs = cs * 2
                 self._append_rect(
@@ -468,7 +515,7 @@ class GameRenderer:
                     sx + arrow_cs * 0.5, sy + arrow_cs * 0.5,
                     (180, 120, 60), opacity=220,
                 )
-            elif isinstance(p, Fireball):
+            elif isinstance(p, Fireball) or projectile_kind == "Fireball":
                 self._append_circle(verts, sx, sy, cs * 2, (255, 140, 0))
         self._flush_overlay(verts)
 
@@ -565,11 +612,22 @@ class GameRenderer:
             else:
                 self._fps_text = f"R:-- S:{sim_fps:.0f}"
             self._fps_label_updated_at = now
-        if self._fps_text:
             verts = array("f")
-            self._append_text(verts, 10.0, float(self.window_height) - 20.0,
-                              self._fps_text, (255, 255, 0), pixel_size=3.0)
-            self._flush_overlay(verts)
+            self._append_text(
+                verts,
+                10.0,
+                float(self.window_height) - 20.0,
+                self._fps_text,
+                (255, 255, 0),
+                pixel_size=3.0,
+            )
+            self._fps_overlay_bytes = verts.tobytes()
+            self._fps_overlay_vertex_count = len(verts) // 6
+        if self._fps_text:
+            self._flush_overlay_bytes(
+                self._fps_overlay_bytes,
+                count=self._fps_overlay_vertex_count,
+            )
 
     def draw_perf_overlay(self, app) -> None:
         """Draw a compact multi-line perf overlay.
@@ -581,72 +639,134 @@ class GameRenderer:
         if world is None:
             return
         self.draw_fps(app.sim_fps)
-        chunk_stats = world.chunk_cache.snapshot_stats()
-        perf = app.debug_perf_snapshot()
-        lines = [
-            (
-                "Main "
-                f"tick {perf['main_tick_total_last_ms']:.1f}/{perf['main_tick_total_avg_ms']:.1f} ms "
-                f"sim {perf['main_tick_sim_last_ms']:.1f}/{perf['main_tick_sim_avg_ms']:.1f} "
-                f"cam {perf['main_tick_camera_last_ms']:.1f}/{perf['main_tick_camera_avg_ms']:.1f} "
-                f"io {perf['main_tick_background_io_last_ms']:.1f}/{perf['main_tick_background_io_avg_ms']:.1f}"
-            ),
-            (
-                "Sim "
-                f"upd {perf['update_game_total_last_ms']:.1f}/{perf['update_game_total_avg_ms']:.1f} ms "
-                f"poll {perf['update_game_poll_last_ms']:.1f}/{perf['update_game_poll_avg_ms']:.1f} "
-                f"sched {perf['update_game_schedule_feedback_last_ms']:.1f}/{perf['update_game_schedule_feedback_avg_ms']:.1f}"
-            ),
-            (
-                "CPU submit "
-                f"step {perf['update_game_world_step_submit_last_ms']:.1f}/{perf['update_game_world_step_submit_avg_ms']:.1f} ms "
-                f"snap {perf['update_game_snapshot_last_ms']:.1f}/{perf['update_game_snapshot_avg_ms']:.1f} "
-                f"clear {perf['update_game_ctx_clear_last_ms']:.1f}/{perf['update_game_ctx_clear_avg_ms']:.1f}"
-            ),
-            (
-                "Paging "
-                f"shift {world.shift_time_last_ms():.1f} ms "
-                f"in {world.incoming_load_time_last_ms():.1f} "
-                f"ov {world.overlap_copy_time_last_ms():.1f} "
-                f"ev {world.stage_time_last_ms():.1f} "
-                f"anc {world.anchor_build_time_last_ms():.1f}+{world.anchor_upload_time_last_ms():.1f}"
-            ),
-            (
-                "Shift chunks "
-                f"cache {world.paging_stats.last_shift_cache_hits} "
-                f"empty {world.paging_stats.last_shift_empty_hits} "
-                f"wait {world.paging_stats.last_shift_inflight_wait_hits} "
-                f"load {world.paging_stats.last_shift_disk_loads}/{world.paging_stats.last_shift_disk_load_seconds * 1000.0:.1f} ms "
-                f"gen {world.paging_stats.last_shift_generates}/{world.paging_stats.last_shift_generate_seconds * 1000.0:.1f} ms "
-                f"save {world.paging_stats.last_shift_saves}/{world.paging_stats.last_shift_save_seconds * 1000.0:.1f} ms"
-            ),
-            (
-                "Chunk totals "
-                f"load {chunk_stats.disk_load_count}/{chunk_stats.disk_load_total_seconds * 1000.0:.1f} ms "
-                f"gen {chunk_stats.generate_count}/{chunk_stats.generate_total_seconds * 1000.0:.1f} ms "
-                f"save {chunk_stats.save_count}/{chunk_stats.save_total_seconds * 1000.0:.1f} ms "
-                f"cached {chunk_stats.cached_chunks} inflight {chunk_stats.prefetch_inflight} queued {chunk_stats.prefetch_queued}"
-            ),
-            "F3 perf overlay, F6 collision samples, F4 temp view, F5 pressure view",
-        ]
-        bg = array("f")
-        text = array("f")
-        line_h = 18.0
-        top = float(self.window_height) - 44.0
-        max_chars = max(len(line) for line in lines)
-        panel_w = min(float(self.window_width) - 12.0, 10.0 + max_chars * 12.0)
-        panel_h = 10.0 + len(lines) * line_h
-        self._append_rect(bg, 6.0, top - panel_h + 6.0, 6.0 + panel_w, top + 12.0, (0, 0, 0), opacity=180)
-        for idx, line in enumerate(lines):
-            y = top - idx * line_h
-            self._append_text(text, 12.0, y, line, (255, 230, 120), pixel_size=2.0)
-        self._flush_overlay(bg)
-        self._flush_overlay(text)
+        now = perf_counter()
+        if now - self._perf_overlay_updated_at >= self._perf_overlay_update_interval:
+            status_fn = getattr(app, "gpu_world_status_snapshot", None)
+            world_status = status_fn(block=False) if callable(status_fn) else None
+            chunk_status = dict((world_status or {}).get("chunk") or {})
+            paging_status = dict((world_status or {}).get("paging") or {})
+            chunk_stats = None if chunk_status else world.chunk_cache.snapshot_stats()
+            def _paging_value(name: str, fallback):
+                if name in paging_status:
+                    return paging_status[name]
+                return fallback()
+            def _chunk_value(name: str, fallback):
+                if name in chunk_status:
+                    return chunk_status[name]
+                return fallback()
+            perf = app.debug_perf_snapshot()
+            lines = [
+                (
+                    "Main "
+                    f"tick {perf['main_tick_total_last_ms']:.1f}/{perf['main_tick_total_avg_ms']:.1f} ms "
+                    f"sim {perf['main_tick_sim_last_ms']:.1f}/{perf['main_tick_sim_avg_ms']:.1f} "
+                    f"cam {perf['main_tick_camera_last_ms']:.1f}/{perf['main_tick_camera_avg_ms']:.1f} "
+                    f"io {perf['main_tick_background_io_last_ms']:.1f}/{perf['main_tick_background_io_avg_ms']:.1f}"
+                ),
+                (
+                    "Draw "
+                    f"total {perf['draw_total_last_ms']:.1f}/{perf['draw_total_avg_ms']:.1f} ms "
+                    f"world {perf['draw_world_last_ms']:.1f}/{perf['draw_world_avg_ms']:.1f} "
+                    f"dbg {perf['draw_debug_overlay_last_ms']:.1f}/{perf['draw_debug_overlay_avg_ms']:.1f}"
+                ),
+                (
+                    "Sim "
+                    f"upd {perf['update_game_total_last_ms']:.1f}/{perf['update_game_total_avg_ms']:.1f} ms "
+                    f"poll {perf['update_game_poll_last_ms']:.1f}/{perf['update_game_poll_avg_ms']:.1f} "
+                    f"sched {perf['update_game_schedule_feedback_last_ms']:.1f}/{perf['update_game_schedule_feedback_avg_ms']:.1f} "
+                    f"gpu {app.gpu_tick_rate:.0f}/s"
+                ),
+                (
+                    "CPU submit "
+                    f"step {perf['update_game_world_step_submit_last_ms']:.1f}/{perf['update_game_world_step_submit_avg_ms']:.1f} ms "
+                    f"snap {perf['snapshot_submit_last_ms']:.1f}/{perf['snapshot_ready_to_consume_delay_last_ms']:.1f} "
+                    f"q/p {int(perf['snapshot_queued_request_count'])}/{int(perf['snapshot_pending_token_count'])} "
+                    f"stream {perf['update_game_streams_last_ms']:.1f}/{perf['update_game_streams_avg_ms']:.1f}"
+                ),
+                (
+                    "GPU cmd "
+                    f"mut {perf['gpu_world_mutation_flush_last_ms']:.1f}/{perf['gpu_world_mutation_flush_avg_ms']:.1f} ms "
+                    f"post {perf['update_game_post_step_gpu_mutations_last_ms']:.1f}/{perf['update_game_post_step_gpu_mutations_avg_ms']:.1f} "
+                    f"pending {int(perf['gpu_world_mutation_pending'])} "
+                    f"flushed {int(perf['gpu_world_mutation_last_flush_count'])}"
+                ),
+                (
+                    "Actors "
+                    f"ai {perf['update_game_enemy_ai_last_ms']:.1f}/{perf['update_game_enemy_ai_avg_ms']:.1f} "
+                    f"proj {perf['update_game_projectiles_last_ms']:.1f}/{perf['update_game_projectiles_avg_ms']:.1f} "
+                    f"clean {perf['update_game_cleanup_last_ms']:.1f}/{perf['update_game_cleanup_avg_ms']:.1f}"
+                ),
+                (
+                    "Paging "
+                    f"shift {float(_paging_value('shift_ms', world.shift_time_last_ms)):.1f} ms "
+                    f"in {float(_paging_value('incoming_load_ms', world.incoming_load_time_last_ms)):.1f} "
+                    f"ov {float(_paging_value('overlap_ms', world.overlap_copy_time_last_ms)):.1f} "
+                    f"ev {float(_paging_value('evict_stage_ms', world.stage_time_last_ms)):.1f} "
+                    f"anc {float(_paging_value('anchor_build_ms', world.anchor_build_time_last_ms)):.1f}+{float(_paging_value('anchor_upload_ms', world.anchor_upload_time_last_ms)):.1f}"
+                ),
+                (
+                    "Shift chunks "
+                    f"cache {int(_paging_value('last_shift_cache_hits', lambda: world.paging_stats.last_shift_cache_hits))} "
+                    f"empty {int(_paging_value('last_shift_empty_hits', lambda: world.paging_stats.last_shift_empty_hits))} "
+                    f"wait {int(_paging_value('last_shift_inflight_wait_hits', lambda: world.paging_stats.last_shift_inflight_wait_hits))} "
+                    f"load {int(_paging_value('last_shift_disk_loads', lambda: world.paging_stats.last_shift_disk_loads))}/{float(_paging_value('last_shift_disk_load_ms', lambda: world.paging_stats.last_shift_disk_load_seconds * 1000.0)):.1f} ms "
+                    f"gen {int(_paging_value('last_shift_generates', lambda: world.paging_stats.last_shift_generates))}/{float(_paging_value('last_shift_generate_ms', lambda: world.paging_stats.last_shift_generate_seconds * 1000.0)):.1f} ms "
+                    f"save {int(_paging_value('last_shift_saves', lambda: world.paging_stats.last_shift_saves))}/{float(_paging_value('last_shift_save_ms', lambda: world.paging_stats.last_shift_save_seconds * 1000.0)):.1f} ms"
+                ),
+                (
+                    "Chunk totals "
+                    f"load {int(_chunk_value('disk_load_count', lambda: chunk_stats.disk_load_count))}/{float(_chunk_value('disk_load_total_ms', lambda: chunk_stats.disk_load_total_seconds * 1000.0)):.1f} ms "
+                    f"gen {int(_chunk_value('generate_count', lambda: chunk_stats.generate_count))}/{float(_chunk_value('generate_total_ms', lambda: chunk_stats.generate_total_seconds * 1000.0)):.1f} ms "
+                    f"save {int(_chunk_value('save_count', lambda: chunk_stats.save_count))}/{float(_chunk_value('save_total_ms', lambda: chunk_stats.save_total_seconds * 1000.0)):.1f} ms "
+                    f"cached {int(_chunk_value('cached', lambda: chunk_stats.cached_chunks))} inflight {int(_chunk_value('prefetch_inflight', lambda: chunk_stats.prefetch_inflight))} "
+                    f"queued {int(_chunk_value('prefetch_queued', lambda: chunk_stats.prefetch_queued))} patch {int(_paging_value('active_chunk_patch_queue_depth', lambda: world.active_chunk_patch_queue_depth))} "
+                    f"sync {int(_chunk_value('sync_blocking_fetch', lambda: chunk_stats.sync_blocking_fetch_count))}"
+                ),
+                "F3 perf overlay, F6 collision samples, F4 temp view, F5 pressure view",
+            ]
+            bg = array("f")
+            text = array("f")
+            line_h = 18.0
+            top = float(self.window_height) - 44.0
+            max_chars = max(len(line) for line in lines)
+            panel_w = min(float(self.window_width) - 12.0, 10.0 + max_chars * 12.0)
+            panel_h = 10.0 + len(lines) * line_h
+            self._append_rect(bg, 6.0, top - panel_h + 6.0, 6.0 + panel_w, top + 12.0, (0, 0, 0), opacity=180)
+            for idx, line in enumerate(lines):
+                y = top - idx * line_h
+                self._append_text(text, 12.0, y, line, (255, 230, 120), pixel_size=2.0)
+            self._perf_overlay_bg_bytes = bg.tobytes()
+            self._perf_overlay_bg_vertex_count = len(bg) // 6
+            self._perf_overlay_text_bytes = text.tobytes()
+            self._perf_overlay_text_vertex_count = len(text) // 6
+            self._perf_overlay_updated_at = now
+        self._flush_overlay_bytes(
+            self._perf_overlay_bg_bytes,
+            count=self._perf_overlay_bg_vertex_count,
+        )
+        self._flush_overlay_bytes(
+            self._perf_overlay_text_bytes,
+            count=self._perf_overlay_text_vertex_count,
+        )
 
-    def draw(self, world, hero: Hero, camera_x: int, camera_y: int, view_mode: DebugViewMode, dt: float = 1.0 / 60.0, enemies: dict | None = None, projectiles: list | None = None) -> None:
+    def draw(
+        self,
+        world,
+        hero: Hero,
+        camera_x: int,
+        camera_y: int,
+        view_mode: DebugViewMode,
+        dt: float = 1.0 / 60.0,
+        enemies: dict | None = None,
+        projectiles: list | None = None,
+        frame_payload: GpuFramePayload | None = None,
+    ) -> None:
         """Full render pass."""
         self._record_render_fps()
-        self.draw_grid(world, view_mode)
+        if frame_payload is not None:
+            self.draw_grid_payload(frame_payload)
+        else:
+            self.draw_grid(world, view_mode)
         self.draw_hero(hero, camera_x, camera_y, dt)
         if enemies is not None:
             self.draw_enemies(enemies, camera_x, camera_y)

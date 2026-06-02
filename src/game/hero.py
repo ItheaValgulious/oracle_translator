@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 
 from src.game import config as cfg
+from src.engine.snapshot_collision import SnapshotCollisionProbe, build_probe_for_envelope
 
 log = logging.getLogger(__name__)
 
@@ -363,8 +364,30 @@ def feedback_from_snapshot(
     height: float,
     world_width: float,
 ) -> GridFeedback:
-    feedback = GridFeedback(world_width=world_width)
     if snapshot is None:
+        return GridFeedback(world_width=world_width)
+    return feedback_from_snapshot_probe(
+        probe=build_probe_for_envelope(snapshot),
+        center_x=center_x,
+        bottom_y=bottom_y,
+        width=width,
+        height=height,
+        world_width=world_width,
+    )
+
+
+def feedback_from_snapshot_probe(
+    *,
+    probe: SnapshotCollisionProbe | None,
+    center_x: float,
+    bottom_y: float,
+    width: float,
+    height: float,
+    world_width: float,
+) -> GridFeedback:
+    """Phase 8: snapshot-driven collision using SnapshotCollisionProbe."""
+    feedback = GridFeedback(world_width=world_width)
+    if probe is None:
         return feedback
 
     left = int(center_x - width / 2.0)
@@ -376,16 +399,20 @@ def feedback_from_snapshot(
     left_wall_x = left - 1
     right_wall_x = right + 1
 
-    feedback.blocked_below = any(_solid_cell(snapshot, x, foot_y) for x in range(left, right + 1))
-    feedback.blocked_up = any(_solid_cell(snapshot, x, head_y) for x in range(left, right + 1))
-    feedback.blocked_left = any(_solid_cell(snapshot, left_wall_x, y) for y in range(bottom, top + 1))
-    feedback.blocked_right = any(_solid_cell(snapshot, right_wall_x, y) for y in range(bottom, top + 1))
+    feedback.blocked_below = any(probe.is_solid(x, foot_y) for x in range(left, right + 1))
+    feedback.blocked_up = any(probe.is_solid(x, head_y) for x in range(left, right + 1))
+    feedback.blocked_left = any(probe.is_solid(left_wall_x, y) for y in range(bottom, top + 1))
+    feedback.blocked_right = any(probe.is_solid(right_wall_x, y) for y in range(bottom, top + 1))
 
     clearance_y = max(bottom, top - 1)
-    feedback.blocked_left_ahead = _solid_cell(snapshot, left_wall_x, top)
-    feedback.blocked_right_ahead = _solid_cell(snapshot, right_wall_x, top)
+    left_step_foot = probe.is_solid(left_wall_x, top)
+    right_step_foot = probe.is_solid(right_wall_x, top)
+    left_step_clearance_blocked = probe.is_solid(left_wall_x, clearance_y)
+    right_step_clearance_blocked = probe.is_solid(right_wall_x, clearance_y)
+    feedback.blocked_left_ahead = left_step_foot and not left_step_clearance_blocked
+    feedback.blocked_right_ahead = right_step_foot and not right_step_clearance_blocked
     feedback.embedded = any(
-        _solid_cell(snapshot, x, y)
+        probe.is_solid(x, y)
         for x in range(left, right + 1)
         for y in (top, clearance_y)
     )
@@ -394,26 +421,27 @@ def feedback_from_snapshot(
     in_liquid = False
     for x in range(left, right + 1):
         for y in range(bottom, top + 1):
-            family_id = snapshot.family_id_at_world(x, y)
+            family_id = probe.family_at(x, y)
             if family_id is None or family_id == "empty":
                 continue
-            temperature = snapshot.temperature_at_world(x, y)
             if family_id in {"water", "tar", "acid", "magic_acid", "poison"}:
                 in_liquid = True
             if family_id in {"fire", "acid", "magic_acid"}:
                 hazard += 0.1
-            velocity = snapshot.velocity_at_world(x, y)
+            velocity = probe.velocity_at(x, y)
             if velocity is not None:
                 vel_x, vel_y = velocity
                 speed = abs(vel_x) + abs(vel_y)
                 if speed >= 30.0:
                     hazard += min(0.18, (speed - 30.0) * 0.0015)
+            temperature = probe.temperature_at(x, y)
             if temperature is None:
                 continue
             if temperature >= 80.0:
                 hazard += min(0.24, (temperature - 80.0) * 0.00045)
             if temperature <= -35.0:
                 hazard += min(0.12, (-35.0 - temperature) * 0.00018)
+
     feedback.in_liquid = in_liquid
     feedback.damage = min(0.35, hazard)
     return feedback

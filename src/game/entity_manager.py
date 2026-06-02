@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from src.engine.gpu_backend import FeedbackQueryPoint, GpuFeedbackBatchToken, _same_feedback_token
+from src.engine.snapshot_mailbox import SnapshotMailboxRegistry
 from src.engine.world import ActiveWorldWindow
 from src.game.enemy import EnemyBase
 from src.game.hero import Hero, GridFeedback, LocalCellSnapshot, feedback_from_snapshot
@@ -114,6 +115,48 @@ def _sample_span(start: int, stop: int, max_count: int) -> list[int]:
     return values
 
 
+def _coerce_local_snapshot(snapshot: object, *, entity_id: str | None = None, age_frames: int = 0) -> LocalCellSnapshot | None:
+    if isinstance(snapshot, LocalCellSnapshot):
+        snapshot.age_frames = int(age_frames)
+        return snapshot
+    origin_x = getattr(snapshot, "origin_x", getattr(snapshot, "world_x", None))
+    origin_y = getattr(snapshot, "origin_y", getattr(snapshot, "world_y", None))
+    width = getattr(snapshot, "width", None)
+    height = getattr(snapshot, "height", None)
+    variant_indices = getattr(snapshot, "variant_indices", None)
+    velocities = getattr(snapshot, "velocities", None)
+    temperatures = getattr(snapshot, "temperatures", None)
+    variant_families = getattr(snapshot, "variant_families", None)
+    empty_variant_index = getattr(snapshot, "empty_variant_index", None)
+    tick_id = getattr(snapshot, "tick_id", getattr(snapshot, "issued_step", 0))
+    if any(value is None for value in (
+        origin_x,
+        origin_y,
+        width,
+        height,
+        variant_indices,
+        velocities,
+        temperatures,
+        variant_families,
+        empty_variant_index,
+    )):
+        return None
+    return LocalCellSnapshot(
+        entity_id=str(getattr(snapshot, "entity_id", entity_id or "")),
+        origin_x=int(origin_x),
+        origin_y=int(origin_y),
+        width=int(width),
+        height=int(height),
+        variant_indices=variant_indices,
+        velocities=velocities,
+        temperatures=temperatures,
+        variant_families=variant_families,
+        empty_variant_index=int(empty_variant_index),
+        tick_id=int(tick_id or 0),
+        age_frames=int(age_frames),
+    )
+
+
 @dataclass
 class EntityManager:
     """Manages entity lifecycle, GPU occupancy mask, and local snapshots."""
@@ -126,6 +169,7 @@ class EntityManager:
     _pending_feedback_tokens: deque[GpuFeedbackBatchToken] = field(default_factory=deque)
     debug_collision: bool = False
     last_debug: DebugCollisionInfo | None = None
+    _snapshot_registry: SnapshotMailboxRegistry = field(default_factory=SnapshotMailboxRegistry)
 
     def register_entity(self, entity: Entity, world: ActiveWorldWindow | None = None) -> None:
         self._entities[entity.entity_id] = entity
@@ -136,6 +180,7 @@ class EntityManager:
         self._entities.pop(entity_id, None)
         self._last_feedback.pop(entity_id, None)
         self._latest_snapshots.pop(entity_id, None)
+        self._snapshot_registry.drop(entity_id)
 
     def register_enemy(self, enemy: EnemyBase) -> None:
         self._enemies[enemy.entity_id] = enemy
@@ -154,8 +199,14 @@ class EntityManager:
     def register_entity_shapes(self, world: ActiveWorldWindow) -> None:
         if world.gpu_simulator is None:
             return
-        for entity in self._entities.values():
-            world.gpu_simulator.register_entity_shape(entity.entity_id, int(entity.width), int(entity.height))
+        for entity_id, width, height in self.entity_shape_payloads():
+            world.gpu_simulator.register_entity_shape(entity_id, width, height)
+
+    def entity_shape_payloads(self) -> list[tuple[str, int, int]]:
+        return [
+            (entity.entity_id, int(entity.width), int(entity.height))
+            for entity in self._entities.values()
+        ]
 
     def _build_query_points(
         self,
@@ -244,17 +295,31 @@ class EntityManager:
     def update_gpu_entity_mask(self, world: ActiveWorldWindow) -> None:
         if world.gpu_simulator is None:
             return
+        rects = self.entity_mask_payload(world)
+        world.gpu_simulator.update_entity_mask(rects)
+
+    def entity_mask_payload(self, world: ActiveWorldWindow) -> list[tuple[int, int, int, int, int]]:
         rects: list[tuple[int, int, int, int, int]] = []
         for entity in self._entities.values():
             clip = _clipped_local_rect(world, entity)
             if clip is None:
                 continue
             rects.append((*clip, _entity_tag(entity.entity_id)))
-        world.gpu_simulator.update_entity_mask(rects)
+        return rects
 
     def _upload_entity_states(self, world: ActiveWorldWindow) -> None:
         if world.gpu_simulator is None:
             return
+        states = self.entity_state_payload(world)
+        if states:
+            world.gpu_simulator.upload_entity_states(
+                states,
+                origin_x=world.active_origin_x,
+                origin_y=world.active_origin_y,
+            )
+
+    def entity_state_payload(self, world: ActiveWorldWindow) -> list[tuple[str, int, int, bool, float]] | None:
+        visible_ids = {entity.entity_id for entity in self.visible_entities(world)}
         states: list[tuple[str, int, int, bool, float]] = []
         hero_entity = self._entities.get("hero")
         if hero_entity is not None:
@@ -262,13 +327,15 @@ class EntityManager:
         for eid, enemy in self._enemies.items():
             if not enemy.is_alive:
                 continue
+            if eid not in visible_ids:
+                continue
             states.append((eid, int(enemy.x), int(enemy.y), enemy.facing_right, 1.0))
-        if states:
-            world.gpu_simulator.upload_entity_states(
-                states,
-                origin_x=world.active_origin_x,
-                origin_y=world.active_origin_y,
-            )
+        # Cache check: skip upload if states haven't changed
+        cached = getattr(self, "_cached_entity_states", None)
+        if cached == states:
+            return None
+        self._cached_entity_states = list(states)
+        return states
 
     def tick(self, world: ActiveWorldWindow, dt: float) -> None:
         del dt
@@ -325,11 +392,6 @@ class EntityManager:
                 if polled is not None:
                     self._pending_feedback_tokens.popleft()
                     ready_feedback = polled
-            if ready_feedback is None and self._last_feedback == {}:
-                token = self._pending_feedback_tokens[0]
-                ready_feedback = world.gpu_simulator.poll_batched_entity_feedback(token, force_ready=True)
-                if ready_feedback is not None:
-                    self._pending_feedback_tokens.popleft()
             if ready_feedback is not None:
                 resolved.update(ready_feedback)
         for entity in active_entities:
@@ -344,13 +406,15 @@ class EntityManager:
         *,
         feedback: dict[str, GridFeedback] | None = None,
     ) -> None:
+        del feedback
         hero_entity = self._entities.get("hero")
-        resolved_feedback = feedback or self._last_feedback
-        hero_snapshot = None
-        hero_fb = resolved_feedback.get("hero") or GridFeedback(world_width=world.world_width)
+        gpu = getattr(world, "gpu_simulator", None)
+        current_tick = int(
+            getattr(world, "gpu_step_index", getattr(gpu, "step_index", 0)) or 0
+        )
+        hero_snapshot = self.latest_snapshot_for("hero", current_tick=current_tick)
         self.hero.update(
             dt,
-            grid_feedback=hero_fb,
             local_snapshot=hero_snapshot,
             world_width=world.world_width,
         )
@@ -365,8 +429,26 @@ class EntityManager:
     def set_latest_snapshot(self, entity_id: str, snapshot: LocalCellSnapshot) -> None:
         self._latest_snapshots[entity_id] = snapshot
 
-    def latest_snapshot_for(self, entity_id: str) -> LocalCellSnapshot | None:
-        return self._latest_snapshots.get(entity_id)
+    def latest_snapshot_for(self, entity_id: str, *, current_tick: int = 0) -> LocalCellSnapshot | None:
+        cached = self._latest_snapshots.get(entity_id)
+        envelope = self._snapshot_registry.consume(entity_id, current_tick=current_tick)
+        if envelope is not None:
+            packed = _coerce_local_snapshot(
+                envelope.packed,
+                entity_id=entity_id,
+                age_frames=int(envelope.age_frames),
+            )
+            if packed is not None:
+                if cached is None or int(packed.tick_id) >= int(cached.tick_id):
+                    self._latest_snapshots[entity_id] = packed
+                    cached = packed
+                if cached is packed:
+                    return packed
+        snapshot = cached
+        if snapshot is None:
+            return None
+        snapshot.age_frames = max(0, int(current_tick) - int(snapshot.tick_id))
+        return snapshot
 
     def visible_entities(self, world: ActiveWorldWindow) -> list[Entity]:
         result: list[Entity] = []

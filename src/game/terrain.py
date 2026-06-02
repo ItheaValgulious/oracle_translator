@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import TYPE_CHECKING
 
+from src.engine.chunk_generation_worker import register_generator_factory
 from src.engine.types import CellState, CellFlag
 
 log = logging.getLogger(__name__)
@@ -235,6 +236,20 @@ class PlainsPondFeature:
 # TerrainGenerator
 # ---------------------------------------------------------------------------
 
+TERRAIN_CHUNK_WORKER_FACTORY_KEY = "src.game.terrain.default"
+
+
+def _terrain_chunk_worker_factory():
+    def _generate(store, chunk_x: int, chunk_y: int, chunk_size: int, seed: int) -> None:
+        TerrainGenerator(seed, registry=None).generate_chunk(store, chunk_x, chunk_y, chunk_size, seed)
+
+    return _generate
+
+
+def register_chunk_generation_worker_factories() -> None:
+    register_generator_factory(TERRAIN_CHUNK_WORKER_FACTORY_KEY, _terrain_chunk_worker_factory)
+
+
 class TerrainGenerator:
     """Deterministic, seed-based terrain generator for lazy chunk creation.
 
@@ -242,6 +257,12 @@ class TerrainGenerator:
         gen = TerrainGenerator(seed, registry)
         store = WorldChunkStore(..., chunk_generator=gen.generate_chunk)
     """
+
+    supports_packed_chunk_generation = True
+    chunk_generation_worker_factory_key = TERRAIN_CHUNK_WORKER_FACTORY_KEY
+    chunk_generation_worker_init_specs = [
+        "src.game.terrain:register_chunk_generation_worker_factories",
+    ]
 
     def __init__(self, seed: int, registry) -> None:
         self.seed = seed
@@ -751,9 +772,16 @@ class TerrainGenerator:
             if biome == "underground":
                 continue
             if _hash01(self.seed, wx, 0, cfg.ENEMY_TYPE_SALT_A) < cfg.ENEMY_A_PROBABILITY:
-                ground_y = self.ground_height_at(wx)
-                y = ground_y - 1 - cfg.ENEMY_A_HEIGHT
-                points.append({"type": "A", "x": float(wx), "y": y, "biome": biome})
+                spawn = self.find_spawn_point_near(
+                    wx,
+                    entity_width=cfg.ENEMY_A_WIDTH,
+                    entity_height=cfg.ENEMY_A_HEIGHT,
+                    search_radius=max(32, cfg.ENEMY_SPACING // 2),
+                    step=4,
+                )
+                if spawn is not None:
+                    sx, sy = spawn
+                    points.append({"type": "A", "x": sx, "y": sy, "biome": biome})
             if biome in ("hillside", "alpine") and _hash01(self.seed, wx, 0, cfg.ENEMY_TYPE_SALT_B) < cfg.ENEMY_B_PROBABILITY:
                 ground_y = self.ground_height_at(wx)
                 y = ground_y - 1 - cfg.ENEMY_B_HOVER_HEIGHT - cfg.ENEMY_B_HEIGHT
@@ -1234,3 +1262,6 @@ class TerrainGenerator:
             if ch['cx'] - half_w <= wx < ch['cx'] + half_w:
                 return float(ch['cy'] - ch['h'] // 2)
         return float(cfg.UNDERGROUND_Y_START + cfg.UNDERGROUND_STONE_CAP_DEPTH)
+
+
+register_chunk_generation_worker_factories()

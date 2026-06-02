@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import logging
 import struct
 import threading
@@ -14,13 +15,16 @@ from typing import TYPE_CHECKING, Callable
 log = logging.getLogger(__name__)
 
 from .atmosphere import default_ambient_air_temperature_for_row
-from .gpu_backend import LocalCellsSnapshot, PackedStateRegion
+from .gpu_backend import GpuLocalSnapshotToken, LocalCellsSnapshot, PackedStateRegion
 from .grid import Grid
 from .render import DebugViewMode
 from .types import CellFlag, CellState, MaterialRegistry
 
 if TYPE_CHECKING:
     import moderngl
+
+    from .chunk_generation_worker import ChunkGenerationWorkerPool
+    from .chunk_io_worker import ChunkIoWorkerClient
 
 
 DEFAULT_WORLD_CHUNK_SIZE = 320
@@ -34,6 +38,13 @@ DEFAULT_GPU_WRITEBACK_SLICE_CELL_BUDGET = 64
 DEFAULT_CHUNK_IO_WORKERS = 1
 DEFAULT_CHUNK_CACHE_PREFETCH_X = 3
 DEFAULT_CHUNK_CACHE_PREFETCH_Y = 2
+# Phase 2: two-ring residency policy (sizes are in *chunks*, not cells).
+# Inner ring is never evicted; outer ring is the soft prefetch boundary.
+# X-heavy because horizontal exploration dominates in this game.
+DEFAULT_CHUNK_INNER_RING_X = 6
+DEFAULT_CHUNK_INNER_RING_Y = 2
+DEFAULT_CHUNK_OUTER_RING_X = 10
+DEFAULT_CHUNK_OUTER_RING_Y = 3
 GPU_CHUNK_FILE_MAGIC = b"OGCHUNK1"
 GPU_CHUNK_FILE_VERSION = 1
 GPU_CHUNK_HEADER_FORMAT = "<8siiiiiiqq"
@@ -165,6 +176,7 @@ class ChunkIoStats:
     cache_hits: int = 0
     empty_hits: int = 0
     inflight_wait_hits: int = 0
+    sync_blocking_fetch_count: int = 0
     disk_load_count: int = 0
     disk_load_total_seconds: float = 0.0
     disk_load_last_seconds: float = 0.0
@@ -177,6 +189,24 @@ class ChunkIoStats:
     save_total_seconds: float = 0.0
     save_last_seconds: float = 0.0
     save_max_seconds: float = 0.0
+    worker_fallback_count: int = 0
+
+
+class ChunkResidency(enum.IntEnum):
+    """Explicit per-chunk residency state. Used by F3/debug and the
+    upcoming two-ring async cache to make residency decisions without
+    inspecting private dicts."""
+
+    UNKNOWN = 0
+    RESIDENT_CLEAN = 1
+    RESIDENT_DIRTY = 2
+    QUEUED_LOAD = 3
+    QUEUED_SAVE = 4
+    QUEUED_GENERATE = 5
+    INFLIGHT_IO = 6
+    INFLIGHT_GENERATION = 7
+    INFLIGHT_GPU_WRITEBACK = 8
+    EVICTED = 9
 
 
 @dataclass(frozen=True)
@@ -201,6 +231,16 @@ class ChunkCacheDebugSnapshot:
     save_total_seconds: float
     save_last_seconds: float
     save_max_seconds: float
+    # Phase 1 additions: split-out residency/queue/worker metrics.
+    clean_resident_chunks: int = 0
+    dirty_resident_chunks: int = 0
+    queued_read_count: int = 0
+    queued_write_count: int = 0
+    queued_generate_count: int = 0
+    inflight_io_count: int = 0
+    inflight_generation_count: int = 0
+    worker_fallback_count: int = 0
+    sync_blocking_fetch_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -572,6 +612,14 @@ class GpuChunkCache:
         save_dir: str | Path,
         prefetch_x: int = DEFAULT_CHUNK_CACHE_PREFETCH_X,
         prefetch_y: int = DEFAULT_CHUNK_CACHE_PREFETCH_Y,
+        inner_ring_x: int = DEFAULT_CHUNK_INNER_RING_X,
+        inner_ring_y: int = DEFAULT_CHUNK_INNER_RING_Y,
+        outer_ring_x: int = DEFAULT_CHUNK_OUTER_RING_X,
+        outer_ring_y: int = DEFAULT_CHUNK_OUTER_RING_Y,
+        save_executor: ThreadPoolExecutor | None = None,
+        enable_worker_processes: bool = False,
+        io_worker_client: ChunkIoWorkerClient | None = None,
+        generation_worker_pool: ChunkGenerationWorkerPool | None = None,
     ) -> None:
         from .gpu_backend import GpuMaterialTables
 
@@ -581,6 +629,10 @@ class GpuChunkCache:
         self.chunk_size = store.chunk_size
         self.prefetch_x = max(0, int(prefetch_x))
         self.prefetch_y = max(0, int(prefetch_y))
+        self.inner_ring_x = max(0, int(inner_ring_x))
+        self.inner_ring_y = max(0, int(inner_ring_y))
+        self.outer_ring_x = max(self.inner_ring_x, int(outer_ring_x))
+        self.outer_ring_y = max(self.inner_ring_y, int(outer_ring_y))
         self.save_dir = Path(save_dir) / f"seed_{store.seed}" / f"chunk_{self.chunk_size}"
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self._chunks: dict[tuple[int, int], PackedChunk] = {}
@@ -593,10 +645,44 @@ class GpuChunkCache:
         self._empty_chunks: set[tuple[int, int]] = set()
         self._blank_chunk_cache: dict[int, PackedChunk] = {}
         self._executor = ThreadPoolExecutor(max_workers=DEFAULT_CHUNK_IO_WORKERS, thread_name_prefix="gpu-chunk")
+        # Phase 2: dedicated async save executor so disk writes never share
+        # capacity with read-priority IO. Phase 3 will move this out of the
+        # main process entirely.
+        self._save_executor = save_executor or ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="gpu-chunk-save"
+        )
+        self._owns_save_executor = save_executor is None
+        self._queued_save_keys: set[tuple[int, int]] = set()
+        self._inflight_save: dict[tuple[int, int], Future[None]] = {}
+        self._generation_inflight: set[tuple[int, int]] = set()
         self._lock = threading.Lock()
         self._material_fingerprint = _variant_fingerprint(registry)
         self._placeholder_variant_index = self.tables.variant_index_by_key.get(("entity_placeholder", "placeholder"), -1)
+        self._dirty_count = 0
         self.stats = ChunkIoStats()
+        self._worker_io_timeout_seconds = 5.0
+        self._worker_generation_timeout_seconds = 20.0
+        self._io_worker = io_worker_client
+        self._generation_worker_pool = generation_worker_pool
+        self._owns_io_worker = False
+        self._owns_generation_worker_pool = False
+        enable_io_worker = bool(enable_worker_processes or io_worker_client is not None)
+        enable_generation_worker = bool(enable_worker_processes or generation_worker_pool is not None)
+        if enable_io_worker and self._io_worker is None:
+            from .chunk_io_worker import ChunkIoWorkerClient as _ChunkIoWorkerClient
+
+            self._io_worker = _ChunkIoWorkerClient(read_threads=2, write_threads=1)
+            self._owns_io_worker = True
+        if enable_generation_worker and self._generation_worker_pool is None:
+            worker_factory_key, worker_init_specs = self._generation_worker_metadata()
+            if worker_factory_key is not None:
+                from .chunk_generation_worker import ChunkGenerationWorkerPool as _ChunkGenerationWorkerPool
+
+                self._generation_worker_pool = _ChunkGenerationWorkerPool(
+                    max_workers=2,
+                    init_specs=worker_init_specs,
+                )
+                self._owns_generation_worker_pool = True
 
     def snapshot_stats(self) -> ChunkCacheDebugSnapshot:
         with self._lock:
@@ -605,6 +691,18 @@ class GpuChunkCache:
             prefetch_queued = len(self._prefetch_queue)
             prefetch_inflight = len(self._inflight)
             pinned_chunks = len(self._pinned_chunks)
+            # Use the cached _dirty_count to avoid O(n) scan under the lock
+            dirty_resident = self._dirty_count
+            clean_resident = cached_chunks - dirty_resident
+            # Phase 2: split disk queues by direction. Read uses the legacy
+            # prefetch queue; write uses the new async-save queue introduced
+            # by the two-ring residency policy. Phase 4 will populate the
+            # generate queue/inflight counters.
+            queued_generate = sum(1 for key in self._prefetch_queue if self._prefetch_key_is_generate_candidate(key))
+            queued_read = max(0, prefetch_queued - queued_generate)
+            queued_write = len(self._queued_save_keys)
+            inflight_generation = len(self._generation_inflight)
+            inflight_io = max(0, prefetch_inflight + len(self._prime_inflight) - inflight_generation) + len(self._inflight_save)
         return ChunkCacheDebugSnapshot(
             cached_chunks=cached_chunks,
             empty_chunks=empty_chunks,
@@ -626,7 +724,112 @@ class GpuChunkCache:
             save_total_seconds=self.stats.save_total_seconds,
             save_last_seconds=self.stats.save_last_seconds,
             save_max_seconds=self.stats.save_max_seconds,
+            clean_resident_chunks=clean_resident,
+            dirty_resident_chunks=dirty_resident,
+            queued_read_count=queued_read,
+            queued_write_count=queued_write,
+            queued_generate_count=queued_generate,
+            inflight_io_count=inflight_io,
+            inflight_generation_count=inflight_generation,
+            worker_fallback_count=self.stats.worker_fallback_count,
+            sync_blocking_fetch_count=self.stats.sync_blocking_fetch_count,
         )
+
+    def chunk_residency_state(self, chunk_x: int, chunk_y: int) -> ChunkResidency:
+        """Return the current residency state for a chunk.
+
+        Phase 1 derives the state from existing structures; later phases
+        will own the state machine directly. The mapping is best-effort
+        and reflects what the cache currently believes about the chunk."""
+        key = (chunk_x, chunk_y)
+        with self._lock:
+            # Inflight save dominates: even though the chunk is still
+            # resident we want callers to see "this chunk is being saved
+            # for an eviction-after-ack flow".
+            if key in self._inflight_save:
+                return ChunkResidency.INFLIGHT_IO
+            if key in self._queued_save_keys:
+                return ChunkResidency.QUEUED_SAVE
+            chunk = self._chunks.get(key)
+            if chunk is not None:
+                return (
+                    ChunkResidency.RESIDENT_DIRTY
+                    if chunk.dirty
+                    else ChunkResidency.RESIDENT_CLEAN
+                )
+            if key in self._generation_inflight:
+                return ChunkResidency.INFLIGHT_GENERATION
+            if key in self._inflight:
+                return ChunkResidency.INFLIGHT_IO
+            if key in self._prime_inflight:
+                return ChunkResidency.INFLIGHT_IO
+            if key in self._prefetch_queued:
+                if self._prefetch_key_is_generate_candidate(key):
+                    return ChunkResidency.QUEUED_GENERATE
+                return ChunkResidency.QUEUED_LOAD
+            if key in self._empty_chunks:
+                return ChunkResidency.RESIDENT_CLEAN
+        return ChunkResidency.EVICTED
+
+    def record_worker_fallback(self) -> None:
+        """Increment the worker fallback counter. Phase 3/4 will call
+        this when an out-of-process worker times out or crashes."""
+        self.stats.worker_fallback_count += 1
+
+    def _generator_supports_packed_chunk_generation(self) -> bool:
+        chunk_generator = self.store.chunk_generator
+        if chunk_generator is None:
+            return False
+        if bool(getattr(chunk_generator, "supports_packed_chunk_generation", False)):
+            return True
+        generator_owner = getattr(chunk_generator, "__self__", None)
+        return bool(getattr(generator_owner, "supports_packed_chunk_generation", False))
+
+    def _generation_worker_metadata(self) -> tuple[str | None, list[str]]:
+        chunk_generator = self.store.chunk_generator
+        if chunk_generator is None:
+            return None, []
+        factory_key = getattr(chunk_generator, "chunk_generation_worker_factory_key", None)
+        init_specs = getattr(chunk_generator, "chunk_generation_worker_init_specs", None)
+        generator_owner = getattr(chunk_generator, "__self__", None)
+        if factory_key is None and generator_owner is not None:
+            factory_key = getattr(generator_owner, "chunk_generation_worker_factory_key", None)
+        if init_specs is None and generator_owner is not None:
+            init_specs = getattr(generator_owner, "chunk_generation_worker_init_specs", None)
+        if factory_key is None:
+            return None, []
+        return str(factory_key), [str(spec) for spec in list(init_specs or [])]
+
+    def _record_disk_load_timing(self, started_at: float, *, counted: bool) -> None:
+        elapsed = perf_counter() - started_at
+        if counted:
+            self.stats.disk_load_count += 1
+            self.stats.disk_load_total_seconds += elapsed
+        self.stats.disk_load_last_seconds = elapsed
+        self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
+
+    def _record_generate_timing(self, started_at: float) -> None:
+        elapsed = perf_counter() - started_at
+        self.stats.generate_count += 1
+        self.stats.generate_total_seconds += elapsed
+        self.stats.generate_last_seconds = elapsed
+        self.stats.generate_max_seconds = max(self.stats.generate_max_seconds, elapsed)
+
+    def _record_save_timing(self, started_at: float) -> None:
+        elapsed = perf_counter() - started_at
+        self.stats.save_count += 1
+        self.stats.save_total_seconds += elapsed
+        self.stats.save_last_seconds = elapsed
+        self.stats.save_max_seconds = max(self.stats.save_max_seconds, elapsed)
+
+    def _prefetch_key_is_generate_candidate(self, key: tuple[int, int]) -> bool:
+        if self.store.chunk_generator is None:
+            return False
+        if key in self._empty_chunks:
+            return False
+        if self._chunk_file_exists(key[0], key[1]):
+            return False
+        return True
 
     def _chunk_path(self, chunk_x: int, chunk_y: int) -> Path:
         return self.save_dir / f"{chunk_x}_{chunk_y}.ogchunk"
@@ -659,19 +862,70 @@ class GpuChunkCache:
             self._blank_chunk_cache[chunk_y] = chunk
         return chunk
 
+    def _read_chunk_bytes(self, path: Path) -> bytes | None:
+        if self._io_worker is None:
+            if not path.exists():
+                return None
+            return path.read_bytes()
+        fallback_before = int(self._io_worker.stats.fallback_count)
+        response = self._io_worker.read_response(path, timeout=self._worker_io_timeout_seconds)
+        if int(self._io_worker.stats.fallback_count) > fallback_before:
+            self.record_worker_fallback()
+        if response.ok:
+            self._io_worker.stats.read_count += 1
+            return response.payload if response.payload else None
+        self.record_worker_fallback()
+        if not path.exists():
+            return None
+        return path.read_bytes()
+
+    def _write_chunk_bytes(self, path: Path, payload: bytes) -> None:
+        def _unique_tmp_path() -> Path:
+            suffix = f".{threading.get_ident()}.{id(payload)}.tmp"
+            return path.with_name(path.name + suffix)
+
+        if self._io_worker is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = _unique_tmp_path()
+            try:
+                tmp_path.write_bytes(payload)
+                tmp_path.replace(path)
+            finally:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+            return
+        fallback_before = int(self._io_worker.stats.fallback_count)
+        response = self._io_worker.write_response(path, payload, timeout=self._worker_io_timeout_seconds)
+        if int(self._io_worker.stats.fallback_count) > fallback_before:
+            self.record_worker_fallback()
+        if response.ok:
+            self._io_worker.stats.write_count += 1
+            return
+        self.record_worker_fallback()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = _unique_tmp_path()
+        try:
+            tmp_path.write_bytes(payload)
+            tmp_path.replace(path)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
     def _load_from_disk(self, chunk_x: int, chunk_y: int) -> PackedChunk | None:
         started_at = perf_counter()
         path = self._chunk_path(chunk_x, chunk_y)
-        if not path.exists():
-            elapsed = perf_counter() - started_at
-            self.stats.disk_load_last_seconds = elapsed
-            self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
+        data = self._read_chunk_bytes(path)
+        if data is None:
+            self._record_disk_load_timing(started_at, counted=False)
             return None
-        data = path.read_bytes()
         if len(data) < GPU_CHUNK_HEADER_SIZE:
-            elapsed = perf_counter() - started_at
-            self.stats.disk_load_last_seconds = elapsed
-            self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
+            self._record_disk_load_timing(started_at, counted=False)
             return None
         (
             magic,
@@ -689,20 +943,25 @@ class GpuChunkCache:
             or version != GPU_CHUNK_FILE_VERSION
             or stored_seed != self.store.seed
             or chunk_size != self.chunk_size
-            or width != self.chunk_size
-            or height != self.chunk_size
             or fingerprint != self._material_fingerprint
         ):
-            elapsed = perf_counter() - started_at
-            self.stats.disk_load_last_seconds = elapsed
-            self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
+            self._record_disk_load_timing(started_at, counted=False)
+            return None
+        if width == 0 and height == 0:
+            if len(data) != GPU_CHUNK_HEADER_SIZE:
+                self._record_disk_load_timing(started_at, counted=False)
+                return None
+            self._empty_chunks.add((chunk_x, chunk_y))
+            self._record_disk_load_timing(started_at, counted=True)
+            log.debug("[world] loaded empty GPU chunk marker (%d,%d) from disk", chunk_x, chunk_y)
+            return self._blank_chunk_for(chunk_y)
+        if width != self.chunk_size or height != self.chunk_size:
+            self._record_disk_load_timing(started_at, counted=False)
             return None
         plane_size = width * height * GPU_STATE_PIXEL_BYTES
         expected = GPU_CHUNK_HEADER_SIZE + plane_size * 3
         if len(data) != expected:
-            elapsed = perf_counter() - started_at
-            self.stats.disk_load_last_seconds = elapsed
-            self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
+            self._record_disk_load_timing(started_at, counted=False)
             return None
         offset = GPU_CHUNK_HEADER_SIZE
         chunk = PackedChunk(
@@ -713,15 +972,14 @@ class GpuChunkCache:
             state_misc=bytearray(data[offset + plane_size * 2:offset + plane_size * 3]),
             dirty=False,
         )
-        elapsed = perf_counter() - started_at
-        self.stats.disk_load_count += 1
-        self.stats.disk_load_total_seconds += elapsed
-        self.stats.disk_load_last_seconds = elapsed
-        self.stats.disk_load_max_seconds = max(self.stats.disk_load_max_seconds, elapsed)
+        self._record_disk_load_timing(started_at, counted=True)
         log.debug("[world] loaded GPU chunk (%d,%d) from disk", chunk_x, chunk_y)
         return chunk
 
     def _save_to_disk(self, chunk_x: int, chunk_y: int, chunk: PackedChunk) -> None:
+        if not chunk.dirty:
+            return
+        self._dirty_count = max(0, self._dirty_count - 1)
         started_at = perf_counter()
         self.save_dir.mkdir(parents=True, exist_ok=True)
         path = self._chunk_path(chunk_x, chunk_y)
@@ -737,27 +995,43 @@ class GpuChunkCache:
             int(chunk_y),
             self._material_fingerprint,
         )
-        tmp_path = path.with_suffix(".tmp")
-        tmp_path.write_bytes(header + bytes(chunk.state_int) + bytes(chunk.state_vec) + bytes(chunk.state_misc))
-        tmp_path.replace(path)
+        payload = header + bytes(chunk.state_int) + bytes(chunk.state_vec) + bytes(chunk.state_misc)
+        self._write_chunk_bytes(path, payload)
         chunk.dirty = False
-        elapsed = perf_counter() - started_at
-        self.stats.save_count += 1
-        self.stats.save_total_seconds += elapsed
-        self.stats.save_last_seconds = elapsed
-        self.stats.save_max_seconds = max(self.stats.save_max_seconds, elapsed)
+        self._record_save_timing(started_at)
         log.debug("[world] saved GPU chunk (%d,%d) to disk", chunk_x, chunk_y)
 
-    def _generate_chunk(self, chunk_x: int, chunk_y: int) -> PackedChunk:
+    def _save_empty_marker_to_disk(self, chunk_x: int, chunk_y: int) -> None:
+        path = self._chunk_path(chunk_x, chunk_y)
+        if path.exists():
+            return
         started_at = perf_counter()
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        header = struct.pack(
+            GPU_CHUNK_HEADER_FORMAT,
+            GPU_CHUNK_FILE_MAGIC,
+            GPU_CHUNK_FILE_VERSION,
+            int(self.store.seed),
+            self.chunk_size,
+            0,
+            0,
+            int(chunk_x),
+            int(chunk_y),
+            self._material_fingerprint,
+        )
+        self._write_chunk_bytes(path, header)
+        self._record_save_timing(started_at)
+        log.debug("[world] saved empty GPU chunk marker (%d,%d) to disk", chunk_x, chunk_y)
+
+    def _generate_chunk_in_process(self, chunk_x: int, chunk_y: int, *, started_at: float | None = None) -> PackedChunk:
+        started_at = perf_counter() if started_at is None else started_at
         log.debug("[world] generating GPU chunk (%d,%d) for the first time", chunk_x, chunk_y)
         store_chunk = self.store._chunk(chunk_x, chunk_y, create=False)  # noqa: SLF001
         chunk_generator = self.store.chunk_generator
-        generator_owner = getattr(chunk_generator, "__self__", None) if chunk_generator is not None else None
         if (
             store_chunk is None
             and chunk_generator is not None
-            and getattr(generator_owner, "supports_packed_chunk_generation", False)
+            and self._generator_supports_packed_chunk_generation()
         ):
             writer = _PackedChunkTerrainWriter(
                 world_width=self.store.width,
@@ -772,11 +1046,9 @@ class GpuChunkCache:
             chunk = writer.finalize()
             if writer._nondefault_writes <= 0:  # noqa: SLF001
                 self._empty_chunks.add((chunk_x, chunk_y))
-            elapsed = perf_counter() - started_at
-            self.stats.generate_count += 1
-            self.stats.generate_total_seconds += elapsed
-            self.stats.generate_last_seconds = elapsed
-            self.stats.generate_max_seconds = max(self.stats.generate_max_seconds, elapsed)
+            else:
+                self._empty_chunks.discard((chunk_x, chunk_y))
+            self._record_generate_timing(started_at)
             return chunk
 
         chunk = _blank_chunk(self.chunk_size, self.store.height, chunk_y, self.tables.empty_variant_index)
@@ -791,11 +1063,7 @@ class GpuChunkCache:
             store_chunk = temp_store._chunk(chunk_x, chunk_y, create=False)  # noqa: SLF001
         if store_chunk is None or not store_chunk.cells:
             self._empty_chunks.add((chunk_x, chunk_y))
-            elapsed = perf_counter() - started_at
-            self.stats.generate_count += 1
-            self.stats.generate_total_seconds += elapsed
-            self.stats.generate_last_seconds = elapsed
-            self.stats.generate_max_seconds = max(self.stats.generate_max_seconds, elapsed)
+            self._record_generate_timing(started_at)
             return self._blank_chunk_for(chunk_y)
         if store_chunk is not None and store_chunk.cells:
             state_int = array("i")
@@ -821,15 +1089,66 @@ class GpuChunkCache:
             chunk.state_int = bytearray(state_int.tobytes())
             chunk.state_vec = bytearray(state_vec.tobytes())
             chunk.state_misc = bytearray(state_misc.tobytes())
+        self._empty_chunks.discard((chunk_x, chunk_y))
         chunk.dirty = True
-        elapsed = perf_counter() - started_at
-        self.stats.generate_count += 1
-        self.stats.generate_total_seconds += elapsed
-        self.stats.generate_last_seconds = elapsed
-        self.stats.generate_max_seconds = max(self.stats.generate_max_seconds, elapsed)
+        self._record_generate_timing(started_at)
+        return chunk
+
+    def _generate_chunk(self, chunk_x: int, chunk_y: int) -> PackedChunk:
+        started_at = perf_counter()
+        worker_factory_key, _worker_init_specs = self._generation_worker_metadata()
+        if self._generation_worker_pool is None or worker_factory_key is None:
+            return self._generate_chunk_in_process(chunk_x, chunk_y, started_at=started_at)
+        key = (chunk_x, chunk_y)
+        with self._lock:
+            self._generation_inflight.add(key)
+        try:
+            from .chunk_generation_worker import make_request
+
+            fallback_before = int(self._generation_worker_pool.stats.fallback_count)
+            result = self._generation_worker_pool.generate_blocking(
+                make_request(
+                    factory_key=worker_factory_key,
+                    chunk_x=chunk_x,
+                    chunk_y=chunk_y,
+                    chunk_size=self.chunk_size,
+                    world_width=self.store.width,
+                    world_height=self.store.height,
+                    seed=self.store.seed,
+                ),
+                timeout=self._worker_generation_timeout_seconds,
+            )
+            if int(self._generation_worker_pool.stats.fallback_count) > fallback_before:
+                self.record_worker_fallback()
+        except Exception:  # noqa: BLE001
+            log.exception("[world] worker generation failed for chunk (%d,%d)", chunk_x, chunk_y)
+            self.record_worker_fallback()
+            return self._generate_chunk_in_process(chunk_x, chunk_y, started_at=started_at)
+        finally:
+            with self._lock:
+                self._generation_inflight.discard(key)
+        if not result.ok:
+            log.warning("[world] worker generation returned error for chunk (%d,%d): %s", chunk_x, chunk_y, result.error)
+            self.record_worker_fallback()
+            return self._generate_chunk_in_process(chunk_x, chunk_y, started_at=started_at)
+        if result.is_empty:
+            self._empty_chunks.add(key)
+            self._record_generate_timing(started_at)
+            return self._blank_chunk_for(chunk_y)
+        self._empty_chunks.discard(key)
+        chunk = PackedChunk(
+            width=int(result.chunk_size),
+            height=int(result.chunk_size),
+            state_int=bytearray(result.state_int),
+            state_vec=bytearray(result.state_vec),
+            state_misc=bytearray(result.state_misc),
+            dirty=True,
+        )
+        self._record_generate_timing(started_at)
         return chunk
 
     def ensure_chunk_cached(self, chunk_x: int, chunk_y: int) -> PackedChunk:
+        self.stats.sync_blocking_fetch_count += 1
         key = (chunk_x, chunk_y)
         if key in self._empty_chunks:
             self.stats.empty_hits += 1
@@ -845,14 +1164,19 @@ class GpuChunkCache:
             chunk = future.result()
             with self._lock:
                 self._inflight.pop(key, None)
-                if chunk is not None:
+                if chunk is not None and key not in self._chunks:
+                    if chunk.dirty:
+                        self._dirty_count += 1
                     self._chunks[key] = chunk
                     return chunk
         chunk = self._load_from_disk(chunk_x, chunk_y)
         if chunk is None:
             chunk = self._generate_chunk(chunk_x, chunk_y)
         with self._lock:
-            self._chunks[key] = chunk
+            if key not in self._chunks:
+                if chunk.dirty:
+                    self._dirty_count += 1
+                self._chunks[key] = chunk
         return chunk
 
     def prefetch_chunks_for_rect(self, rect: WorldRect) -> None:
@@ -901,12 +1225,97 @@ class GpuChunkCache:
                 self._prefetch_queue.append(key)
             self._prefetch_queued.add(key)
 
+    def evict_clean_disk_backed_for_rect(
+        self,
+        rect: WorldRect,
+        *,
+        margin_x: int | None = None,
+        margin_y: int | None = None,
+    ) -> dict[str, int]:
+        """Evict clean resident chunks in ``rect`` only when disk-backed.
+
+        This is a profiling/debug helper for constructing disk-only
+        residency windows. Dirty, pinned, queued, or inflight chunks are
+        skipped so normal durability and async worker invariants remain
+        intact.
+        """
+        keys = self._prefetch_keys_for_rect(rect, margin_x=margin_x, margin_y=margin_y)
+        result = {
+            "requested": len(keys),
+            "evicted": 0,
+            "missing": 0,
+            "dirty_skipped": 0,
+            "pinned_skipped": 0,
+            "inflight_skipped": 0,
+            "no_disk_skipped": 0,
+        }
+        for key in keys:
+            with self._lock:
+                chunk = self._chunks.get(key)
+                is_pinned = key in self._pinned_chunks
+                is_inflight = (
+                    key in self._prefetch_queued
+                    or key in self._inflight
+                    or key in self._prime_inflight
+                    or key in self._generation_inflight
+                    or key in self._queued_save_keys
+                    or key in self._inflight_save
+                )
+            if chunk is None:
+                result["missing"] += 1
+                continue
+            if is_pinned:
+                result["pinned_skipped"] += 1
+                continue
+            if is_inflight:
+                result["inflight_skipped"] += 1
+                continue
+            if chunk.dirty:
+                result["dirty_skipped"] += 1
+                continue
+            if not self._chunk_file_exists(key[0], key[1]):
+                result["no_disk_skipped"] += 1
+                continue
+            with self._lock:
+                current = self._chunks.get(key)
+                if current is not chunk:
+                    result["inflight_skipped"] += 1
+                    continue
+                if current.dirty:
+                    result["dirty_skipped"] += 1
+                    continue
+                self._chunks.pop(key, None)
+                self._empty_chunks.discard(key)
+            result["evicted"] += 1
+        return result
+
+    def _schedule_prefetch_key(self, key: tuple[int, int], *, prioritize: bool = False) -> None:
+        """Queue one chunk for background residency without touching storage."""
+        with self._lock:
+            if (
+                key in self._chunks
+                or key in self._empty_chunks
+                or key in self._prefetch_queued
+                or key in self._inflight
+                or key in self._prime_inflight
+                or key in self._generation_inflight
+            ):
+                return
+            if prioritize:
+                self._prefetch_queue.appendleft(key)
+            else:
+                self._prefetch_queue.append(key)
+            self._prefetch_queued.add(key)
+
     def _load_for_worker(self, chunk_x: int, chunk_y: int) -> PackedChunk | None:
         chunk = self._load_from_disk(chunk_x, chunk_y)
         if chunk is not None:
+            if (chunk_x, chunk_y) in self._empty_chunks:
+                return None
             return chunk
         chunk = self._generate_chunk(chunk_x, chunk_y)
         if (chunk_x, chunk_y) in self._empty_chunks:
+            self._save_empty_marker_to_disk(chunk_x, chunk_y)
             return None
         if chunk.dirty:
             self._save_to_disk(chunk_x, chunk_y, chunk)
@@ -915,11 +1324,14 @@ class GpuChunkCache:
     def _prime_for_worker(self, chunk_x: int, chunk_y: int) -> None:
         chunk = self._load_from_disk(chunk_x, chunk_y)
         if chunk is not None:
+            if (chunk_x, chunk_y) in self._empty_chunks:
+                return
             with self._lock:
                 self._chunks[(chunk_x, chunk_y)] = chunk
             return
         chunk = self._generate_chunk(chunk_x, chunk_y)
         if (chunk_x, chunk_y) in self._empty_chunks:
+            self._save_empty_marker_to_disk(chunk_x, chunk_y)
             return
         if chunk.dirty:
             self._save_to_disk(chunk_x, chunk_y, chunk)
@@ -958,6 +1370,7 @@ class GpuChunkCache:
             if chunk is None:
                 chunk = self._generate_chunk(chunk_x, chunk_y)
             if key in self._empty_chunks:
+                self._save_empty_marker_to_disk(chunk_x, chunk_y)
                 continue
             if chunk.dirty:
                 self._save_to_disk(chunk_x, chunk_y, chunk)
@@ -1044,6 +1457,125 @@ class GpuChunkCache:
                 self._save_to_disk(chunk_x, chunk_y, chunk)
             self._chunks.pop(key, None)
 
+    def _rect_chunk_bounds(self, rect: WorldRect) -> tuple[int, int, int, int]:
+        chunk_min_x = max(0, rect.x) // self.chunk_size
+        chunk_max_x = max(0, rect.right - 1) // self.chunk_size
+        chunk_min_y = max(0, rect.y) // self.chunk_size
+        chunk_max_y = max(0, rect.bottom - 1) // self.chunk_size
+        return chunk_min_x, chunk_max_x, chunk_min_y, chunk_max_y
+
+    def _is_in_ring(
+        self,
+        key: tuple[int, int],
+        rect_bounds: tuple[int, int, int, int],
+        ring_x: int,
+        ring_y: int,
+    ) -> bool:
+        chunk_x, chunk_y = key
+        min_x, max_x, min_y, max_y = rect_bounds
+        return (
+            (min_x - ring_x) <= chunk_x <= (max_x + ring_x)
+            and (min_y - ring_y) <= chunk_y <= (max_y + ring_y)
+        )
+
+    def _enqueue_async_save(self, key: tuple[int, int], chunk: PackedChunk) -> None:
+        """Queue an async save for ``key`` if not already queued/inflight.
+
+        Caller must hold ``self._lock``. The key sits in ``_queued_save_keys``
+        until the executor picks the job up, at which point it moves to
+        ``_inflight_save``. On save completion the chunk is evicted from
+        RAM if it is still clean and not pinned. Failures leave the chunk
+        resident (still dirty) so the next pass retries.
+        """
+        if key in self._queued_save_keys or key in self._inflight_save:
+            return
+        self._queued_save_keys.add(key)
+
+        def _run(*, key=key, chunk=chunk) -> None:
+            # Transition queued → inflight as soon as the worker picks up.
+            with self._lock:
+                self._queued_save_keys.discard(key)
+                # _inflight_save is populated by the submit() caller below,
+                # so the state transition is already represented by the
+                # future being non-pending. Nothing else to do here.
+            try:
+                self._save_to_disk(key[0], key[1], chunk)
+                ok = True
+            except Exception:  # noqa: BLE001
+                log.exception("[world] async save failed for chunk %s", key)
+                ok = False
+            with self._lock:
+                self._inflight_save.pop(key, None)
+                if not ok:
+                    return
+                current = self._chunks.get(key)
+                if current is None:
+                    return
+                if current.dirty or key in self._pinned_chunks:
+                    return
+                self._chunks.pop(key, None)
+
+        future = self._save_executor.submit(_run)
+        self._inflight_save[key] = future
+
+    def service_residency(self, rect: WorldRect) -> None:
+        """Apply the two-ring residency policy around ``rect``.
+
+        Inner ring: never evict.
+        Outer ring band (between inner and outer): leave resident for now;
+        Phase 5 may add background cleaning here.
+        Outside outer ring: clean → evict immediately, dirty → async save,
+        evict after ack. Never blocks the caller.
+        """
+        if rect.is_empty:
+            return
+        bounds = self._rect_chunk_bounds(rect)
+        with self._lock:
+            for key, chunk in list(self._chunks.items()):
+                if key in self._pinned_chunks:
+                    continue
+                if self._is_in_ring(key, bounds, self.inner_ring_x, self.inner_ring_y):
+                    continue
+                if self._is_in_ring(key, bounds, self.outer_ring_x, self.outer_ring_y):
+                    # Soft band: do not force eviction here. Phase 5 may
+                    # opportunistically clean dirty chunks; for now leave
+                    # them alone so gameplay paths are not perturbed.
+                    continue
+                if key in self._inflight_save or key in self._queued_save_keys:
+                    continue
+                if chunk.dirty:
+                    self._enqueue_async_save(key, chunk)
+                else:
+                    self._chunks.pop(key, None)
+
+    def wait_pending_saves(self, timeout: float | None = None) -> None:
+        """Block until all in-flight async saves have completed.
+
+        Test-only / shutdown helper. The runtime gameplay loop must not
+        call this — the whole point of the two-ring policy is that saves
+        are best-effort and don't stall the main thread.
+        """
+        deadline = None if timeout is None else perf_counter() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                futures = list(self._inflight_save.values())
+                queued = bool(self._queued_save_keys)
+            if not futures and not queued:
+                return
+            remaining = None if deadline is None else max(0.0, deadline - perf_counter())
+            if queued and not futures:
+                if remaining == 0.0:
+                    return
+                threading.Event().wait(0.001 if remaining is None else min(0.001, remaining))
+                continue
+            for future in futures:
+                try:
+                    future.result(timeout=remaining)
+                except Exception:  # noqa: BLE001
+                    pass
+            if deadline is not None and perf_counter() >= deadline:
+                return
+
     def flush_dirty(self) -> None:
         for (chunk_x, chunk_y), chunk in list(self._chunks.items()):
             if chunk.dirty:
@@ -1057,9 +1589,20 @@ class GpuChunkCache:
         return False
 
     def shutdown(self) -> None:
+        # Normal close is the durability barrier. Runtime calls may queue
+        # best-effort work, but process exit must wait for owned workers so
+        # they do not survive the game process or cancel running saves.
+        self.wait_pending_saves()
+        self._prime_executor.shutdown(wait=True, cancel_futures=True)
+        self._executor.shutdown(wait=True, cancel_futures=True)
         self.flush_dirty()
-        self._prime_executor.shutdown(wait=False, cancel_futures=True)
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self.wait_pending_saves()
+        if self._owns_save_executor:
+            self._save_executor.shutdown(wait=True, cancel_futures=True)
+        if self._owns_generation_worker_pool and self._generation_worker_pool is not None:
+            self._generation_worker_pool.shutdown(wait=True)
+        if self._owns_io_worker and self._io_worker is not None:
+            self._io_worker.shutdown()
 
     def read_rect(self, rect: WorldRect):
         if rect.width <= 0 or rect.height <= 0:
@@ -1091,8 +1634,16 @@ class GpuChunkCache:
             )
         return PackedStateRegion(width=rect.width, height=rect.height, state_int=bytes(result.state_int), state_vec=bytes(result.state_vec), state_misc=bytes(result.state_misc))
 
-    def read_rect_parts(self, rect: WorldRect) -> list[tuple[WorldRect, object | None]]:
+    def read_rect_parts(
+        self,
+        rect: WorldRect,
+        *,
+        block: bool = True,
+        prioritize_missing: bool = True,
+    ) -> list[tuple[WorldRect, object | None]]:
         parts: list[tuple[WorldRect, object | None]] = []
+        if not block:
+            self.collect_ready_prefetch()
         for chunk_x, chunk_y in _chunks_for_rect(rect, self.chunk_size):
             chunk_rect = self._chunk_world_rect(chunk_x, chunk_y)
             overlap = rect.intersection(chunk_rect)
@@ -1102,10 +1653,26 @@ class GpuChunkCache:
             if self._can_fill_empty_chunk(chunk_x, chunk_y):
                 parts.append((overlap, None))
                 continue
-            chunk = self.ensure_chunk_cached(chunk_x, chunk_y)
+            if not block:
+                with self._lock:
+                    chunk = self._chunks.get(key)
+                    is_known_empty = key in self._empty_chunks
+                if is_known_empty:
+                    self.stats.empty_hits += 1
+                    parts.append((overlap, None))
+                    continue
+                if chunk is None:
+                    self._schedule_prefetch_key(key, prioritize=prioritize_missing)
+                    parts.append((overlap, None))
+                    continue
+                self.stats.cache_hits += 1
+            else:
+                chunk = self.ensure_chunk_cached(chunk_x, chunk_y)
             if key in self._empty_chunks:
                 with self._lock:
-                    self._chunks.pop(key, None)
+                    popped = self._chunks.pop(key, None)
+                    if popped is not None and popped.dirty:
+                        self._dirty_count = max(0, self._dirty_count - 1)
                 parts.append((overlap, None))
                 continue
             packed = _extract_packed_rect(
@@ -1141,6 +1708,7 @@ class GpuChunkCache:
                 self._empty_chunks.discard(key)
             else:
                 chunk = self.ensure_chunk_cached(chunk_x, chunk_y)
+            was_clean = not chunk.dirty
             _copy_packed_rect(
                 packed_region,
                 chunk,
@@ -1151,6 +1719,8 @@ class GpuChunkCache:
                 width=overlap.width,
                 height=overlap.height,
             )
+            if was_clean:
+                self._dirty_count += 1
             self._empty_chunks.discard(key)
 
     def has_support_anchor_source(
@@ -1159,6 +1729,7 @@ class GpuChunkCache:
         y: int,
         *,
         support_variant_indices: set[int],
+        block: bool = True,
     ) -> bool:
         if x < 0 or y < 0 or x >= self.store.width or y >= self.store.height:
             return False
@@ -1170,7 +1741,15 @@ class GpuChunkCache:
         local_x = x % self.chunk_size
         local_y = y % self.chunk_size
         local_index = local_y * self.chunk_size + local_x
-        chunk = self.ensure_chunk_cached(chunk_x, chunk_y)
+        if block:
+            chunk = self.ensure_chunk_cached(chunk_x, chunk_y)
+        else:
+            self.collect_ready_prefetch()
+            with self._lock:
+                chunk = self._chunks.get(key)
+            if chunk is None:
+                self._schedule_prefetch_key(key, prioritize=True)
+                return False
         int_values = array("i")
         int_start = local_index * GPU_STATE_PIXEL_BYTES
         int_values.frombytes(bytes(chunk.state_int[int_start:int_start + GPU_STATE_PIXEL_BYTES]))
@@ -1503,11 +2082,13 @@ class ActiveWorldWindow:
         blocked_impulse_enabled: bool = True,
         directional_fallback_enabled: bool = True,
         directional_fallback_angle_limit_degrees: float = 45.0,
+        enable_gl_sync: bool = True,
         initial_camera_x: int | None = None,
         initial_camera_y: int | None = None,
         chunk_save_dir: str | Path = "artifacts/gpu_chunks",
         chunk_cache_prefetch_x: int = DEFAULT_CHUNK_CACHE_PREFETCH_X,
         chunk_cache_prefetch_y: int = DEFAULT_CHUNK_CACHE_PREFETCH_Y,
+        enable_chunk_worker_processes: bool = False,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -1552,9 +2133,11 @@ class ActiveWorldWindow:
             save_dir=chunk_save_dir,
             prefetch_x=chunk_cache_prefetch_x,
             prefetch_y=chunk_cache_prefetch_y,
+            enable_worker_processes=enable_chunk_worker_processes,
         )
         self.gpu_simulator = None
         self._pending_gpu_writebacks: list[_PendingGpuWriteback] = []
+        self._pending_active_chunk_patches: set[tuple[int, int]] = set()
         self._pending_flush_cooldown_steps = 0
         self._camera_idle_elapsed_seconds = self.idle_flush_cooldown_seconds
         self._last_background_io_flush_idle_seconds = 0.0
@@ -1577,6 +2160,7 @@ class ActiveWorldWindow:
             blocked_impulse_enabled=self.blocked_impulse_enabled,
             directional_fallback_enabled=self.directional_fallback_enabled,
             directional_fallback_angle_limit_degrees=self.directional_fallback_angle_limit_degrees,
+            enable_gl_sync=enable_gl_sync,
         )
         self._load_incoming_rect_into_gpu_buffer(
             self.active_rect,
@@ -1610,10 +2194,21 @@ class ActiveWorldWindow:
         return len(self._pending_gpu_writebacks)
 
     @property
+    def gpu_writeback_queue_depth(self) -> int:
+        """Clarified alias of `pending_writeback_count`: this counts GPU
+        staged regions waiting for CPU readback, NOT disk-save backlog.
+        Disk-save backlog will live in the chunk cache once Phase 2 lands."""
+        return len(self._pending_gpu_writebacks)
+
+    @property
+    def active_chunk_patch_queue_depth(self) -> int:
+        return len(self._pending_active_chunk_patches)
+
+    @property
     def pending_writeback_pressure_count(self) -> int:
         return max(0, len(self._pending_gpu_writebacks) - self.pending_writeback_limit)
 
-    def _border_has_external_support_anchor(self, rect: WorldRect, local_x: int, local_y: int) -> bool:
+    def _border_has_external_support_anchor(self, rect: WorldRect, local_x: int, local_y: int, *, block: bool = True) -> bool:
         world_x = rect.x + local_x
         world_y = rect.y + local_y
         for dx, dy in NEIGHBORS_8:
@@ -1625,6 +2220,7 @@ class ActiveWorldWindow:
                 neighbor_x,
                 neighbor_y,
                 support_variant_indices=self._support_transmission_variant_indices,
+                block=block,
             ):
                 return True
         return False
@@ -1637,7 +2233,7 @@ class ActiveWorldWindow:
             anchored.add(position + 1)
         return anchored
 
-    def _top_anchor_row(self, rect: WorldRect) -> list[bool]:
+    def _top_anchor_row(self, rect: WorldRect, *, block: bool = True) -> list[bool]:
         if rect.y <= 0:
             return [False for _ in range(rect.width)]
         positions: set[int] = set()
@@ -1647,12 +2243,13 @@ class ActiveWorldWindow:
                 world_x,
                 world_y,
                 support_variant_indices=self._support_transmission_variant_indices,
+                block=block,
             ):
                 positions.add(world_x)
         neighboring = self._neighboring_anchor_positions(positions)
         return [rect.x + local_x in neighboring for local_x in range(rect.width)]
 
-    def _bottom_anchor_row(self, rect: WorldRect) -> list[bool]:
+    def _bottom_anchor_row(self, rect: WorldRect, *, block: bool = True) -> list[bool]:
         if rect.bottom >= self.store.height:
             return [False for _ in range(rect.width)]
         positions: set[int] = set()
@@ -1662,12 +2259,13 @@ class ActiveWorldWindow:
                 world_x,
                 world_y,
                 support_variant_indices=self._support_transmission_variant_indices,
+                block=block,
             ):
                 positions.add(world_x)
         neighboring = self._neighboring_anchor_positions(positions)
         return [rect.x + local_x in neighboring for local_x in range(rect.width)]
 
-    def _left_anchor_column(self, rect: WorldRect) -> list[bool]:
+    def _left_anchor_column(self, rect: WorldRect, *, block: bool = True) -> list[bool]:
         if rect.x <= 0:
             return [False for _ in range(max(0, rect.height - 2))]
         positions: set[int] = set()
@@ -1677,6 +2275,7 @@ class ActiveWorldWindow:
                 world_x,
                 world_y,
                 support_variant_indices=self._support_transmission_variant_indices,
+                block=block,
             ):
                 positions.add(world_y)
         if rect.y > 0:
@@ -1686,6 +2285,7 @@ class ActiveWorldWindow:
                     world_x_candidate,
                     corner_y,
                     support_variant_indices=self._support_transmission_variant_indices,
+                    block=block,
                 ):
                     positions.add(corner_y)
         if rect.bottom < self.store.height:
@@ -1695,12 +2295,13 @@ class ActiveWorldWindow:
                     world_x_candidate,
                     corner_y,
                     support_variant_indices=self._support_transmission_variant_indices,
+                    block=block,
                 ):
                     positions.add(corner_y)
         neighboring = self._neighboring_anchor_positions(positions)
         return [rect.y + local_y in neighboring for local_y in range(1, rect.height - 1)]
 
-    def _right_anchor_column(self, rect: WorldRect) -> list[bool]:
+    def _right_anchor_column(self, rect: WorldRect, *, block: bool = True) -> list[bool]:
         if rect.right >= self.store.width:
             return [False for _ in range(max(0, rect.height - 2))]
         positions: set[int] = set()
@@ -1710,6 +2311,7 @@ class ActiveWorldWindow:
                 world_x,
                 world_y,
                 support_variant_indices=self._support_transmission_variant_indices,
+                block=block,
             ):
                 positions.add(world_y)
         if rect.y > 0:
@@ -1719,6 +2321,7 @@ class ActiveWorldWindow:
                     world_x_candidate,
                     corner_y,
                     support_variant_indices=self._support_transmission_variant_indices,
+                    block=block,
                 ):
                     positions.add(corner_y)
         if rect.bottom < self.store.height:
@@ -1728,12 +2331,13 @@ class ActiveWorldWindow:
                     world_x_candidate,
                     corner_y,
                     support_variant_indices=self._support_transmission_variant_indices,
+                    block=block,
                 ):
                     positions.add(corner_y)
         neighboring = self._neighboring_anchor_positions(positions)
         return [rect.y + local_y in neighboring for local_y in range(1, rect.height - 1)]
 
-    def _build_external_support_anchor_mask(self, rect: WorldRect) -> list[bool]:
+    def _build_external_support_anchor_mask(self, rect: WorldRect, *, block: bool = True) -> list[bool]:
         anchors = [False for _ in range(rect.width * rect.height)]
         if rect.width <= 0 or rect.height <= 0:
             return anchors
@@ -1742,16 +2346,16 @@ class ActiveWorldWindow:
         left_x = 0
         right_x = rect.width - 1
         for local_x in range(rect.width):
-            anchors[top_y * rect.width + local_x] = self._border_has_external_support_anchor(rect, local_x, top_y)
+            anchors[top_y * rect.width + local_x] = self._border_has_external_support_anchor(rect, local_x, top_y, block=block)
             if bottom_y != top_y:
-                anchors[bottom_y * rect.width + local_x] = self._border_has_external_support_anchor(rect, local_x, bottom_y)
+                anchors[bottom_y * rect.width + local_x] = self._border_has_external_support_anchor(rect, local_x, bottom_y, block=block)
         for local_y in range(1, bottom_y):
-            anchors[local_y * rect.width + left_x] = self._border_has_external_support_anchor(rect, left_x, local_y)
+            anchors[local_y * rect.width + left_x] = self._border_has_external_support_anchor(rect, left_x, local_y, block=block)
             if right_x != left_x:
-                anchors[local_y * rect.width + right_x] = self._border_has_external_support_anchor(rect, right_x, local_y)
+                anchors[local_y * rect.width + right_x] = self._border_has_external_support_anchor(rect, right_x, local_y, block=block)
         return anchors
 
-    def _build_external_support_anchor_updates(self, rect: WorldRect) -> tuple[list[bool], list[_AnchorRegionUpdate]]:
+    def _build_external_support_anchor_updates(self, rect: WorldRect, *, block: bool = True) -> tuple[list[bool], list[_AnchorRegionUpdate]]:
         anchors = self.external_support_anchors
         expected_size = rect.width * rect.height
         if len(anchors) != expected_size:
@@ -1759,14 +2363,14 @@ class ActiveWorldWindow:
         updates: list[_AnchorRegionUpdate] = []
         if rect.width <= 0 or rect.height <= 0:
             return anchors, updates
-        top_values = self._top_anchor_row(rect)
+        top_values = self._top_anchor_row(rect, block=block)
         previous_top_values = anchors[: rect.width]
         anchors[: rect.width] = top_values
         if top_values != previous_top_values:
             updates.append(_AnchorRegionUpdate(local_x=0, local_y=0, width=rect.width, height=1, values=top_values))
         if rect.height > 1:
             bottom_offset = (rect.height - 1) * rect.width
-            bottom_values = self._bottom_anchor_row(rect)
+            bottom_values = self._bottom_anchor_row(rect, block=block)
             previous_bottom_values = anchors[bottom_offset : bottom_offset + rect.width]
             anchors[bottom_offset : bottom_offset + rect.width] = bottom_values
             if bottom_values != previous_bottom_values:
@@ -1780,7 +2384,7 @@ class ActiveWorldWindow:
                     )
                 )
         if rect.height > 2:
-            left_values = self._left_anchor_column(rect)
+            left_values = self._left_anchor_column(rect, block=block)
             previous_left_values = [anchors[local_y * rect.width] for local_y in range(1, rect.height - 1)]
             for local_y, value in enumerate(left_values, start=1):
                 anchors[local_y * rect.width] = value
@@ -1795,7 +2399,7 @@ class ActiveWorldWindow:
                     )
                 )
             if rect.width > 1:
-                right_values = self._right_anchor_column(rect)
+                right_values = self._right_anchor_column(rect, block=block)
                 previous_right_values = [
                     anchors[local_y * rect.width + (rect.width - 1)]
                     for local_y in range(1, rect.height - 1)
@@ -1814,9 +2418,9 @@ class ActiveWorldWindow:
                     )
         return anchors, updates
 
-    def _set_external_support_anchors(self) -> None:
+    def _set_external_support_anchors(self, *, block: bool = True) -> None:
         build_started_at = perf_counter()
-        anchors, updates = self._build_external_support_anchor_updates(self.active_rect)
+        anchors, updates = self._build_external_support_anchor_updates(self.active_rect, block=block)
         build_elapsed = perf_counter() - build_started_at
         self.external_support_anchors = anchors
         upload_started_at = perf_counter()
@@ -1892,6 +2496,7 @@ class ActiveWorldWindow:
         target_buffer_index: int,
         target_origin_x: int,
         target_origin_y: int,
+        best_effort: bool = False,
     ) -> None:
         assert self.gpu_simulator is not None
         remaining = [rect]
@@ -1920,8 +2525,16 @@ class ActiveWorldWindow:
         if remaining:
             self.chunk_cache.collect_ready_prefetch()
         for missing in remaining:
-            for part, packed in self.chunk_cache.read_rect_parts(missing):
+            for part, packed in self.chunk_cache.read_rect_parts(
+                missing,
+                block=not best_effort,
+                prioritize_missing=True,
+            ):
                 if packed is None:
+                    if best_effort:
+                        self._pending_active_chunk_patches.add(
+                            (max(0, part.x) // self.chunk_cache.chunk_size, max(0, part.y) // self.chunk_cache.chunk_size)
+                        )
                     self.gpu_simulator.fill_empty_region(
                         part.x - target_origin_x,
                         part.y - target_origin_y,
@@ -2009,6 +2622,7 @@ class ActiveWorldWindow:
                 target_buffer_index=target_buffer_index,
                 target_origin_x=new_rect.x,
                 target_origin_y=new_rect.y,
+                best_effort=True,
             )
         incoming_load_elapsed = perf_counter() - incoming_load_started_at
         self.paging_stats.last_incoming_load_seconds = incoming_load_elapsed
@@ -2036,8 +2650,8 @@ class ActiveWorldWindow:
         self.active_origin_y = new_origin_y
         self.chunk_cache.schedule_prefetch_for_rect(self.active_rect)
         self.chunk_cache.service_prefetch(max_chunks=4, collect_ready=False)
-        self.chunk_cache.evict_far_chunks(self.active_rect)
-        self._set_external_support_anchors()
+        self.chunk_cache.service_residency(self.active_rect)
+        self._set_external_support_anchors(block=False)
         chunk_stats_after = self.chunk_cache.snapshot_stats()
         self.paging_stats.last_shift_cache_hits = chunk_stats_after.cache_hits - chunk_stats_before.cache_hits
         self.paging_stats.last_shift_empty_hits = chunk_stats_after.empty_hits - chunk_stats_before.empty_hits
@@ -2160,6 +2774,36 @@ class ActiveWorldWindow:
             self.camera_y = saved_camera_y
         return WorldRect(origin_x, origin_y, self.active_width, self.active_height)
 
+    def evict_clean_disk_backed_chunks_for_camera_path(
+        self,
+        *,
+        start_camera_x: int,
+        end_camera_x: int,
+        camera_y: int | None = None,
+        margin_x: int = 0,
+        margin_y: int = 0,
+    ) -> dict[str, int | tuple[int, int, int, int]]:
+        """Drop disk-backed clean chunks covering a camera path from RAM.
+
+        Used by the live experiment harness to measure disk-only reloads
+        without deleting persistent chunk files or evicting dirty chunks.
+        """
+        y = self.camera_y if camera_y is None else int(camera_y)
+        start_rect = self._active_rect_for_camera(int(start_camera_x), y)
+        end_rect = self._active_rect_for_camera(int(end_camera_x), y)
+        left = min(start_rect.x, end_rect.x)
+        top = min(start_rect.y, end_rect.y)
+        right = max(start_rect.right, end_rect.right)
+        bottom = max(start_rect.bottom, end_rect.bottom)
+        rect = WorldRect(left, top, right - left, bottom - top)
+        result = self.chunk_cache.evict_clean_disk_backed_for_rect(
+            rect,
+            margin_x=max(0, int(margin_x)),
+            margin_y=max(0, int(margin_y)),
+        )
+        result["rect"] = (rect.x, rect.y, rect.width, rect.height)
+        return result
+
     def prefetch_camera_region(self, camera_x: int, camera_y: int, *, submit_chunks: int = 8) -> None:
         rect = self._active_rect_for_camera(camera_x, camera_y)
         self.chunk_cache.schedule_prefetch_for_rect(rect, margin_x=0, margin_y=0, prioritize=True)
@@ -2265,11 +2909,68 @@ class ActiveWorldWindow:
         if self.gpu_simulator is not None:
             self.gpu_simulator.set_directional_fallback_angle_limit_degrees(angle_limit_degrees)
 
+    def _patch_ready_active_chunks(self, *, max_chunks: int = 1) -> bool:
+        pending_patches = getattr(self, "_pending_active_chunk_patches", None)
+        if self.gpu_simulator is None or not pending_patches:
+            return False
+        did_work = False
+        patched = 0
+        for key in list(pending_patches):
+            if patched >= max(0, int(max_chunks)):
+                break
+            chunk_x, chunk_y = key
+            chunk_rect = self.chunk_cache._chunk_world_rect(chunk_x, chunk_y)  # noqa: SLF001
+            overlap = self.active_rect.intersection(chunk_rect)
+            if overlap is None:
+                self._pending_active_chunk_patches.discard(key)
+                continue
+            state = self.chunk_cache.chunk_residency_state(chunk_x, chunk_y)
+            if state not in (ChunkResidency.RESIDENT_CLEAN, ChunkResidency.RESIDENT_DIRTY):
+                continue
+            parts = self.chunk_cache.read_rect_parts(overlap, block=False, prioritize_missing=False)
+            ready = True
+            for part, packed in parts:
+                local_x = part.x - self.active_origin_x
+                local_y = part.y - self.active_origin_y
+                if packed is None:
+                    self.gpu_simulator.fill_empty_region(
+                        local_x,
+                        local_y,
+                        part.width,
+                        part.height,
+                        world_row_offset=part.y,
+                        world_height=self.store.height,
+                    )
+                    continue
+                self.gpu_simulator.write_region_bytes(
+                    local_x,
+                    local_y,
+                    part.width,
+                    part.height,
+                    packed.state_int,
+                    packed.state_vec,
+                    packed.state_misc,
+                )
+                self.gpu_simulator.clear_region_transients(local_x, local_y, part.width, part.height)
+            if ready:
+                self._pending_active_chunk_patches.discard(key)
+                patched += 1
+                did_work = True
+        if did_work:
+            self._set_external_support_anchors(block=False)
+        return did_work
+
     def service_background_io(self) -> None:
         if self.gpu_simulator is None:
             return
         if self._camera_recently_moved:
-            self.chunk_cache.service_prefetch(max_chunks=1, collect_ready=False)
+            self.chunk_cache.service_prefetch(max_chunks=1)
+            self._patch_ready_active_chunks(max_chunks=1)
+            return
+        did_prefetch = self.chunk_cache.service_prefetch(max_chunks=1)
+        did_patch = self._patch_ready_active_chunks(max_chunks=1)
+        if did_prefetch or did_patch:
+            self._last_background_io_flush_idle_seconds = self._camera_idle_elapsed_seconds
             return
         if self._camera_idle_elapsed_seconds - self._last_background_io_flush_idle_seconds < self.idle_flush_service_interval_seconds:
             return
@@ -2277,9 +2978,6 @@ class ActiveWorldWindow:
             if self._flush_one_pending_gpu_writeback():
                 self._last_background_io_flush_idle_seconds = self._camera_idle_elapsed_seconds
                 return
-        if self.chunk_cache.service_prefetch(max_chunks=1):
-            self._last_background_io_flush_idle_seconds = self._camera_idle_elapsed_seconds
-            return
         if self.chunk_cache.flush_one_dirty():
             self._last_background_io_flush_idle_seconds = self._camera_idle_elapsed_seconds
 
@@ -2372,6 +3070,39 @@ class ActiveWorldWindow:
             gw=width,
             gh=height,
         )
+
+    def request_snapshot_cells_region_world(
+        self,
+        *,
+        entity_id: str,
+        world_x: int,
+        world_y: int,
+        width: int,
+        height: int,
+    ) -> GpuLocalSnapshotToken:
+        if self.gpu_simulator is None:
+            raise RuntimeError("GPU simulator required.")
+        local_x = int(world_x) - self.active_origin_x
+        local_y = int(world_y) - self.active_origin_y
+        return self.gpu_simulator.request_snapshot_cells_region(
+            entity_id=entity_id,
+            world_x=int(world_x),
+            world_y=int(world_y),
+            gx=local_x,
+            gy=local_y,
+            gw=int(width),
+            gh=int(height),
+        )
+
+    def poll_snapshot_cells_region_world(
+        self,
+        token: GpuLocalSnapshotToken,
+        *,
+        force_ready: bool = False,
+    ) -> LocalCellsSnapshot | None:
+        if self.gpu_simulator is None:
+            raise RuntimeError("GPU simulator required.")
+        return self.gpu_simulator.poll_snapshot_cells_region(token, force_ready=force_ready)
 
     def close(self) -> None:
         if self.gpu_simulator is not None:

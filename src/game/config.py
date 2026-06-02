@@ -6,6 +6,7 @@ import os
 VIEWPORT_WIDTH = 640
 VIEWPORT_HEIGHT = 380
 CELL_SCALE = 4              # px per cell (demo uses 4)
+CELL_SCALE_OPTIONS = (2, 3, 4, 6, 8)
 
 # ── World ── (proportional to viewport, same k-factors as old plan)
 # Old: BIOME_WIDTH = 50 * 160 = 8000, WORLD_HEIGHT = 10 * 96 = 960
