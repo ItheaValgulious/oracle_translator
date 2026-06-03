@@ -3,9 +3,7 @@
 Provides endpoints for:
 - /status, /hero, /enemies, /projectiles: game state queries
 - /cells, /gpu_cells, /gpu_pressure: grid inspection
-- /press?key=...&action=tap|down|up: key input dispatch (main-thread safe)
-- /paint?x=..&y=..&radius=..&family=..&variant=..: generic paint helper
-- /ignite?x=..&y=..&radius=..: fire paint helper for stress/debug
+- /press?key=...: key input dispatch (main-thread safe)
 - /screenshot: PNG framebuffer capture (main-thread safe)
 """
 
@@ -82,10 +80,6 @@ class DebugHandler(BaseHTTPRequestHandler):
                 data = self._teleport()
             elif path.startswith("/explode"):
                 data = self._explode()
-            elif path.startswith("/paint"):
-                data = self._paint()
-            elif path.startswith("/ignite"):
-                data = self._ignite()
             elif path.startswith("/spawn"):
                 data = self._spawn_enemy()
             elif path.startswith("/heal"):
@@ -108,7 +102,7 @@ class DebugHandler(BaseHTTPRequestHandler):
                         "/gpu_inject_probe?x=..&y=..&radius=..&pressure=..",
                         "/gpu_pressure_timeline?x=..&y=..&radius=..&frames=..",
                         "/benchmark",
-                        "/press?key=ENTER&action=tap|down|up", "/screenshot",
+                        "/press?key=ENTER", "/screenshot",
                         "/teleport?x=..&y=..",
                         "/teleport_surface?x=..",
                         "/nudge_surface?dx=..",
@@ -116,8 +110,6 @@ class DebugHandler(BaseHTTPRequestHandler):
                         "/experiment_camera_clear",
                         "/evict_disk_chunks?start_x=..&end_x=..&margin_x=..&margin_y=..",
                         "/explode?x=..&y=..",
-                        "/paint?x=..&y=..&radius=..&family=stone&variant=stone_platform",
-                        "/ignite?x=..&y=..&radius=..",
                         "/spawn?type=A|B|C",
                         "/heal?amount=50",
                         "/shutdown",
@@ -152,10 +144,6 @@ class DebugHandler(BaseHTTPRequestHandler):
                 "clear_fx_ms": paging_status.get("clear_fx_ms", 0.0),
                 "anchor_build_ms": paging_status.get("anchor_build_ms", 0.0),
                 "anchor_upload_ms": paging_status.get("anchor_upload_ms", 0.0),
-                "anchor_total_ms": paging_status.get("anchor_total_ms", 0.0),
-                "prefetch_submit_ms": paging_status.get("prefetch_submit_ms", 0.0),
-                "prefetch_service_ms": paging_status.get("prefetch_service_ms", 0.0),
-                "residency_service_ms": paging_status.get("residency_service_ms", 0.0),
                 "shift_count": paging_status.get("shift_count", 0),
                 # Renamed for clarity (Phase 1): this counts GPU staged regions
                 # awaiting CPU readback, NOT disk-save backlog.
@@ -164,9 +152,6 @@ class DebugHandler(BaseHTTPRequestHandler):
                 # Legacy alias retained so callers transitioning to the new
                 # name keep working during the migration.
                 "pending_writebacks": paging_status.get("pending_writebacks", 0),
-                "incoming_ready_parts": paging_status.get("incoming_ready_parts", 0),
-                "incoming_empty_parts": paging_status.get("incoming_empty_parts", 0),
-                "incoming_pending_parts": paging_status.get("incoming_pending_parts", 0),
                 "last_shift_cache_hits": paging_status.get("last_shift_cache_hits", 0),
                 "last_shift_empty_hits": paging_status.get("last_shift_empty_hits", 0),
                 "last_shift_inflight_wait_hits": paging_status.get("last_shift_inflight_wait_hits", 0),
@@ -272,10 +257,6 @@ class DebugHandler(BaseHTTPRequestHandler):
             "state": h.state,
             "hp": h.hp, "mp": h.mp,
             "facing_right": h.facing_right,
-            "input_left": h.input_left,
-            "input_right": h.input_right,
-            "input_jump": h.input_jump,
-            "input_chant_held": h.input_chant_held,
         }
 
     def _get_enemies(self) -> dict[str, Any]:
@@ -306,9 +287,9 @@ class DebugHandler(BaseHTTPRequestHandler):
 
     def _get_fps(self) -> dict[str, Any]:
         app = self.app
-        render_fps = getattr(app, "visible_render_fps", None)
-        if callable(render_fps):
-            render_fps = render_fps()
+        render_fps = None
+        if getattr(app, "renderer", None) is not None:
+            render_fps = getattr(app.renderer, "_render_fps", None)
         return {
             "sim_fps": round(float(app.sim_fps), 3) if hasattr(app, "sim_fps") else None,
             "render_fps": round(float(render_fps), 3) if render_fps is not None else None,
@@ -360,11 +341,7 @@ class DebugHandler(BaseHTTPRequestHandler):
                 "sim_accumulator": getattr(app, "_sim_accumulator", None),
                 "last_dt": getattr(app, "_last_dt", None),
                 "tick_count": getattr(app, "_tick_call_count", None),
-                "render_fps": (
-                    round(float(app.visible_render_fps), 3)
-                    if getattr(app, "visible_render_fps", None) is not None
-                    else None
-                ),
+                "render_fps": round(float(app.renderer._render_fps), 3) if hasattr(app, "renderer") and app.renderer else None,
             }
             # Include recent tick history for debugging
             history = getattr(app, "_debug_tick_history", [])
@@ -659,10 +636,6 @@ class DebugHandler(BaseHTTPRequestHandler):
                     k, v = part.split("=", 1)
                     params[k] = v
         key_name = params.get("key", "ENTER").upper()
-        hold_seconds = max(0.0, min(60.0, float(params.get("hold", "0.1"))))
-        action = str(params.get("action", "tap")).strip().lower() or "tap"
-        if action not in {"tap", "down", "up"}:
-            action = "tap"
         key_map = {
             "ENTER": pyglet_key.ENTER,
             "SPACE": pyglet_key.SPACE,
@@ -684,25 +657,13 @@ class DebugHandler(BaseHTTPRequestHandler):
         def _do_press(dt):
             app.on_key_press(symbol, 0)
             event.set()
+        pyglet.clock.schedule_once(_do_press, 0)
+        event.wait(timeout=5)
+        # Schedule key release after a short delay
         def _do_release(dt):
             app.on_key_release(symbol, 0)
-            event.set()
-        if action == "up":
-            pyglet.clock.schedule_once(_do_release, 0)
-            event.wait(timeout=5)
-        else:
-            pyglet.clock.schedule_once(_do_press, 0)
-            event.wait(timeout=5)
-            if action == "tap":
-                pyglet.clock.schedule_once(_do_release, hold_seconds)
-        return {
-            "pressed": key_name,
-            "action": action,
-            "symbol": symbol,
-            "screen": app.current_screen,
-            "hold_seconds": hold_seconds,
-            "keys_pressed_count": len(getattr(app, "_keys_pressed", set()) or ()),
-        }
+        pyglet.clock.schedule_once(_do_release, 0.1)
+        return {"pressed": key_name, "symbol": symbol, "screen": app.current_screen}
 
     # ── Debug actions ──────────────────────────────────────────────
 
@@ -961,91 +922,6 @@ class DebugHandler(BaseHTTPRequestHandler):
             event.set()
 
         pyglet.clock.schedule_once(_do_explode, 0)
-        event.wait(timeout=5)
-        return result
-
-    def _ignite(self) -> dict[str, Any]:
-        """Paint a fire patch at a world position for debug stress tests."""
-        import pyglet
-        params = {}
-        if "?" in self.path:
-            for part in self.path.split("?")[1].split("&"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    params[k] = float(v)
-        app = self.app
-        tx = int(params.get("x", app.hero.x))
-        ty = int(params.get("y", app.hero.y + app.hero.height * 0.5))
-        radius = max(1, int(params.get("radius", 4)))
-        temperature = float(params.get("temperature", 650.0))
-        event = threading.Event()
-        result: dict[str, Any] = {}
-
-        def _do_ignite(dt):
-            try:
-                if app.world is None:
-                    result["error"] = "world not loaded"
-                else:
-                    app._queue_world_paint(
-                        tx,
-                        ty,
-                        radius,
-                        "fire",
-                        "fire",
-                        overrides={"temperature": temperature, "vel_y": -1.0},
-                    )
-                    app._flush_gpu_world_mutations()
-                    result["ignite"] = {
-                        "x": tx,
-                        "y": ty,
-                        "radius": radius,
-                        "temperature": temperature,
-                    }
-            except Exception as exc:
-                result["error"] = str(exc)
-            event.set()
-
-        pyglet.clock.schedule_once(_do_ignite, 0)
-        event.wait(timeout=5)
-        return result
-
-    def _paint(self) -> dict[str, Any]:
-        """Paint a generic material patch at a world position for debug verification."""
-        import pyglet
-        params = {}
-        if "?" in self.path:
-            for part in self.path.split("?")[1].split("&"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    params[k] = v
-        app = self.app
-        tx = int(float(params.get("x", app.hero.x)))
-        ty = int(float(params.get("y", app.hero.y + app.hero.height * 0.5)))
-        radius = max(1, int(float(params.get("radius", "1"))))
-        family = str(params.get("family", "stone")).strip() or "stone"
-        variant = str(params.get("variant", "stone_platform")).strip() or "stone_platform"
-        event = threading.Event()
-        result: dict[str, Any] = {}
-
-        def _do_paint(dt):
-            try:
-                if app.world is None:
-                    result["error"] = "world not loaded"
-                else:
-                    app._queue_world_paint(tx, ty, radius, family, variant)
-                    app._flush_gpu_world_mutations()
-                    result["paint"] = {
-                        "x": tx,
-                        "y": ty,
-                        "radius": radius,
-                        "family": family,
-                        "variant": variant,
-                    }
-            except Exception as exc:
-                result["error"] = str(exc)
-            event.set()
-
-        pyglet.clock.schedule_once(_do_paint, 0)
         event.wait(timeout=5)
         return result
 

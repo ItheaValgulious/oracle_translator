@@ -3765,30 +3765,6 @@ class GpuSimulator:
                 rows.append(full_data[start : start + row_size])
             return b"".join(rows)
 
-    def _read_texture_region_via_full_texture(
-        self,
-        texture: moderngl.Texture,
-        x: int,
-        y: int,
-        width: int,
-        height: int,
-        *,
-        components: int,
-        dtype: str,
-    ) -> bytes:
-        texture_width, _texture_height = texture.size
-        bytes_per_component = 4 if dtype in {"i4", "f4"} else 1
-        pixel_size = components * bytes_per_component
-        row_size = width * pixel_size
-        full_row_size = texture_width * pixel_size
-        full_data = texture.read(alignment=1)
-        rows = []
-        row_start = y * full_row_size + x * pixel_size
-        for row in range(height):
-            start = row_start + row * full_row_size
-            rows.append(full_data[start : start + row_size])
-        return b"".join(rows)
-
     def _acquire_stage_atlas(self, kind: str, *, slot_width: int, slot_height: int, slot_count: int = 16) -> _GpuStageAtlas:
         atlas = self._stage_atlases.get(kind)
         if atlas is None:
@@ -4514,12 +4490,7 @@ class GpuSimulator:
             raise ValueError("Staged region read must be within bounds.")
         if x + read_width > staged.width or y + read_height > staged.height:
             raise ValueError("Staged region read exceeds staged bounds.")
-        # Snapshot/paging staged reads are stability-sensitive on Win32:
-        # attaching these intermediate textures to a transient framebuffer and
-        # calling framebuffer.read has triggered native access violations under
-        # sustained async snapshot load. Reading the whole texture and slicing
-        # in Python is slower but avoids that crash path.
-        state_int_data = self._read_texture_region_via_full_texture(
+        state_int_data = self._read_texture_region(
             staged.state_int,
             staged.src_origin_x + x,
             staged.src_origin_y + y,
@@ -4528,7 +4499,7 @@ class GpuSimulator:
             components=4,
             dtype="i4",
         )
-        state_vec_data = self._read_texture_region_via_full_texture(
+        state_vec_data = self._read_texture_region(
             staged.state_vec,
             staged.src_origin_x + x,
             staged.src_origin_y + y,
@@ -4537,7 +4508,7 @@ class GpuSimulator:
             components=4,
             dtype="f4",
         )
-        state_misc_data = self._read_texture_region_via_full_texture(
+        state_misc_data = self._read_texture_region(
             staged.state_misc,
             staged.src_origin_x + x,
             staged.src_origin_y + y,
@@ -4567,7 +4538,7 @@ class GpuSimulator:
         return PackedStateRegion(
             width=read_width,
             height=read_height,
-            state_int=self._read_texture_region_via_full_texture(
+            state_int=self._read_texture_region(
                 staged.state_int,
                 staged.src_origin_x + x,
                 staged.src_origin_y + y,
@@ -4576,7 +4547,7 @@ class GpuSimulator:
                 components=4,
                 dtype="i4",
             ),
-            state_vec=self._read_texture_region_via_full_texture(
+            state_vec=self._read_texture_region(
                 staged.state_vec,
                 staged.src_origin_x + x,
                 staged.src_origin_y + y,
@@ -4585,7 +4556,7 @@ class GpuSimulator:
                 components=4,
                 dtype="f4",
             ),
-            state_misc=self._read_texture_region_via_full_texture(
+            state_misc=self._read_texture_region(
                 staged.state_misc,
                 staged.src_origin_x + x,
                 staged.src_origin_y + y,
