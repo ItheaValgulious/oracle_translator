@@ -2169,7 +2169,7 @@ class ActiveWorldWindow:
             target_origin_y=self.active_origin_y,
         )
         self.chunk_cache.schedule_prefetch_for_rect(self.active_rect)
-        self.chunk_cache.service_prefetch(max_chunks=4, collect_ready=False)
+        self.chunk_cache.service_prefetch(max_chunks=4)
         self._set_external_support_anchors()
         log.debug("[world] GPU simulator created")
 
@@ -2208,7 +2208,14 @@ class ActiveWorldWindow:
     def pending_writeback_pressure_count(self) -> int:
         return max(0, len(self._pending_gpu_writebacks) - self.pending_writeback_limit)
 
-    def _border_has_external_support_anchor(self, rect: WorldRect, local_x: int, local_y: int, *, block: bool = True) -> bool:
+    def _border_has_external_support_anchor(
+        self,
+        rect: WorldRect,
+        local_x: int,
+        local_y: int,
+        *,
+        block: bool = True,
+    ) -> bool:
         world_x = rect.x + local_x
         world_y = rect.y + local_y
         for dx, dy in NEIGHBORS_8:
@@ -2355,7 +2362,12 @@ class ActiveWorldWindow:
                 anchors[local_y * rect.width + right_x] = self._border_has_external_support_anchor(rect, right_x, local_y, block=block)
         return anchors
 
-    def _build_external_support_anchor_updates(self, rect: WorldRect, *, block: bool = True) -> tuple[list[bool], list[_AnchorRegionUpdate]]:
+    def _build_external_support_anchor_updates(
+        self,
+        rect: WorldRect,
+        *,
+        block: bool = True,
+    ) -> tuple[list[bool], list[_AnchorRegionUpdate]]:
         anchors = self.external_support_anchors
         expected_size = rect.width * rect.height
         if len(anchors) != expected_size:
@@ -2416,11 +2428,19 @@ class ActiveWorldWindow:
                             values=right_values,
                         )
                     )
+
         return anchors, updates
 
-    def _set_external_support_anchors(self, *, block: bool = True) -> None:
+    def _set_external_support_anchors(
+        self,
+        *,
+        block: bool = True,
+    ) -> None:
         build_started_at = perf_counter()
-        anchors, updates = self._build_external_support_anchor_updates(self.active_rect, block=block)
+        anchors, updates = self._build_external_support_anchor_updates(
+            self.active_rect,
+            block=block,
+        )
         build_elapsed = perf_counter() - build_started_at
         self.external_support_anchors = anchors
         upload_started_at = perf_counter()
@@ -2649,7 +2669,7 @@ class ActiveWorldWindow:
         self.active_origin_x = new_origin_x
         self.active_origin_y = new_origin_y
         self.chunk_cache.schedule_prefetch_for_rect(self.active_rect)
-        self.chunk_cache.service_prefetch(max_chunks=4, collect_ready=False)
+        self.chunk_cache.service_prefetch(max_chunks=4)
         self.chunk_cache.service_residency(self.active_rect)
         self._set_external_support_anchors(block=False)
         chunk_stats_after = self.chunk_cache.snapshot_stats()
